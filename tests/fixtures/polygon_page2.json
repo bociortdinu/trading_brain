@@ -1,0 +1,12 @@
+{
+  "ticker": "C:XAUUSD",
+  "adjusted": true,
+  "resultsCount": 2,
+  "status": "OK",
+  "request_id": "sanitized-request-id-2",
+  "count": 2,
+  "results": [
+    {"v": 1000, "vw": 2403.6, "o": 2403.5, "c": 2404.0, "h": 2404.5, "l": 2403.0, "t": 1767228300000, "n": 250},
+    {"v": 900, "vw": 2404.4, "o": 2404.0, "c": 2405.0, "h": 2405.5, "l": 2403.8, "t": 1767229200000, "n": 240}
+  ]
+}

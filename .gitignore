@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+# Secrets — NEVER commit (real DB/Polygon/Anthropic creds). .env.example IS committed.
+.env
+.env.*
+!.env.example
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.DS_Store

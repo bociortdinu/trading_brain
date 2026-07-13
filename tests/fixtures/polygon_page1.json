@@ -1,0 +1,15 @@
+{
+  "ticker": "C:XAUUSD",
+  "adjusted": true,
+  "queryCount": 3,
+  "resultsCount": 3,
+  "status": "OK",
+  "request_id": "sanitized-request-id",
+  "count": 3,
+  "next_url": "https://api.polygon.io/v2/aggs/ticker/C:XAUUSD/range/15/minute/1767225600000/1767312000000?cursor=PAGE2",
+  "results": [
+    {"v": 1200, "vw": 2400.1, "o": 2400.0, "c": 2401.0, "h": 2402.0, "l": 2399.5, "t": 1767225600000, "n": 300},
+    {"v": 1100, "vw": 2401.2, "o": 2401.0, "c": 2402.5, "h": 2403.0, "l": 2400.8, "t": 1767226500000, "n": 280},
+    {"v": 1300, "vw": 2402.6, "o": 2402.5, "c": 2403.5, "h": 2404.0, "l": 2402.0, "t": 1767227400000, "n": 310}
+  ]
+}

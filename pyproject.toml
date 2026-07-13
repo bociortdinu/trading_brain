@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-brain"
+version = "0.0.1"
+description = "Decision brain for the XTB trading system. Talks to trading_hands over HTTP; the LLM is the sole decision-maker."
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+db = ["psycopg[binary]>=3.1"]
+# Structured Outputs (messages.parse / output_config.format) require a recent SDK.
+# Pinned to a version verified in this repo to expose messages.parse + the error types
+# the client relies on (see tests/test_packaging.py::test_anthropic_sdk_supports_parse).
+llm = ["anthropic>=0.116"]
+dev = ["pytest>=8", "pandas>=2.0"]
+
+# Flat layout with several top-level packages -> declare them explicitly (with
+# subpackages) so `pip install -e .` does not fail setuptools auto-discovery.
+# NOTE: every top-level importable package (dir with __init__.py, excluding tests) MUST
+# be covered by a pattern here — tests/test_packaging.py fails otherwise.
+[tool.setuptools.packages.find]
+include = [
+    "app*", "brokers_bridge*", "config*", "core*", "database*",
+    "data_collector*", "features*", "decision*", "risk*", "shadow*",
+]
+
+[tool.setuptools.package-data]
+database = ["migrations/*.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
