@@ -69,6 +69,10 @@ class Settings(BaseSettings):
     benchmark_model: str = "claude-opus-4-8"
     decision_max_tokens: int = 1024
 
+    # Shadow backtest: a MODELED spread for historical (replay) bars — we never borrow the
+    # current live quote for a past bar. ~XTB gold spread observed live (~0.018-0.02%).
+    replay_spread_pct: float = 0.02
+
     def provider_symbol(self, brain_symbol: str) -> str:
         # Only Polygon uses a different ticker (C:XAUUSD); XTB and CSV use the brain symbol
         # (GOLD) directly. Keeps the symbol mapping correct when switching providers.
