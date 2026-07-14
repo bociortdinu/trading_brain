@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     )
     eligibility_max_feed_lag_seconds: int = 1800
     eligibility_max_quote_lag_seconds: int = 120
+    # The feed-vs-broker basis is trustworthy only when the XTB quote is observed close to
+    # the bar close; beyond this lag the number is dominated by price movement, so it is
+    # marked unreliable and the basis magnitudes are not reported.
+    max_basis_lag_seconds: int = 90
 
     # LLM decision layer (Faza 2). ONE configurable baseline model; the benchmark model runs
     # on the SAME frozen inputs for comparison. No Haiku tiering yet (news classification is

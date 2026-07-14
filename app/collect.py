@@ -78,6 +78,28 @@ def compute_eligibility(
     )
 
 
+def compute_basis(feed_price, bid, ask, bar_close, observed_at, quote_time, *,
+                  max_lag_seconds: float) -> dict:
+    """Feed-vs-broker basis at a bar. RELIABLE only when the quote is observed close to the
+    bar close: beyond `max_lag_seconds` the (feed_price - broker_mid) difference is dominated
+    by price MOVEMENT between the two instants, not a genuine feed-vs-broker basis — so the
+    basis magnitudes are withheld and `basis_reliable=False`. The instantaneous spread is
+    always kept (it does not depend on the lag)."""
+    mid = (bid + ask) / 2 if bid and ask else None
+    lag = (observed_at - bar_close).total_seconds()
+    reliable = lag <= max_lag_seconds
+    return {
+        "feed_price": feed_price, "xtb_bid": bid, "xtb_ask": ask,
+        "xtb_spread_pct": round((ask - bid) / ask * 100, 4) if ask else 0.0,
+        "quote_time": quote_time.isoformat() if quote_time else None,
+        "observed_at": observed_at.isoformat(), "bar_close": bar_close.isoformat(),
+        "observation_lag_seconds": round(lag, 1),
+        "basis_reliable": reliable,
+        "basis_abs": round(feed_price - mid, 4) if (mid and reliable) else None,
+        "basis_pct": round((feed_price - mid) / mid * 100, 4) if (mid and reliable) else None,
+    }
+
+
 async def observe_xtb_spread(settings, feed_price, bar_close) -> tuple[float | None, dict | None]:
     async with TradingHandsClient(settings.trading_hands_url, settings.http_timeout_seconds) as th:
         try:
@@ -86,16 +108,8 @@ async def observe_xtb_spread(settings, feed_price, bar_close) -> tuple[float | N
             return None, None
     observed_at = datetime.now(timezone.utc)
     quote_time = datetime.fromtimestamp(q.time / 1000, tz=timezone.utc) if q.time else None
-    mid = (q.bid + q.ask) / 2 if q.bid and q.ask else None
-    basis = {
-        "feed_price": feed_price, "xtb_bid": q.bid, "xtb_ask": q.ask,
-        "xtb_spread_pct": round(q.spread_pct, 4),
-        "quote_time": quote_time.isoformat() if quote_time else None,
-        "observed_at": observed_at.isoformat(), "bar_close": bar_close.isoformat(),
-        "observation_lag_seconds": round((observed_at - bar_close).total_seconds(), 1),
-        "basis_abs": round(feed_price - mid, 4) if mid else None,
-        "basis_pct": round((feed_price - mid) / mid * 100, 4) if mid else None,
-    }
+    basis = compute_basis(feed_price, q.bid, q.ask, bar_close, observed_at, quote_time,
+                          max_lag_seconds=settings.max_basis_lag_seconds)
     return round(q.spread_pct, 4), basis
 
 
