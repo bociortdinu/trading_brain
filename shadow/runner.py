@@ -57,6 +57,7 @@ async def backtest_over_windows(
     provider_name: str,
     decision_maker,
     modeled_spread_pct: float,
+    slippage_pct: float = 0.0,
     prefilter_config: PrefilterConfig | None = None,
     risk_config: RiskConfig | None = None,
     eligibility_config: EligibilityConfig | None = None,
@@ -95,11 +96,13 @@ async def backtest_over_windows(
                "direction": rec.decision.direction.value if rec.decision else "NO_TRADE",
                "approved": rec.risk_approved, "outcome": None}
         if rec.risk_approved:
-            trade = open_virtual_trade(
-                rec.decision.direction, packet.price, rec.risk.sl_pct, rec.risk.tp_pct,
-                spread_pct=modeled_spread_pct, spread_provenance="modeled", opened_at=as_of,
-            )
             future = [c for c in m15 if c.open_time >= as_of]
+            entry_ref = future[0].open if future else packet.price  # fill at next bar's open (latency)
+            trade = open_virtual_trade(
+                rec.decision.direction, entry_ref, rec.risk.sl_pct, rec.risk.tp_pct,
+                spread_pct=modeled_spread_pct, spread_provenance="modeled",
+                slippage_pct=slippage_pct, opened_at=as_of,
+            )
             o = reconcile(trade, future, shadow_config)
             row["outcome"] = o.model_dump()
             if persist_dsn and run_id:
@@ -158,6 +161,7 @@ async def _run(settings, *, count: int, run_id: str | None) -> None:
     rows = await backtest_over_windows(
         windows, symbol=symbol, provider_name=settings.market_data_provider,
         decision_maker=ConfluenceStrategy(), modeled_spread_pct=settings.replay_spread_pct,
+        slippage_pct=settings.slippage_pct,
         persist_dsn=settings.db_dsn if run_id else None, run_id=run_id,
     )
     rep = report(rows)

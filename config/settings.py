@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     # Shadow backtest: a MODELED spread for historical (replay) bars — we never borrow the
     # current live quote for a past bar. ~XTB gold spread observed live (~0.018-0.02%).
     replay_spread_pct: float = 0.02
+    # Modeled execution slippage (adverse) applied to every shadow entry AND exit fill, on top
+    # of the spread. Keeps shadow R-multiples honest (not over-optimistic).
+    slippage_pct: float = 0.005
 
     def provider_symbol(self, brain_symbol: str) -> str:
         # Only Polygon uses a different ticker (C:XAUUSD); XTB and CSV use the brain symbol

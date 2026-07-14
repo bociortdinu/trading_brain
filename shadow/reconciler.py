@@ -33,15 +33,30 @@ class Outcome(BaseModel):
     ambiguous: bool = False
 
 
-def _r_net(trade: VirtualTrade, exit_mid: float) -> float:
-    """Signed R-multiple net of ONE round-trip spread cost."""
+def _r_net(trade: VirtualTrade, exit_fill: float) -> float:
+    """Signed R-multiple from the actual exit FILL, net of ONE round-trip spread cost
+    (slippage is already baked into entry_mid and exit_fill)."""
     sign = 1.0 if trade.direction == Direction.BUY else -1.0
-    gross = sign * (exit_mid - trade.entry_mid)
+    gross = sign * (exit_fill - trade.entry_mid)
     spread_cost = trade.entry_mid * trade.spread_pct / 100.0  # one full spread, round trip
     risk = trade.risk_per_unit
     if risk <= 0:
         return 0.0
     return round((gross - spread_cost) / risk, 3)
+
+
+def _exit_fill(trade: VirtualTrade, exit_ref: float) -> float:
+    """Apply adverse exit slippage: closing a long SELLS (slip down), a short BUYS (slip up)."""
+    s = trade.slippage_pct / 100.0
+    return exit_ref * (1 - s) if trade.direction == Direction.BUY else exit_ref * (1 + s)
+
+
+def _stop_exit_ref(trade: VirtualTrade, bar: Candle) -> float:
+    """Gap-through-stop: if the bar OPENED already past the stop, the fill is at the open
+    (worse), not idealised at the stop level."""
+    if trade.direction == Direction.BUY:
+        return min(trade.sl_price, bar.open)   # long stop is below; a gap-down fills lower
+    return max(trade.sl_price, bar.open)       # short stop is above; a gap-up fills higher
 
 
 def _hits(trade: VirtualTrade, bar: Candle) -> tuple[bool, bool]:
@@ -72,25 +87,29 @@ def reconcile(trade: VirtualTrade, bars: list[Candle], config: ShadowConfig | No
         sl_hit, tp_hit = _hits(trade, bar)
 
         if sl_hit and tp_hit:
-            r_pess = _r_net(trade, trade.sl_price)
-            r_opt = _r_net(trade, trade.tp_price)
+            sl_fill = _exit_fill(trade, _stop_exit_ref(trade, bar))   # gap-through + slippage
+            tp_fill = _exit_fill(trade, trade.tp_price)               # slippage
+            r_pess, r_opt = _r_net(trade, sl_fill), _r_net(trade, tp_fill)
             return Outcome(
-                status="closed", exit_reason="ambiguous", exit_price=trade.sl_price,
+                status="closed", exit_reason="ambiguous", exit_price=round(sl_fill, 4),
                 closed_at=bar.close_time, r_multiple=r_pess, r_pessimistic=r_pess,
                 r_optimistic=r_opt, ambiguous=True,
             )
         if tp_hit:
-            r = _r_net(trade, trade.tp_price)
-            return Outcome(status="closed", exit_reason="tp_hit", exit_price=trade.tp_price,
+            fill = _exit_fill(trade, trade.tp_price)
+            r = _r_net(trade, fill)
+            return Outcome(status="closed", exit_reason="tp_hit", exit_price=round(fill, 4),
                            closed_at=bar.close_time, r_multiple=r, r_pessimistic=r, r_optimistic=r)
         if sl_hit:
-            r = _r_net(trade, trade.sl_price)
-            return Outcome(status="closed", exit_reason="sl_hit", exit_price=trade.sl_price,
+            fill = _exit_fill(trade, _stop_exit_ref(trade, bar))
+            r = _r_net(trade, fill)
+            return Outcome(status="closed", exit_reason="sl_hit", exit_price=round(fill, 4),
                            closed_at=bar.close_time, r_multiple=r, r_pessimistic=r, r_optimistic=r)
 
         if i + 1 >= config.timeout_bars:  # no touch within the horizon -> time-based exit
-            r = _r_net(trade, bar.close)
-            return Outcome(status="expired", exit_reason="timeout", exit_price=round(bar.close, 4),
+            fill = _exit_fill(trade, bar.close)
+            r = _r_net(trade, fill)
+            return Outcome(status="expired", exit_reason="timeout", exit_price=round(fill, 4),
                            closed_at=bar.close_time, r_multiple=r, r_pessimistic=r, r_optimistic=r)
 
     # ran out of bars without a touch and before the timeout -> still open

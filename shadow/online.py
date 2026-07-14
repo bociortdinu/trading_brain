@@ -55,7 +55,8 @@ def _to_trade(row: dict) -> VirtualTrade:
         direction=Direction.BUY if row["side"] == "buy" else Direction.SELL,
         entry_mid=float(row["entry_price"]), sl_price=float(row["sl_price"]),
         tp_price=float(row["tp_price"]), spread_pct=float(row["spread_pct"] or 0.0),
-        spread_provenance=row["spread_provenance"] or "modeled", opened_at=row["opened_at"],
+        spread_provenance=row["spread_provenance"] or "modeled",
+        slippage_pct=float(row["slippage_pct"] or 0.0), opened_at=row["opened_at"],
     )
 
 
@@ -122,10 +123,16 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
             )
             summary["decision"] = f"{record.stage}:{record.decision.direction.value if record.decision else '-'}"
             if record.risk_approved:
+                # Online: fill at the OBSERVED quote mid (captures real latency), not the bar close.
+                observed_mid = None
+                if basis is not None and basis.get("xtb_bid") and basis.get("xtb_ask"):
+                    observed_mid = (basis["xtb_bid"] + basis["xtb_ask"]) / 2
                 trade = open_virtual_trade(
-                    record.decision.direction, packet.price, record.risk.sl_pct, record.risk.tp_pct,
+                    record.decision.direction, observed_mid or packet.price,
+                    record.risk.sl_pct, record.risk.tp_pct,
                     spread_pct=packet.spread_pct or settings.replay_spread_pct,
-                    spread_provenance="observed_xtb" if packet.spread_pct else "modeled", opened_at=as_of,
+                    spread_provenance="observed_xtb" if packet.spread_pct else "modeled",
+                    slippage_pct=settings.slippage_pct, opened_at=as_of,
                 )
                 tid, _ = upsert_shadow_trade(
                     settings.db_dsn, decision_id=dec_id, run_id=run_id, symbol=brain_symbol,

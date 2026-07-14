@@ -115,6 +115,35 @@ def test_zero_spread_gives_clean_r():
 
 
 # --------------------------------------------------------------------------- #
+# slippage + gap-through-stop realism
+# --------------------------------------------------------------------------- #
+def _long_slip(slip):
+    return open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6, spread_pct=0.0,
+                              spread_provenance="modeled", slippage_pct=slip, opened_at=_T0)
+
+
+def test_entry_slippage_makes_fill_adverse():
+    t = _long_slip(0.02)                       # BUY -> entry slips UP
+    assert t.entry_mid == pytest.approx(4000.8)  # 4000 * (1 + 0.0002)
+
+
+def test_slippage_reduces_r_vs_zero():
+    o0 = reconcile(_long_slip(0.0), [_bar(4000, 4030, 3999, 4020)])
+    o1 = reconcile(_long_slip(0.02), [_bar(4000, 4030, 3999, 4020)])
+    assert o0.r_multiple == pytest.approx(2.0)
+    assert o1.r_multiple < o0.r_multiple       # entry + exit slippage both bite
+
+
+def test_gap_through_stop_fills_worse_than_the_stop():
+    t = _long_slip(0.0)                          # sl ~3988
+    gap = _bar(3980, 3985, 3975, 3982)          # opens 3980, already below the stop -> gap-through
+    o = reconcile(t, [gap])
+    assert o.exit_reason == "sl_hit"
+    assert o.exit_price < t.sl_price            # filled at the gap open, worse than the stop
+    assert o.r_multiple < -1.0                  # worse than a clean -1R
+
+
+# --------------------------------------------------------------------------- #
 # metrics
 # --------------------------------------------------------------------------- #
 def test_summarize_edge_and_ambiguity_band():

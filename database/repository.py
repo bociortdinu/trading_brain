@@ -213,12 +213,12 @@ def open_shadow_trades(dsn: str, run_id: str) -> list[dict]:
     with psycopg.connect(dsn) as conn:
         rows = conn.execute(
             "SELECT decision_id, symbol, side, entry_price, sl_price, tp_price, opened_at, "
-            "spread_pct, spread_provenance FROM trades "
+            "spread_pct, spread_provenance, slippage_pct FROM trades "
             "WHERE mode = 'shadow' AND status = 'open' AND run_id = %s",
             (run_id,),
         ).fetchall()
     keys = ["decision_id", "symbol", "side", "entry_price", "sl_price", "tp_price",
-            "opened_at", "spread_pct", "spread_provenance"]
+            "opened_at", "spread_pct", "spread_provenance", "slippage_pct"]
     return [dict(zip(keys, r)) for r in rows]
 
 
@@ -278,8 +278,8 @@ def upsert_shadow_trade(dsn: str, *, decision_id: int, run_id: str, symbol: str,
                 (decision_id, run_id, symbol, side, mode, entry_price, sl_price, tp_price,
                  opened_at, status, exit_price, exit_reason, closed_at, r_multiple,
                  r_pessimistic, r_optimistic, ambiguous, timeframe, timeout_bars,
-                 spread_pct, spread_provenance, costs)
-            VALUES (%s,%s,%s,%s,'shadow',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 spread_pct, spread_provenance, slippage_pct, costs)
+            VALUES (%s,%s,%s,%s,'shadow',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (decision_id, run_id) DO UPDATE SET
                 status        = EXCLUDED.status,
                 exit_price    = EXCLUDED.exit_price,
@@ -297,7 +297,7 @@ def upsert_shadow_trade(dsn: str, *, decision_id: int, run_id: str, symbol: str,
                 trade.opened_at, outcome.status, outcome.exit_price, outcome.exit_reason,
                 outcome.closed_at, outcome.r_multiple, outcome.r_pessimistic, outcome.r_optimistic,
                 outcome.ambiguous, timeframe, timeout_bars, trade.spread_pct,
-                trade.spread_provenance, Json(cost_model),
+                trade.spread_provenance, trade.slippage_pct, Json(cost_model),
             ),
         ).fetchone()
         conn.commit()

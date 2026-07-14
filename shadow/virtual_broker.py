@@ -31,11 +31,12 @@ class ShadowConfig(BaseModel):
 
 class VirtualTrade(BaseModel):
     direction: Direction        # BUY or SELL only (NO_TRADE never reaches here)
-    entry_mid: float            # mid price at entry (bars are mid)
+    entry_mid: float            # ACTUAL entry fill (reference price + adverse slippage)
     sl_price: float             # absolute stop level
     tp_price: float             # absolute target level
     spread_pct: float           # round-trip spread cost basis
     spread_provenance: SpreadProvenance
+    slippage_pct: float = 0.0   # adverse slippage baked into entry; also applied on exit
     opened_at: datetime
 
     @property
@@ -46,25 +47,32 @@ class VirtualTrade(BaseModel):
 
 def open_virtual_trade(
     direction: Direction,
-    entry_mid: float,
+    entry_ref: float,
     sl_pct: float,
     tp_pct: float,
     *,
     spread_pct: float,
     spread_provenance: SpreadProvenance,
+    slippage_pct: float = 0.0,
     opened_at: datetime,
 ) -> VirtualTrade:
+    """`entry_ref` is the reference fill price (online: the observed quote; replay: the next
+    bar's open). Adverse slippage is applied to it, and SL/TP are derived from that fill."""
     if direction not in (Direction.BUY, Direction.SELL):
         raise ValueError("a virtual trade requires BUY or SELL, not NO_TRADE")
-    if entry_mid <= 0 or sl_pct <= 0 or tp_pct <= 0:
-        raise ValueError("entry_mid, sl_pct and tp_pct must be positive")
+    if entry_ref <= 0 or sl_pct <= 0 or tp_pct <= 0:
+        raise ValueError("entry_ref, sl_pct and tp_pct must be positive")
+    s = slippage_pct / 100.0
     if direction == Direction.BUY:
-        sl = entry_mid * (1 - sl_pct / 100)
-        tp = entry_mid * (1 + tp_pct / 100)
+        entry_fill = entry_ref * (1 + s)          # buying slips UP (adverse)
+        sl = entry_fill * (1 - sl_pct / 100)
+        tp = entry_fill * (1 + tp_pct / 100)
     else:  # SELL
-        sl = entry_mid * (1 + sl_pct / 100)
-        tp = entry_mid * (1 - tp_pct / 100)
+        entry_fill = entry_ref * (1 - s)          # selling slips DOWN (adverse)
+        sl = entry_fill * (1 + sl_pct / 100)
+        tp = entry_fill * (1 - tp_pct / 100)
     return VirtualTrade(
-        direction=direction, entry_mid=entry_mid, sl_price=round(sl, 4), tp_price=round(tp, 4),
-        spread_pct=spread_pct, spread_provenance=spread_provenance, opened_at=opened_at,
+        direction=direction, entry_mid=round(entry_fill, 4), sl_price=round(sl, 4),
+        tp_price=round(tp, 4), spread_pct=spread_pct, spread_provenance=spread_provenance,
+        slippage_pct=slippage_pct, opened_at=opened_at,
     )
