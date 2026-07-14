@@ -205,37 +205,58 @@ def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, mo
     return row[0]
 
 
-def record_shadow_trade(dsn: str, *, decision_id: int, symbol: str, trade, outcome) -> int:
-    """Persist a shadow VirtualTrade + its reconciled Outcome to the trades table.
+def upsert_shadow_trade(dsn: str, *, decision_id: int, run_id: str, symbol: str, trade, outcome,
+                        timeframe: str, timeout_bars: int, costs: dict | None = None) -> tuple[int, str]:
+    """Idempotently persist/refresh a shadow trade for (decision_id, run_id).
 
-    mode='shadow'; PnL is modeled (R-multiple is the primary metric, with pessimistic/
-    optimistic bands + the ambiguity flag for both-hit intervals). `trade` is a
-    shadow.virtual_broker.VirtualTrade, `outcome` a shadow.reconciler.Outcome.
+    A re-run UPSERTs the SAME row — an open trade is closed IN PLACE (entry/SL/TP stay
+    fixed; only the outcome + costs update), reconciliation is repeatable after a restart,
+    and experiments are separated by run_id. Returns (id, "inserted"|"updated"). PnL is
+    modeled; R-multiple is the primary metric with pessimistic/optimistic bands + ambiguity.
+    `trade` is a shadow.virtual_broker.VirtualTrade, `outcome` a shadow.reconciler.Outcome.
     """
     import psycopg
+    from psycopg.types.json import Json
 
     from core.models import Direction
 
     side = "buy" if trade.direction == Direction.BUY else "sell"
+    cost_model = costs or {
+        "spread_pct": trade.spread_pct, "spread_provenance": trade.spread_provenance,
+        "modeled": ["spread"], "not_modeled": ["commission", "swap", "slippage", "latency"],
+    }
     with psycopg.connect(dsn) as conn:
         row = conn.execute(
             """
             INSERT INTO trades
-                (decision_id, symbol, side, mode, entry_price, sl_price, tp_price, opened_at,
-                 status, exit_price, exit_reason, closed_at, r_multiple, r_pessimistic,
-                 r_optimistic, ambiguous)
-            VALUES (%s,%s,%s,'shadow',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            RETURNING id
+                (decision_id, run_id, symbol, side, mode, entry_price, sl_price, tp_price,
+                 opened_at, status, exit_price, exit_reason, closed_at, r_multiple,
+                 r_pessimistic, r_optimistic, ambiguous, timeframe, timeout_bars,
+                 spread_pct, spread_provenance, costs)
+            VALUES (%s,%s,%s,%s,'shadow',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (decision_id, run_id) DO UPDATE SET
+                status        = EXCLUDED.status,
+                exit_price    = EXCLUDED.exit_price,
+                exit_reason   = EXCLUDED.exit_reason,
+                closed_at     = EXCLUDED.closed_at,
+                r_multiple    = EXCLUDED.r_multiple,
+                r_pessimistic = EXCLUDED.r_pessimistic,
+                r_optimistic  = EXCLUDED.r_optimistic,
+                ambiguous     = EXCLUDED.ambiguous,
+                costs         = EXCLUDED.costs
+            RETURNING id, (xmax = 0) AS inserted
             """,
             (
-                decision_id, symbol, side, trade.entry_mid, trade.sl_price, trade.tp_price,
+                decision_id, run_id, symbol, side, trade.entry_mid, trade.sl_price, trade.tp_price,
                 trade.opened_at, outcome.status, outcome.exit_price, outcome.exit_reason,
-                outcome.closed_at, outcome.r_multiple, outcome.r_pessimistic,
-                outcome.r_optimistic, outcome.ambiguous,
+                outcome.closed_at, outcome.r_multiple, outcome.r_pessimistic, outcome.r_optimistic,
+                outcome.ambiguous, timeframe, timeout_bars, trade.spread_pct,
+                trade.spread_provenance, Json(cost_model),
             ),
         ).fetchone()
         conn.commit()
-    return row[0]
+    trade_id, inserted = row
+    return trade_id, ("inserted" if inserted else "updated")
 
 
 def snapshot_enrichment_status(dsn: str, symbol: str, bar_close):

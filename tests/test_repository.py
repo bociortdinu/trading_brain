@@ -180,10 +180,10 @@ def test_decision_references_immutable_evaluation():
         _cleanup(sym)
 
 
-def test_record_shadow_trade_full_chain():
+def test_upsert_shadow_trade_idempotent_open_then_closed():
     from core.models import Direction
     from data_collector.providers.base import Candle
-    from database.repository import insert_decision, insert_evaluation, record_shadow_trade, upsert_snapshot
+    from database.repository import insert_decision, insert_evaluation, upsert_shadow_trade, upsert_snapshot
     from decision.pipeline import DecisionRecord
     from decision.prefilter import PrefilterResult
     from decision.schema import DecisionOutput
@@ -193,6 +193,7 @@ def test_record_shadow_trade_full_chain():
 
     sym = "TST_" + os.urandom(3).hex()
     end = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    run_id = "test-run"
     try:
         _, snap_id = upsert_snapshot(DSN, _packet(sym, spread=0.03))
         eval_id = insert_evaluation(DSN, snap_id, _eval("replay", True, []))
@@ -210,16 +211,23 @@ def test_record_shadow_trade_full_chain():
                                  mode="shadow", data_provider="csv")
         trade = open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6,
                                    spread_pct=0.03, spread_provenance="modeled", opened_at=end)
-        # a bar that hits TP
+        # 1. no post-entry bars yet -> OPEN row
+        id1, st1 = upsert_shadow_trade(DSN, decision_id=dec_id, run_id=run_id, symbol=sym,
+                                       trade=trade, outcome=reconcile(trade, []),
+                                       timeframe="15min", timeout_bars=96)
+        assert st1 == "inserted"
+        # 2. a TP bar arrives -> reconcile again -> CLOSE THE SAME ROW in place (no duplicate)
         bar = Candle(open_time=end, close_time=end + timedelta(minutes=15),
                      open=4000, high=4030, low=3999, close=4025, volume=1.0)
-        outcome = reconcile(trade, [bar])
-        tid = record_shadow_trade(DSN, decision_id=dec_id, symbol=sym, trade=trade, outcome=outcome)
+        id2, st2 = upsert_shadow_trade(DSN, decision_id=dec_id, run_id=run_id, symbol=sym,
+                                       trade=trade, outcome=reconcile(trade, [bar]),
+                                       timeframe="15min", timeout_bars=96)
+        assert id2 == id1 and st2 == "updated"
         with psycopg.connect(DSN) as c:
-            row = c.execute("SELECT side, mode, status, exit_reason, r_multiple, ambiguous "
-                            "FROM trades WHERE id=%s", (tid,)).fetchone()
-        assert row[0] == "buy" and row[1] == "shadow" and row[2] == "closed"
-        assert row[3] == "tp_hit" and float(row[4]) > 0 and row[5] is False
+            n, status, prov = c.execute(
+                "SELECT count(*), max(status), max(spread_provenance) FROM trades WHERE decision_id=%s",
+                (dec_id,)).fetchone()
+        assert n == 1 and status == "closed" and prov == "modeled"  # one row, closed in place
     finally:
         _cleanup(sym)
 
