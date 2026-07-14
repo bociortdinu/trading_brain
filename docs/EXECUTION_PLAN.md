@@ -147,7 +147,12 @@ Nucleul Shadow Mode e gata (pur, determinist, testat):
 - `database.repository.record_shadow_trade` → tabelul `trades` (`mode='shadow'`, benzi + ambiguitate).
 Teste: `tests/test_shadow.py` (16) + `test_repository` full-chain (snapshot→eval→decizie→trade shadow).
 
-**Rămâne pentru Faza 3:** runner-ul care leagă decizii→trade-uri→reconciliere pe o rulare replay/continuă; **model de spread istoric/modelat** ca deciziile replay să treacă de Risk Engine (altfel `missing_spread`); modelarea latenței online (fill la quote observat) vs replay (fill la open-ul M1 următor + slippage); costuri suplimentare (comision de verificat, swap overnight).
+**Livrat (post-audit):**
+- **Backtest replay** — [shadow/runner.py](../shadow/runner.py): `backtest_over_windows` + spread modelat (`replay_spread_pct`); metrici de edge (win rate, expectancy R, bandă ambiguitate); `--persist` scrie lanțul complet (snapshot→eval→decizie→trade) cu `run_id`. Rulat real pe XTB (strategia deterministă nu are edge — toate sl_hit).
+- **Shadow online continuu** — [shadow/online.py](../shadow/online.py): pe fiecare tick decide + (dacă aprobat) deschide trade `open`, iar la tick-urile următoare `reconcile_open_trades` închide ce a atins SL/TP (idempotent). Rulat live pe XTB (a deschis un SELL shadow, `observed_xtb`). `--once` sau buclă la fiecare M15.
+- **Persistență completă** — `decisions`, `snapshot_evaluations`, `trades` (idempotent, run_id, benzi), `llm_calls` (orice apel incl. eșec + cost).
+
+**Rămâne:** modelarea latenței online (fill la quote observat) vs replay (fill la open-ul M1 următor + slippage); costuri suplimentare (comision de verificat, swap overnight); backtest adânc (paginare Go — necesită repornire serviciu); **măsurarea edge-ului real** = rularea cu makerul LLM (plătit, amânat).
 
 ---
 
