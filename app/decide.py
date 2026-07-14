@@ -25,7 +25,7 @@ from app.collect import (
 from config.settings import load_settings
 from core.models import Direction
 from data_collector.providers.factory import build_provider
-from database.repository import insert_decision, insert_evaluation, upsert_snapshot
+from database.repository import insert_decision, insert_evaluation, insert_llm_call, upsert_snapshot
 from decision.pipeline import run_decision
 from decision.prefilter import PrefilterConfig
 from decision.schema import DecisionInput, DecisionOutput, build_decision_input
@@ -104,8 +104,15 @@ async def _run(settings, *, mode: str, use_fake: bool, all_regimes: bool = False
               f"sl={record.risk.sl_pct} tp={record.risk.tp_pct} "
               f"execution_ready={record.risk.execution_ready} pending={record.risk.pending_execution_gates}")
 
-    tokens = {}
+    # Audit-log the LLM call (success OR failure) with its full manifest + cost.
     last = getattr(maker, "last_result", None)
+    if last is not None:
+        insert_llm_call(settings.db_dsn, last, snapshot_id=snap_id)
+    if record.stage == "llm_failed":
+        print(f"[llm] FAILED: {record.llm_error} (logged to llm_calls; no decision persisted)")
+        return
+
+    tokens = {}
     if last is not None:
         tokens = {"input": last.input_tokens, "output": last.output_tokens,
                   "latency_ms": last.latency_ms,

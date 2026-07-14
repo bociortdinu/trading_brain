@@ -52,7 +52,7 @@ def _manifest(inp: DecisionInput, prefilter_cfg: PrefilterConfig, risk_cfg: Risk
 
 
 class DecisionRecord(BaseModel):
-    stage: Literal["prefiltered_out", "decided"]
+    stage: Literal["prefiltered_out", "decided", "llm_failed"]
     symbol: str
     as_of: object
     mode: str
@@ -61,6 +61,7 @@ class DecisionRecord(BaseModel):
     risk: RiskVerdict | None = None
     input_hash: str
     manifest: dict
+    llm_error: str | None = None   # set when the LLM call failed (stage == "llm_failed")
 
     @property
     def risk_approved(self) -> bool:
@@ -101,7 +102,15 @@ async def run_decision(
             prefilter=pf, decision=None, risk=None, input_hash=inp.input_hash(), manifest=manifest,
         )
 
-    decision = await decision_maker.decide(inp)   # THE LLM (injected)
+    try:
+        decision = await decision_maker.decide(inp)   # THE LLM (injected)
+    except Exception as exc:  # noqa: BLE001 — a failed LLM call is auditable, not a crash
+        return DecisionRecord(
+            stage="llm_failed", symbol=inp.symbol, as_of=inp.as_of, mode=mode,
+            prefilter=pf, decision=None, risk=None, input_hash=inp.input_hash(),
+            manifest=manifest, llm_error=type(exc).__name__,
+        )
+
     risk = evaluate_risk(decision, packet, risk_config, spread_provenance=inp.spread_provenance)
     return DecisionRecord(
         stage="decided", symbol=inp.symbol, as_of=inp.as_of, mode=mode,

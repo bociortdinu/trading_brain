@@ -205,6 +205,35 @@ def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, mo
     return row[0]
 
 
+def insert_llm_call(dsn: str, result, *, snapshot_id: int | None = None) -> int:
+    """Audit-log one LLM call (success OR failure) with its full manifest + cost. `result`
+    is a decision.llm_client.LlmCallResult. Persisting failures too means a failed/refused/
+    rate-limited call is never invisible under pay-per-token."""
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        row = conn.execute(
+            """
+            INSERT INTO llm_calls
+                (snapshot_id, ok, error, requested_model, effective_model, request_id,
+                 stop_reason, input_tokens, output_tokens, cache_read_tokens,
+                 cache_creation_tokens, estimated_cost_usd, latency_ms, prompt_version,
+                 schema_version, input_hash)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id
+            """,
+            (
+                snapshot_id, result.ok, result.error, result.requested_model,
+                result.effective_model, result.request_id, result.stop_reason,
+                result.input_tokens, result.output_tokens, result.cache_read_input_tokens,
+                result.cache_creation_input_tokens, result.estimated_cost_usd, result.latency_ms,
+                result.prompt_version, result.schema_version, result.input_hash,
+            ),
+        ).fetchone()
+        conn.commit()
+    return row[0]
+
+
 def upsert_shadow_trade(dsn: str, *, decision_id: int, run_id: str, symbol: str, trade, outcome,
                         timeframe: str, timeout_bars: int, costs: dict | None = None) -> tuple[int, str]:
     """Idempotently persist/refresh a shadow trade for (decision_id, run_id).

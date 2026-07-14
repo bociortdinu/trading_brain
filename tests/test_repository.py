@@ -46,6 +46,7 @@ def _cleanup(symbol):
         snaps = "(SELECT id FROM market_snapshots WHERE symbol = %s)"
         decs = f"(SELECT id FROM decisions WHERE snapshot_id IN {snaps})"
         c.execute(f"DELETE FROM trades WHERE decision_id IN {decs}", (symbol,))
+        c.execute(f"DELETE FROM llm_calls WHERE snapshot_id IN {snaps}", (symbol,))
         c.execute(f"DELETE FROM decisions WHERE snapshot_id IN {snaps}", (symbol,))
         c.execute("DELETE FROM snapshot_conflicts WHERE symbol = %s", (symbol,))
         # snapshot_evaluations cascade on snapshot delete, but be explicit for clarity.
@@ -228,6 +229,32 @@ def test_upsert_shadow_trade_idempotent_open_then_closed():
                 "SELECT count(*), max(status), max(spread_provenance) FROM trades WHERE decision_id=%s",
                 (dec_id,)).fetchone()
         assert n == 1 and status == "closed" and prov == "modeled"  # one row, closed in place
+    finally:
+        _cleanup(sym)
+
+
+def test_insert_llm_call_logs_success_and_failure():
+    from database.repository import insert_llm_call, upsert_snapshot
+    from decision.llm_client import LlmCallResult
+
+    sym = "TST_" + os.urandom(3).hex()
+    try:
+        _, snap_id = upsert_snapshot(DSN, _packet(sym, spread=0.02))
+        ok = LlmCallResult(ok=True, requested_model="claude-haiku-4-5",
+                           effective_model="claude-haiku-4-5-20251001", request_id="req_1",
+                           stop_reason="end_turn", input_tokens=1000, output_tokens=300,
+                           cache_read_input_tokens=0, cache_creation_input_tokens=0,
+                           estimated_cost_usd=0.003, latency_ms=1200, input_hash="h")
+        fail = LlmCallResult(ok=False, error="api_status:429", requested_model="claude-haiku-4-5",
+                             input_hash="h")
+        insert_llm_call(DSN, ok, snapshot_id=snap_id)
+        insert_llm_call(DSN, fail, snapshot_id=snap_id)
+        with psycopg.connect(DSN) as c:
+            rows = c.execute("SELECT ok, error, effective_model, estimated_cost_usd FROM llm_calls "
+                             "WHERE snapshot_id=%s ORDER BY ok DESC", (snap_id,)).fetchall()
+        assert len(rows) == 2
+        assert rows[0][0] is True and rows[0][2] == "claude-haiku-4-5-20251001"  # success logged w/ cost
+        assert rows[1][0] is False and rows[1][1] == "api_status:429"            # failure logged w/ error
     finally:
         _cleanup(sym)
 

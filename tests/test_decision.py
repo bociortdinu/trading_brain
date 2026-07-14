@@ -205,3 +205,13 @@ def test_pipeline_replay_missing_spread_is_rejected_not_approved():
     llm = _FakeLLM(_out(Direction.BUY, 0.9))
     rec = _pipe(_packet(atr=0.2, spread=None), _elig(True), llm)   # replay bar, no spread
     assert rec.stage == "decided" and not rec.risk_approved and rec.risk.reason.startswith("missing_spread")
+
+
+def test_pipeline_llm_failure_is_captured_not_crashed():
+    class _FailingLLM:
+        async def decide(self, inp):
+            raise RuntimeError("boom")
+
+    rec = _pipe(_packet(atr=0.2, spread=0.05), _elig(True), _FailingLLM())
+    assert rec.stage == "llm_failed" and rec.llm_error == "RuntimeError"
+    assert rec.decision is None and rec.risk is None and not rec.risk_approved
