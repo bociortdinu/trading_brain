@@ -27,6 +27,13 @@ class ShadowConfig(BaseModel):
     # Close the trade if neither SL nor TP is hit within this many bars (of whatever
     # timeframe is fed to the reconciler). ~1 trading day of M15 bars by default.
     timeout_bars: int = 96
+    # Round-trip commission as % of notional. XTB gold CFD is typically commission-free;
+    # default 0 (set from the real account terms — do not invent a rate).
+    commission_pct: float = 0.0
+    # Overnight financing (swap) as % of notional per rollover held. Default 0 until the real
+    # swapLong/swapShort is read from the account; applied per rollover crossed.
+    swap_pct_per_night: float = 0.0
+    rollover_hour_utc: int = 22   # XTB daily rollover (22:00 UTC in summer)
 
 
 class VirtualTrade(BaseModel):

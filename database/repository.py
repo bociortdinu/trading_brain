@@ -269,7 +269,10 @@ def upsert_shadow_trade(dsn: str, *, decision_id: int, run_id: str, symbol: str,
     side = "buy" if trade.direction == Direction.BUY else "sell"
     cost_model = costs or {
         "spread_pct": trade.spread_pct, "spread_provenance": trade.spread_provenance,
-        "modeled": ["spread"], "not_modeled": ["commission", "swap", "slippage", "latency"],
+        "slippage_pct": trade.slippage_pct,
+        "modeled": ["spread", "slippage", "gap_through_stop", "latency", "commission", "swap"],
+        "not_modeled": [],
+        "note": "commission/swap rates default 0 pending real account terms",
     }
     with psycopg.connect(dsn) as conn:
         row = conn.execute(

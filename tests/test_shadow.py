@@ -144,6 +144,31 @@ def test_gap_through_stop_fills_worse_than_the_stop():
 
 
 # --------------------------------------------------------------------------- #
+# commission + overnight swap
+# --------------------------------------------------------------------------- #
+def test_rollovers_counts_nights_held():
+    from shadow.reconciler import _rollovers
+    o = datetime(2026, 7, 10, 20, tzinfo=UTC)
+    assert _rollovers(o, datetime(2026, 7, 10, 21, tzinfo=UTC), 22) == 0   # before 22:00
+    assert _rollovers(o, datetime(2026, 7, 10, 23, tzinfo=UTC), 22) == 1   # crossed 22:00
+    assert _rollovers(o, datetime(2026, 7, 12, 23, tzinfo=UTC), 22) == 3   # three nights
+
+
+def test_commission_reduces_r():
+    tp = _bar(4000, 4025, 3999, 4020)
+    o0 = reconcile(_long(spread=0.0), [tp], ShadowConfig(commission_pct=0.0))
+    o1 = reconcile(_long(spread=0.0), [tp], ShadowConfig(commission_pct=0.03))
+    assert o0.r_multiple == pytest.approx(2.0) and o1.r_multiple < o0.r_multiple
+
+
+def test_overnight_swap_reduces_r_for_positions_held_past_rollover():
+    tp = _bar(4000, 4025, 3999, 4020, n=9)  # closes 22:30, past the 22:00 rollover
+    o0 = reconcile(_long(spread=0.0), [tp], ShadowConfig(swap_pct_per_night=0.0))
+    o1 = reconcile(_long(spread=0.0), [tp], ShadowConfig(swap_pct_per_night=0.05))
+    assert o1.r_multiple < o0.r_multiple      # one night of swap deducted
+
+
+# --------------------------------------------------------------------------- #
 # metrics
 # --------------------------------------------------------------------------- #
 def test_summarize_edge_and_ambiguity_band():

@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from pydantic import BaseModel
 
@@ -33,16 +33,39 @@ class Outcome(BaseModel):
     ambiguous: bool = False
 
 
-def _r_net(trade: VirtualTrade, exit_fill: float) -> float:
-    """Signed R-multiple from the actual exit FILL, net of ONE round-trip spread cost
-    (slippage is already baked into entry_mid and exit_fill)."""
+def _rollovers(opened_at: datetime, closed_at: datetime, rollover_hour: int) -> int:
+    """Number of daily-rollover boundaries (rollover_hour UTC) strictly between the two
+    instants — i.e. how many nights the position is held over."""
+    if closed_at <= opened_at:
+        return 0
+    boundary = opened_at.replace(hour=rollover_hour, minute=0, second=0, microsecond=0)
+    if boundary <= opened_at:
+        boundary += timedelta(days=1)
+    nights = 0
+    while boundary < closed_at:
+        nights += 1
+        boundary += timedelta(days=1)
+    return nights
+
+
+def _extra_cost(trade: VirtualTrade, config, closed_at: datetime) -> float:
+    """Commission (round-trip) + overnight swap (per rollover held), in price units."""
+    commission = trade.entry_mid * config.commission_pct / 100.0
+    nights = _rollovers(trade.opened_at, closed_at, config.rollover_hour_utc)
+    swap = nights * trade.entry_mid * config.swap_pct_per_night / 100.0
+    return commission + swap
+
+
+def _r_net(trade: VirtualTrade, exit_fill: float, extra_cost: float = 0.0) -> float:
+    """Signed R-multiple from the actual exit FILL, net of the round-trip spread cost plus any
+    commission/swap (slippage is already baked into entry_mid and exit_fill)."""
     sign = 1.0 if trade.direction == Direction.BUY else -1.0
     gross = sign * (exit_fill - trade.entry_mid)
     spread_cost = trade.entry_mid * trade.spread_pct / 100.0  # one full spread, round trip
     risk = trade.risk_per_unit
     if risk <= 0:
         return 0.0
-    return round((gross - spread_cost) / risk, 3)
+    return round((gross - spread_cost - extra_cost) / risk, 3)
 
 
 def _exit_fill(trade: VirtualTrade, exit_ref: float) -> float:
@@ -85,11 +108,12 @@ def reconcile(trade: VirtualTrade, bars: list[Candle], config: ShadowConfig | No
     config = config or ShadowConfig()
     for i, bar in enumerate(_post_entry_bars(trade, bars)):
         sl_hit, tp_hit = _hits(trade, bar)
+        extra = _extra_cost(trade, config, bar.close_time)  # commission + swap for holding to here
 
         if sl_hit and tp_hit:
             sl_fill = _exit_fill(trade, _stop_exit_ref(trade, bar))   # gap-through + slippage
             tp_fill = _exit_fill(trade, trade.tp_price)               # slippage
-            r_pess, r_opt = _r_net(trade, sl_fill), _r_net(trade, tp_fill)
+            r_pess, r_opt = _r_net(trade, sl_fill, extra), _r_net(trade, tp_fill, extra)
             return Outcome(
                 status="closed", exit_reason="ambiguous", exit_price=round(sl_fill, 4),
                 closed_at=bar.close_time, r_multiple=r_pess, r_pessimistic=r_pess,
@@ -97,18 +121,18 @@ def reconcile(trade: VirtualTrade, bars: list[Candle], config: ShadowConfig | No
             )
         if tp_hit:
             fill = _exit_fill(trade, trade.tp_price)
-            r = _r_net(trade, fill)
+            r = _r_net(trade, fill, extra)
             return Outcome(status="closed", exit_reason="tp_hit", exit_price=round(fill, 4),
                            closed_at=bar.close_time, r_multiple=r, r_pessimistic=r, r_optimistic=r)
         if sl_hit:
             fill = _exit_fill(trade, _stop_exit_ref(trade, bar))
-            r = _r_net(trade, fill)
+            r = _r_net(trade, fill, extra)
             return Outcome(status="closed", exit_reason="sl_hit", exit_price=round(fill, 4),
                            closed_at=bar.close_time, r_multiple=r, r_pessimistic=r, r_optimistic=r)
 
         if i + 1 >= config.timeout_bars:  # no touch within the horizon -> time-based exit
             fill = _exit_fill(trade, bar.close)
-            r = _r_net(trade, fill)
+            r = _r_net(trade, fill, extra)
             return Outcome(status="expired", exit_reason="timeout", exit_price=round(fill, 4),
                            closed_at=bar.close_time, r_multiple=r, r_pessimistic=r, r_optimistic=r)
 
