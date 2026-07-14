@@ -29,7 +29,9 @@ from config.settings import Settings, load_settings
 from core.models import Direction
 from data_collector.providers.base import Candle
 from data_collector.providers.factory import build_provider
+from data_collector.session import calendar_for
 from database.repository import (
+    find_shadow_trade_by_input,
     insert_decision,
     insert_evaluation,
     insert_llm_call,
@@ -44,7 +46,7 @@ from features.mtf import TRIGGER_TF
 from risk.engine import RiskConfig
 from shadow.reconciler import reconcile
 from shadow.runner import ConfluenceStrategy
-from shadow.virtual_broker import ShadowConfig, VirtualTrade, open_virtual_trade
+from shadow.virtual_broker import ShadowConfig, VirtualTrade, cost_manifest, open_virtual_trade
 
 log = logging.getLogger(__name__)
 DEFAULT_RUN_ID = "shadow-online-confluence"
@@ -72,13 +74,16 @@ def reconcile_open_trades(dsn: str, m15_bars: list[Candle], *, run_id: str,
         if outcome.status != "open":
             upsert_shadow_trade(dsn, decision_id=row["decision_id"], run_id=run_id,
                                 symbol=row["symbol"], trade=trade, outcome=outcome,
-                                timeframe=TRIGGER_TF, timeout_bars=shadow_config.timeout_bars)
+                                timeframe=TRIGGER_TF, timeout_bars=shadow_config.timeout_bars,
+                                costs=cost_manifest(trade, shadow_config))
             closed += 1
     return closed
 
 
 async def shadow_tick(settings: Settings, provider, provider_name: str, *, decision_maker,
-                      run_id: str, model_name: str = "deterministic-confluence") -> dict:
+                      run_id: str, model_name: str = "deterministic-confluence",
+                      shadow_config: ShadowConfig | None = None) -> dict:
+    shadow_config = shadow_config or ShadowConfig()
     now = datetime.now(timezone.utc)
     brain_symbol = settings.symbol_query
     provider_symbol = settings.provider_symbol(brain_symbol)
@@ -107,7 +112,8 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     if snap_id is not None and status != "conflict":
         eval_id = insert_evaluation(settings.db_dsn, snap_id, result)
         record = await run_decision(packet, result, decision_maker, mode="online",
-                                    prefilter_config=PrefilterConfig(), risk_config=RiskConfig())
+                                    prefilter_config=PrefilterConfig(), risk_config=RiskConfig(),
+                                    calendar=calendar_for(provider_name))
         last = getattr(decision_maker, "last_result", None)
         if last is not None:
             insert_llm_call(settings.db_dsn, last, snapshot_id=snap_id)
@@ -122,34 +128,65 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
                 mode="shadow", data_provider=provider_name,
             )
             summary["decision"] = f"{record.stage}:{record.decision.direction.value if record.decision else '-'}"
-            if record.risk_approved:
+            # Idempotency: if this frozen input already produced a trade in this run (e.g. the
+            # same M15 bar reprocessed after a restart), don't open a duplicate.
+            already = find_shadow_trade_by_input(
+                settings.db_dsn, input_hash=record.input_hash, model=model_name, run_id=run_id)
+            if record.risk_approved and already is not None:
+                summary["opened_trade"] = f"exists:{already}"
+            elif record.risk_approved:
                 # Online: fill at the OBSERVED quote mid (captures real latency), not the bar close.
                 observed_mid = None
                 if basis is not None and basis.get("xtb_bid") and basis.get("xtb_ask"):
                     observed_mid = (basis["xtb_bid"] + basis["xtb_ask"]) / 2
+                # opened_at is the OBSERVATION time (when the quote was seen), NOT the bar close:
+                # reconciliation must not count M15 movement that happened before the real entry.
                 trade = open_virtual_trade(
                     record.decision.direction, observed_mid or packet.price,
                     record.risk.sl_pct, record.risk.tp_pct,
                     spread_pct=packet.spread_pct or settings.replay_spread_pct,
                     spread_provenance="observed_xtb" if packet.spread_pct else "modeled",
-                    slippage_pct=settings.slippage_pct, opened_at=as_of,
+                    slippage_pct=settings.slippage_pct, opened_at=quote_time or eval_now,
                 )
                 tid, _ = upsert_shadow_trade(
                     settings.db_dsn, decision_id=dec_id, run_id=run_id, symbol=brain_symbol,
-                    trade=trade, outcome=reconcile(trade, []), timeframe=TRIGGER_TF,
-                    timeout_bars=ShadowConfig().timeout_bars,
+                    trade=trade, outcome=reconcile(trade, [], shadow_config), timeframe=TRIGGER_TF,
+                    timeout_bars=shadow_config.timeout_bars, costs=cost_manifest(trade, shadow_config),
                 )
                 summary["opened_trade"] = tid
 
-    summary["reconciled_closed"] = reconcile_open_trades(settings.db_dsn, windows[TRIGGER_TF], run_id=run_id)
+    summary["reconciled_closed"] = reconcile_open_trades(
+        settings.db_dsn, windows[TRIGGER_TF], run_id=run_id, shadow_config=shadow_config)
     return summary
 
 
-async def _once(settings: Settings, run_id: str) -> None:
+def _shadow_config(settings: Settings) -> ShadowConfig:
+    return ShadowConfig(commission_pct=settings.commission_pct,
+                        swap_pct_per_night=settings.swap_pct_per_night)
+
+
+def _build_maker(settings: Settings, kind: str):
+    """Select the shadow decision maker. `deterministic` = the free ConfluenceStrategy (default,
+    no API cost); `claude` = the real paid AnthropicDecisionMaker (needs BRAIN_ANTHROPIC_API_KEY).
+    Returns (maker, model_name) so the persisted decision records which maker produced it."""
+    if kind == "deterministic":
+        return ConfluenceStrategy(), "deterministic-confluence"
+    if kind == "claude":
+        if not settings.anthropic_api_key:
+            raise SystemExit("--maker claude needs BRAIN_ANTHROPIC_API_KEY (real, paid API calls)")
+        from decision.llm_client import AnthropicDecisionMaker
+        maker = AnthropicDecisionMaker(settings.anthropic_api_key, settings.decision_model,
+                                       max_tokens=settings.decision_max_tokens)
+        return maker, settings.decision_model
+    raise SystemExit(f"unknown --maker {kind!r} (expected deterministic|claude)")
+
+
+async def _once(settings: Settings, run_id: str, maker, model_name: str) -> None:
     provider = build_provider(settings)
     try:
         summary = await shadow_tick(settings, provider, settings.market_data_provider,
-                                    decision_maker=ConfluenceStrategy(), run_id=run_id)
+                                    decision_maker=maker, run_id=run_id, model_name=model_name,
+                                    shadow_config=_shadow_config(settings))
     finally:
         aclose = getattr(provider, "aclose", None)
         if aclose:
@@ -157,14 +194,16 @@ async def _once(settings: Settings, run_id: str) -> None:
     print(f"[shadow-online] {summary}")
 
 
-async def _loop(settings: Settings, run_id: str, offset_seconds: float = 5.0) -> None:
+async def _loop(settings: Settings, run_id: str, maker, model_name: str,
+                offset_seconds: float = 5.0) -> None:
     provider = build_provider(settings)
-    maker = ConfluenceStrategy()
     try:
         while True:
             try:
                 summary = await shadow_tick(settings, provider, settings.market_data_provider,
-                                            decision_maker=maker, run_id=run_id)
+                                            decision_maker=maker, run_id=run_id,
+                                            model_name=model_name,
+                                            shadow_config=_shadow_config(settings))
                 log.info("shadow tick: %s", summary)
             except Exception:  # noqa: BLE001 — a tick error must not kill the loop
                 log.exception("shadow tick failed (continuing)")
@@ -181,12 +220,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Continuous shadow-online (no execution).")
     parser.add_argument("--once", action="store_true", help="run one tick then exit")
     parser.add_argument("--run-id", default=DEFAULT_RUN_ID, help="experiment id for shadow trades")
+    parser.add_argument("--maker", choices=["deterministic", "claude"], default="deterministic",
+                        help="decision maker: deterministic (free) or claude (paid API)")
     args = parser.parse_args()
     settings = load_settings()
+    maker, model_name = _build_maker(settings, args.maker)
     if args.once:
-        asyncio.run(_once(settings, args.run_id))
+        asyncio.run(_once(settings, args.run_id, maker, model_name))
     else:
-        asyncio.run(_loop(settings, args.run_id))
+        asyncio.run(_loop(settings, args.run_id, maker, model_name))
     return 0
 
 

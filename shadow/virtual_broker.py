@@ -52,6 +52,29 @@ class VirtualTrade(BaseModel):
         return abs(self.entry_mid - self.sl_price)
 
 
+def cost_manifest(trade: "VirtualTrade", config: ShadowConfig) -> dict:
+    """Honest cost manifest for persistence: a cost component is 'modeled' ONLY when its rate
+    is actually non-zero. Commission/swap default to 0 (real XTB terms not wired), so they
+    land in `not_modeled` — the R-multiple is NOT net of real financing, and the manifest must
+    say so instead of claiming 'modeled' with a zero rate."""
+    modeled = ["spread", "gap_through_stop", "latency"]
+    not_modeled: list[str] = []
+    (modeled if trade.slippage_pct > 0 else not_modeled).append("slippage")
+    (modeled if config.commission_pct > 0 else not_modeled).append("commission")
+    (modeled if config.swap_pct_per_night > 0 else not_modeled).append("swap")
+    manifest = {
+        "spread_pct": trade.spread_pct, "spread_provenance": trade.spread_provenance,
+        "slippage_pct": trade.slippage_pct,
+        "commission_pct": config.commission_pct, "swap_pct_per_night": config.swap_pct_per_night,
+        "modeled": modeled, "not_modeled": not_modeled,
+    }
+    if "swap" in not_modeled or "commission" in not_modeled:
+        manifest["note"] = ("commission/swap rate 0 -> NOT net of real financing; also single "
+                            "swap rate (no long/short split), fixed 22:00 UTC rollover, no DST/"
+                            "triple-swap. Wire real XTB terms before trusting expectancy.")
+    return manifest
+
+
 def open_virtual_trade(
     direction: Direction,
     entry_ref: float,

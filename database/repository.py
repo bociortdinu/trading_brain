@@ -267,12 +267,17 @@ def upsert_shadow_trade(dsn: str, *, decision_id: int, run_id: str, symbol: str,
     from core.models import Direction
 
     side = "buy" if trade.direction == Direction.BUY else "sell"
+    # Prefer an explicit manifest from the caller (shadow.virtual_broker.cost_manifest, which
+    # partitions modeled/not_modeled by ACTUAL non-zero rates). The fallback here is honest too:
+    # with no config in scope, commission/swap rates are unknown -> not_modeled, never claimed.
     cost_model = costs or {
         "spread_pct": trade.spread_pct, "spread_provenance": trade.spread_provenance,
         "slippage_pct": trade.slippage_pct,
-        "modeled": ["spread", "slippage", "gap_through_stop", "latency", "commission", "swap"],
-        "not_modeled": [],
-        "note": "commission/swap rates default 0 pending real account terms",
+        "modeled": ["spread", "gap_through_stop", "latency"]
+        + (["slippage"] if trade.slippage_pct > 0 else []),
+        "not_modeled": ["commission", "swap"]
+        + ([] if trade.slippage_pct > 0 else ["slippage"]),
+        "note": "commission/swap rate unknown here (no config) -> NOT net of real financing",
     }
     with psycopg.connect(dsn) as conn:
         row = conn.execute(
@@ -293,6 +298,7 @@ def upsert_shadow_trade(dsn: str, *, decision_id: int, run_id: str, symbol: str,
                 r_optimistic  = EXCLUDED.r_optimistic,
                 ambiguous     = EXCLUDED.ambiguous,
                 costs         = EXCLUDED.costs
+            WHERE trades.status = 'open'
             RETURNING id, (xmax = 0) AS inserted
             """,
             (
@@ -303,9 +309,35 @@ def upsert_shadow_trade(dsn: str, *, decision_id: int, run_id: str, symbol: str,
                 trade.spread_provenance, trade.slippage_pct, Json(cost_model),
             ),
         ).fetchone()
+        # MONOTONE: `WHERE trades.status = 'open'` means a conflict on an ALREADY-CLOSED trade
+        # updates nothing and RETURNING yields no row. A closed shadow trade is terminal — never
+        # reopened or re-scored. Report it as unchanged instead of crashing on the empty result.
+        if row is None:
+            existing = conn.execute(
+                "SELECT id FROM trades WHERE decision_id = %s AND run_id = %s",
+                (decision_id, run_id),
+            ).fetchone()
+            conn.commit()
+            return existing[0], "unchanged"
         conn.commit()
     trade_id, inserted = row
     return trade_id, ("inserted" if inserted else "updated")
+
+
+def find_shadow_trade_by_input(dsn: str, *, input_hash: str, model: str, run_id: str) -> int | None:
+    """End-to-end idempotency key: a shadow trade is uniquely the outcome of deciding a given
+    FROZEN input (input_hash) with a given model, within an experiment (run_id). The DB's
+    UNIQUE(decision_id, run_id) can't dedupe across re-runs because each re-run mints a NEW
+    decision_id — so we dedupe on the input instead. Returns the existing trade id or None."""
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        row = conn.execute(
+            "SELECT t.id FROM trades t JOIN decisions d ON t.decision_id = d.id "
+            "WHERE d.input_hash = %s AND d.model = %s AND t.run_id = %s LIMIT 1",
+            (input_hash, model, run_id),
+        ).fetchone()
+    return row[0] if row else None
 
 
 def snapshot_enrichment_status(dsn: str, symbol: str, bar_close):

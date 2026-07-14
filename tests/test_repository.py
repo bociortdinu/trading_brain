@@ -233,6 +233,94 @@ def test_upsert_shadow_trade_idempotent_open_then_closed():
         _cleanup(sym)
 
 
+def _seed_decision(sym, *, input_hash="h", model="fake", end=None):
+    """Snapshot -> evaluation -> decision; returns (dec_id). Shared by the idempotency tests."""
+    from database.repository import insert_decision, insert_evaluation, upsert_snapshot
+    from decision.pipeline import DecisionRecord
+    from decision.prefilter import PrefilterResult
+    from decision.schema import DecisionOutput
+    from risk.engine import RiskVerdict
+
+    end = end or datetime(2026, 7, 1, tzinfo=timezone.utc)
+    _, snap_id = upsert_snapshot(DSN, _packet(sym, spread=0.03))
+    eval_id = insert_evaluation(DSN, snap_id, _eval("replay", True, []))
+    decision = DecisionOutput(direction="BUY", confidence=0.8, rationale="x")
+    risk = RiskVerdict(approved=True, reason=None, direction="BUY", confidence=0.8,
+                       sl_pct=0.3, tp_pct=0.6, risk_config_version="risk-mvp-2026.2")
+    rec = DecisionRecord(stage="decided", symbol=sym, as_of=end, mode="replay",
+                         prefilter=PrefilterResult(passed=True, reasons=[], config_version="pf"),
+                         decision=decision, risk=risk, input_hash=input_hash,
+                         manifest={"prompt_version": "p", "output_schema_version": "s",
+                                   "feature_pipeline_version": "1.2.0", "strategy_version": "st",
+                                   "risk_config_version": "risk-mvp-2026.2"})
+    return insert_decision(DSN, snapshot_id=snap_id, evaluation_id=eval_id, model=model,
+                           record=rec, ai_input={}, ai_output=decision.model_dump(mode="json"),
+                           mode="shadow", data_provider="csv")
+
+
+def test_upsert_shadow_trade_never_reopens_a_closed_trade():
+    """MONOTONE: once a shadow trade is closed it is terminal. A later upsert carrying an OPEN
+    outcome (e.g. a stray reprocess) must NOT reopen or re-score it."""
+    from core.models import Direction
+    from data_collector.providers.base import Candle
+    from database.repository import upsert_shadow_trade
+    from shadow.reconciler import reconcile
+    from shadow.virtual_broker import open_virtual_trade
+
+    sym = "TST_" + os.urandom(3).hex()
+    end = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    try:
+        dec_id = _seed_decision(sym)
+        trade = open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6,
+                                   spread_pct=0.03, spread_provenance="modeled", opened_at=end)
+        tp_bar = Candle(open_time=end, close_time=end + timedelta(minutes=15),
+                        open=4000, high=4030, low=3999, close=4025, volume=1.0)
+        id1, st1 = upsert_shadow_trade(DSN, decision_id=dec_id, run_id="r", symbol=sym,
+                                       trade=trade, outcome=reconcile(trade, [tp_bar]),
+                                       timeframe="15min", timeout_bars=96)
+        assert st1 == "inserted"
+        # Try to overwrite the CLOSED row with an OPEN outcome -> refused (unchanged).
+        id2, st2 = upsert_shadow_trade(DSN, decision_id=dec_id, run_id="r", symbol=sym,
+                                       trade=trade, outcome=reconcile(trade, []),
+                                       timeframe="15min", timeout_bars=96)
+        assert id2 == id1 and st2 == "unchanged"
+        with psycopg.connect(DSN) as c:
+            status = c.execute("SELECT status FROM trades WHERE id=%s", (id1,)).fetchone()[0]
+        assert status == "closed"   # stayed closed; never reopened
+    finally:
+        _cleanup(sym)
+
+
+def test_find_shadow_trade_by_input_dedupes_across_reruns():
+    """END-TO-END IDEMPOTENCY: two runs produce DIFFERENT decision_ids for the SAME frozen
+    input; the (input_hash, model, run_id) lookup still finds the existing trade so a re-run
+    can skip it instead of duplicating the chain."""
+    from core.models import Direction
+    from database.repository import find_shadow_trade_by_input, upsert_shadow_trade
+    from shadow.reconciler import reconcile
+    from shadow.virtual_broker import open_virtual_trade
+
+    sym = "TST_" + os.urandom(3).hex()
+    end = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    try:
+        assert find_shadow_trade_by_input(DSN, input_hash="hh", model="m", run_id="r") is None
+        dec_id = _seed_decision(sym, input_hash="hh", model="m")
+        trade = open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6,
+                                   spread_pct=0.03, spread_provenance="modeled", opened_at=end)
+        tid, _ = upsert_shadow_trade(DSN, decision_id=dec_id, run_id="r", symbol=sym,
+                                     trade=trade, outcome=reconcile(trade, []),
+                                     timeframe="15min", timeout_bars=96)
+        # A SECOND run mints a new decision_id for the same input, but the trade already exists.
+        dec_id2 = _seed_decision(sym, input_hash="hh", model="m")
+        assert dec_id2 != dec_id
+        assert find_shadow_trade_by_input(DSN, input_hash="hh", model="m", run_id="r") == tid
+        # different run_id or model -> not a match (experiments/makers stay separate)
+        assert find_shadow_trade_by_input(DSN, input_hash="hh", model="m", run_id="other") is None
+        assert find_shadow_trade_by_input(DSN, input_hash="hh", model="claude", run_id="r") is None
+    finally:
+        _cleanup(sym)
+
+
 def test_reconcile_open_trades_closes_hit_trades_idempotently():
     from core.models import Direction
     from data_collector.providers.base import Candle

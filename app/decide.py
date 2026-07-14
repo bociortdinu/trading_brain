@@ -25,6 +25,7 @@ from app.collect import (
 from config.settings import load_settings
 from core.models import Direction
 from data_collector.providers.factory import build_provider
+from data_collector.session import calendar_for
 from database.repository import insert_decision, insert_evaluation, insert_llm_call, upsert_snapshot
 from decision.pipeline import run_decision
 from decision.prefilter import PrefilterConfig
@@ -95,7 +96,8 @@ async def _run(settings, *, mode: str, use_fake: bool, all_regimes: bool = False
     # --shadow-all-regimes lifts only the regime skip, keeping every other gate intact.
     pf_config = PrefilterConfig(blocked_regimes=[]) if all_regimes else PrefilterConfig()
     record = await run_decision(packet, result, maker, mode=mode,
-                                prefilter_config=pf_config, risk_config=RiskConfig())
+                                prefilter_config=pf_config, risk_config=RiskConfig(),
+                                calendar=calendar_for(provider_name))
     inp = build_decision_input(packet, mode=mode)
     print(f"[decision] stage={record.stage} "
           f"{'prefilter='+str(record.prefilter.reasons) if record.stage=='prefiltered_out' else ''}")

@@ -36,6 +36,24 @@ def test_backtest_uptrend_produces_approved_buys_and_closed_trades():
     assert rep["metrics"]["trades_closed"] >= 1
 
 
+def test_single_position_gate_blocks_overlapping_entries():
+    """Executable-realism gate: with single_position (default) no new trade opens while one is
+    open, so trades_opened < approved and the surplus approvals are counted as blocked. Turning
+    the gate off (event-study) opens every approval and blocks none."""
+    gated = report(run(backtest_over_windows(
+        _windows(step=1.0), symbol="GOLD", provider_name="csv",
+        decision_maker=ConfluenceStrategy(), modeled_spread_pct=0.02)))
+    study = report(run(backtest_over_windows(
+        _windows(step=1.0), symbol="GOLD", provider_name="csv",
+        decision_maker=ConfluenceStrategy(), modeled_spread_pct=0.02, single_position=False)))
+
+    assert gated["approved"] > gated["trades_opened"]          # some approvals suppressed
+    assert gated["blocked_position_open"] > 0
+    assert gated["approved"] == gated["blocked_position_open"] + gated["trades_opened"]
+    assert study["blocked_position_open"] == 0                  # event-study opens everything
+    assert study["trades_opened"] == study["approved"] > gated["trades_opened"]
+
+
 def test_backtest_no_lookahead_reconciles_only_future_bars():
     # Every reconciled trade closes strictly AFTER its entry bar (guaranteed by the reconciler);
     # here we just assert the runner yields outcomes and the metrics are net-of-spread finite.

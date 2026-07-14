@@ -10,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from core.models import Direction
+from data_collector.session import DEFAULT_CALENDAR, calendar_for
 from decision.pipeline import DecisionBindingError, run_decision
 from decision.prefilter import PrefilterConfig, prefilter
 from decision.schema import DecisionInput, DecisionOutput, NewsContext, build_decision_input
@@ -158,6 +159,35 @@ def test_risk_rejects_market_closed():
     assert not v.approved and v.reason == "market_closed" and v.session_open is False
 
 
+# Sunday 2026-07-12 21:30 UTC = 17:30 ET: Polygon (opens 17:00 ET) is OPEN, XTB (opens 18:00
+# ET) is CLOSED. This is the exact window the reviewer flagged: the Risk Engine must use the
+# PROVIDER's calendar, or it will authorize an entry when XTB is shut.
+_XTB_CLOSED_POLYGON_OPEN = datetime(2026, 7, 12, 21, 30, tzinfo=UTC)
+
+
+def test_risk_calendar_is_provider_specific_xtb_vs_polygon():
+    packet = _packet(bar=_XTB_CLOSED_POLYGON_OPEN, atr=0.2, spread=0.05)
+    poly = evaluate_risk(_out(Direction.BUY, 0.9), packet, RiskConfig(),
+                         calendar=calendar_for("polygon"))
+    xtb = evaluate_risk(_out(Direction.BUY, 0.9), packet, RiskConfig(),
+                        calendar=calendar_for("xtb"))
+    assert poly.session_open is True and poly.approved            # Polygon: open
+    assert xtb.session_open is False and xtb.reason == "market_closed"   # XTB: shut
+
+
+def test_pipeline_threads_provider_calendar_not_polygon_default():
+    """Regression: run_decision must reject on the XTB calendar at a Sunday-gap bar that the
+    Polygon calendar would approve. Guards against the silent DEFAULT_CALENDAR fallback."""
+    packet = _packet(bar=_XTB_CLOSED_POLYGON_OPEN, atr=0.2, spread=0.05)
+    elig = _elig(True, as_of=_XTB_CLOSED_POLYGON_OPEN)
+    approved = _pipe(packet, elig, _FakeLLM(_out(Direction.BUY, 0.9)),
+                     calendar=calendar_for("polygon"))
+    rejected = _pipe(packet, elig, _FakeLLM(_out(Direction.BUY, 0.9)),
+                     calendar=calendar_for("xtb"))
+    assert approved.risk_approved is True
+    assert rejected.risk_approved is False and rejected.risk.reason == "market_closed"
+
+
 def test_risk_rejects_out_of_bounds_sl_never_clamps():
     v = evaluate_risk(_out(Direction.BUY, 0.9), _packet(atr=5.0, spread=0.05), RiskConfig())
     assert not v.approved and "sl_out_of_bounds" in v.reason and v.sl_pct is None
@@ -171,9 +201,10 @@ def test_risk_rejects_spread_wider_than_stop_fraction():
 # --------------------------------------------------------------------------- #
 # pipeline composition + evaluation binding (no execution)
 # --------------------------------------------------------------------------- #
-def _pipe(packet, elig, llm, mode="replay"):
+def _pipe(packet, elig, llm, mode="replay", calendar=DEFAULT_CALENDAR):
     return run(run_decision(packet, elig, llm, mode=mode,
-                            prefilter_config=PrefilterConfig(), risk_config=RiskConfig()))
+                            prefilter_config=PrefilterConfig(), risk_config=RiskConfig(),
+                            calendar=calendar))
 
 
 def test_pipeline_binding_rejects_mode_mismatch():

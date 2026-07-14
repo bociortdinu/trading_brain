@@ -22,6 +22,40 @@ Cross-cutting (în toate fazele): manifest de reproducere, teste, discipline ant
 
 ---
 
+## Status onest (2026-07-14, după runda 2 de review extern)
+
+Corectez supraevaluări din raportările anterioare (reviewer-ul a avut dreptate):
+
+- **NU** „audit închis integral / Faza 3 completă". Faza 3 e funcțională dar are datorii (mai jos).
+- Backtest-ul determinist NU e un „no-edge robust pe 26 zile". Semnalele s-au concentrat într-un
+  singur regim intraday; înainte era un **event-study** cu poziții suprapuse. Acum există un
+  **position gate** (o poziție o dată) → rezultat executabil, dar tot pe o fereastră limitată.
+- Modelul de cost **nu** e „complet". Comision/swap sunt 0 (nemodelate), un singur swap (fără
+  long/short), rollover fix 22:00 UTC fără DST/triple-swap. Manifestul persistat spune acum onest
+  `not_modeled` când rata e 0.
+- Sistemul **nu acumulează track record**: `shadow.online`/`app.jobs` nu rulează ca serviciu; doar
+  serviciul XTB (trading_hands) e activ.
+- Număr real de commit-uri: **11 în trading_brain, 3 în trading_hands** (nu 15+4).
+
+**Reparat în runda 2 (cu teste):**
+1. **Risk Engine folosea calendarul Polygon** (nu al providerului) → putea aproba cu XTB închis.
+   `run_decision` cere acum `calendar` (fără default) + test regresie XTB-vs-Polygon (duminică 21:30 UTC).
+2. Manifest de cost onest (`not_modeled` pentru rate 0) + comision/swap configurabile din Settings.
+3. **Position gate** (o poziție o dată) + cooldown opțional; `report()` separă `approved` /
+   `blocked_position_open` / `trades_opened`.
+4. **Idempotency end-to-end** pe `(input_hash, model, run_id)` (nu pe `decision_id`) + upsert
+   **monoton** (un trade închis nu se redeschide).
+5. Online: `opened_at` = timpul **observației** quote-ului (nu bar close).
+6. Maker selectabil (`--maker deterministic|claude`) în shadow-online și backtest.
+7. Captura ipax: fișier `0600` + redactare headere secrete.
+
+**Datorii deschise (oneste):** swap/comision reale (2 numere din xStation5); model de swap fin
+(long/short, DST, triple-swap); rularea shadow ca serviciu monitorizat; reconnect XTB testat cu
+mock WebSocket (acum doar keepalive dovedit); `llm_calls` per-attempt cu `retry_count`; news live;
+Faza 4 = **spike** (nu implementată). Măsurarea edge-ului real cu LLM = plătit, amânat.
+
+---
+
 ## Faza 0 — Fundație
 
 **Scop:** un schelet care rulează și confirmă că vedem date reale de la trading_hands.
@@ -145,18 +179,28 @@ Nucleul Shadow Mode e gata (pur, determinist, testat):
 - [shadow/reconciler.py](../shadow/reconciler.py) — `reconcile` verificare **intrabar** SL/TP; când ambele cad în aceeași bară → **bandă pesimist (SL-first) / optimist (TP-first)** + flag `ambiguous` (nu se elimină cazul); R-multiple **net de spread**; timeout; open. Funcționează cu orice timeframe de bare (M15 acum, M1 mai târziu).
 - [shadow/metrics.py](../shadow/metrics.py) — `summarize`: win rate, expectancy R, **rată de ambiguitate**, bandă `avg_r_pessimistic..optimistic`, breakdown pe motiv de ieșire.
 - `database.repository.record_shadow_trade` → tabelul `trades` (`mode='shadow'`, benzi + ambiguitate).
-Teste: `tests/test_shadow.py` (16) + `test_repository` full-chain (snapshot→eval→decizie→trade shadow).
+Teste: `tests/test_shadow.py` (20) + `tests/test_shadow_runner.py` (3, incl. position gate) +
+`test_repository` full-chain (snapshot→eval→decizie→trade shadow, idempotency, upsert monoton).
 
 **Livrat (post-audit):**
 - **Backtest replay** — [shadow/runner.py](../shadow/runner.py): `backtest_over_windows` + spread modelat (`replay_spread_pct`); metrici de edge (win rate, expectancy R, bandă ambiguitate); `--persist` scrie lanțul complet (snapshot→eval→decizie→trade) cu `run_id`. Rulat real pe XTB (strategia deterministă nu are edge — toate sl_hit).
 - **Shadow online continuu** — [shadow/online.py](../shadow/online.py): pe fiecare tick decide + (dacă aprobat) deschide trade `open`, iar la tick-urile următoare `reconcile_open_trades` închide ce a atins SL/TP (idempotent). Rulat live pe XTB (a deschis un SELL shadow, `observed_xtb`). `--once` sau buclă la fiecare M15.
 - **Persistență completă** — `decisions`, `snapshot_evaluations`, `trades` (idempotent, run_id, benzi), `llm_calls` (orice apel incl. eșec + cost).
 
-**Rămâne:** modelarea latenței online (fill la quote observat) vs replay (fill la open-ul M1 următor + slippage); costuri suplimentare (comision de verificat, swap overnight); backtest adânc (paginare Go — necesită repornire serviciu); **măsurarea edge-ului real** = rularea cu makerul LLM (plătit, amânat).
+**Rămâne** (vezi și „Status onest" de sus): swap/comision reale (2 numere din xStation5) + model de
+swap fin (long/short, DST, triple-swap); rularea shadow ca **serviciu monitorizat** ca să acumuleze
+track record; **măsurarea edge-ului real** = rularea cu makerul LLM (`--maker claude`, plătit, amânat).
+Paginarea Go pentru backtest adânc și position gate-ul executabil sunt **livrate** (nu mai sunt aici).
 
 ---
 
 ## Faza 4 — Istoric autoritativ (SUBPROIECT în trading_hands)
+
+> **Stadiu: SPIKE, NU implementată.** Există doar endpoint-urile descoperite + encoding-ul
+> (grpc-web-text) + o unealtă de captură — vezi [IPAX_CLOSED_POSITIONS.md](../../trading_hands/docs/IPAX_CLOSED_POSITIONS.md).
+> Lipsesc: clientul gRPC-Web, auth refresh, schema răspunsului, backfill/paginare, persistență
+> idempotentă, endpoint `/trades/closed`, corelarea `external_id`, un trade demo închis verificat
+> end-to-end. Se deblochează abia când executăm live (contul demo n-are poziții închise de citit).
 
 **Scop:** rezultat live autoritativ (close_price, profit, fill final). Necesar pentru bani reali.
 

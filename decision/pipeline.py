@@ -18,6 +18,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from data_collector.session import XauUsdCalendar
 from decision.prefilter import PrefilterConfig, PrefilterResult, prefilter
 from decision.schema import (
     DECISION_PROMPT_VERSION,
@@ -86,6 +87,9 @@ async def run_decision(
     mode: str,
     prefilter_config: PrefilterConfig,
     risk_config: RiskConfig,
+    calendar: XauUsdCalendar,   # REQUIRED: the PROVIDER's calendar. No default -> no silent
+                                # fallback to Polygon (which would open the session gate when
+                                # XTB is closed, e.g. Sunday 21:00-22:00 UTC).
     news: NewsContext | None = None,
 ) -> DecisionRecord:
     # Fail-closed binding: right mode, right bar. Raises before any LLM call.
@@ -111,7 +115,8 @@ async def run_decision(
             manifest=manifest, llm_error=type(exc).__name__,
         )
 
-    risk = evaluate_risk(decision, packet, risk_config, spread_provenance=inp.spread_provenance)
+    risk = evaluate_risk(decision, packet, risk_config,
+                         spread_provenance=inp.spread_provenance, calendar=calendar)
     return DecisionRecord(
         stage="decided", symbol=inp.symbol, as_of=inp.as_of, mode=mode,
         prefilter=pf, decision=decision, risk=risk, input_hash=inp.input_hash(), manifest=manifest,

@@ -79,6 +79,12 @@ class Settings(BaseSettings):
     # Modeled execution slippage (adverse) applied to every shadow entry AND exit fill, on top
     # of the spread. Keeps shadow R-multiples honest (not over-optimistic).
     slippage_pct: float = 0.005
+    # Real XTB financing terms. Default 0 = NOT modeled (shadow R is then not net of financing;
+    # the persisted cost manifest says so). Set these from xStation5 -> GOLD -> Specification to
+    # make swap/commission real. NOTE: current model uses ONE swap rate (no long/short split),
+    # a fixed 22:00 UTC rollover, and no DST/triple-swap — a coarse approximation, documented.
+    commission_pct: float = 0.0
+    swap_pct_per_night: float = 0.0
 
     def provider_symbol(self, brain_symbol: str) -> str:
         # Only Polygon uses a different ticker (C:XAUUSD); XTB and CSV use the brain symbol
