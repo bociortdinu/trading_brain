@@ -70,7 +70,11 @@ class Settings(BaseSettings):
     decision_max_tokens: int = 1024
 
     def provider_symbol(self, brain_symbol: str) -> str:
-        return self.provider_symbol_map.get(brain_symbol, brain_symbol)
+        # Only Polygon uses a different ticker (C:XAUUSD); XTB and CSV use the brain symbol
+        # (GOLD) directly. Keeps the symbol mapping correct when switching providers.
+        if self.market_data_provider == "polygon":
+            return self.provider_symbol_map.get(brain_symbol, brain_symbol)
+        return brain_symbol
 
 
 def load_settings() -> Settings:

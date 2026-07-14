@@ -25,6 +25,7 @@ from config.settings import Settings, load_settings
 from data_collector.providers.base import Candle, MarketDataProvider, only_closed
 from data_collector.providers.csv_provider import CsvMarketDataProvider
 from data_collector.providers.factory import build_provider
+from data_collector.session import DEFAULT_CALENDAR, calendar_for
 from database.repository import insert_evaluation, upsert_snapshot
 from features.eligibility import EligibilityConfig, EligibilityResult, evaluate_eligibility
 from features.mtf import TRIGGER_TF, FeaturePacket, build_feature_packet
@@ -46,12 +47,13 @@ def slice_to_as_of(windows: dict[str, list[Candle]], as_of: datetime) -> dict[st
 
 def build_packet_from_windows(
     windows, as_of, *, brain_symbol, provider_name, provider_symbol, ingested_at,
-    spread_pct=None, basis_observed=None, news_digest=None,
+    spread_pct=None, basis_observed=None, news_digest=None, calendar=None,
 ) -> FeaturePacket:
+    cal = calendar or calendar_for(provider_name)
     return build_feature_packet(
         brain_symbol, slice_to_as_of(windows, as_of), as_of=as_of, provider=provider_name,
         provider_symbol=provider_symbol, ingested_at=ingested_at, spread_pct=spread_pct,
-        basis_observed=basis_observed, news_digest=news_digest,
+        basis_observed=basis_observed, news_digest=news_digest, calendar=cal,
     )
 
 
@@ -65,12 +67,14 @@ def _eligibility_config(settings: Settings) -> EligibilityConfig:
 
 def compute_eligibility(
     windows, as_of, settings: Settings, *, mode: str, now: datetime,
-    quote_time: datetime | None = None,
+    quote_time: datetime | None = None, provider_name: str | None = None,
 ) -> EligibilityResult:
-    """Contextual verdict for this bar — separate from the (immutable) snapshot."""
+    """Contextual verdict for this bar — separate from the (immutable) snapshot. Uses the
+    provider's own market calendar (XTB and Polygon have different session boundaries)."""
+    cal = calendar_for(provider_name) if provider_name else DEFAULT_CALENDAR
     return evaluate_eligibility(
         slice_to_as_of(windows, as_of), TRIGGER_TF, as_of, mode=mode, now=now,
-        config=_eligibility_config(settings), quote_time=quote_time, evaluated_at=now,
+        config=_eligibility_config(settings), quote_time=quote_time, evaluated_at=now, calendar=cal,
     )
 
 
@@ -144,7 +148,8 @@ def main() -> int:
         # is not earlier than the quote (a quote timestamped after `now` would look like the
         # future and is fail-closed by evaluate_eligibility).
         eval_now = datetime.now(timezone.utc)
-        result = compute_eligibility(windows, as_of, settings, mode=mode, now=eval_now, quote_time=quote_time)
+        result = compute_eligibility(windows, as_of, settings, mode=mode, now=eval_now,
+                                     quote_time=quote_time, provider_name=provider_name)
         return packet, result
 
     packet, result = asyncio.run(_run())

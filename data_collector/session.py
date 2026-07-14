@@ -86,10 +86,27 @@ POLYGON_XAUUSD_CALENDAR = SessionCalendar(
 XauUsdCalendar = SessionCalendar
 DEFAULT_CALENDAR = POLYGON_XAUUSD_CALENDAR
 
-# Provider -> validated calendar. XTB's boundaries differ (its D1 rolls at 22:00 UTC in
-# summer vs Polygon's 21:00 UTC) and must be DERIVED from live XTB gaps before being added
-# here; until then calendar_for('xtb') fails closed rather than silently using Polygon's.
-_CALENDARS: dict[str, SessionCalendar] = {"polygon": POLYGON_XAUUSD_CALENDAR}
+# XTB GOLD — DERIVED + validated from live H1/M15 gaps (summer/EDT, 2026-07): daily break
+# 21:00-22:00 UTC (17:00-18:00 ET) and Friday close 21:00 UTC (17:00 ET) match the global
+# 17:00-ET spot-gold rollover, but XTB's Sunday OPEN is 22:00 UTC = 18:00 ET (its first bar
+# is 18:00 ET; the 17:00-18:00 ET hour carries no data). Expressed in ET so the 17:00-ET
+# rollover stays DST-correct. NOTE: only the summer (EDT) boundaries are validated with live
+# data; winter (EST) is inferred from the ET anchoring — bump the version if it differs.
+_XTB_XAUUSD_EXCEPTIONS: dict[date, object] = {
+    date(2026, 7, 3): ("early_close", 13),  # US Independence Day (observed): XTB ends ~13:00 ET
+}
+XTB_XAUUSD_CALENDAR = SessionCalendar(
+    version="xauusd-xtb-2026.1", tz=_NY, open_hour=18, close_hour=17, break_hour=17,
+    exceptions=_XTB_XAUUSD_EXCEPTIONS,
+)
+
+# Provider -> validated calendar. Same instrument, different provider = different session
+# boundaries (see above): fail-closed for an unknown provider rather than misapplying one.
+_CALENDARS: dict[str, SessionCalendar] = {
+    "polygon": POLYGON_XAUUSD_CALENDAR,
+    "xtb": XTB_XAUUSD_CALENDAR,
+    "csv": POLYGON_XAUUSD_CALENDAR,  # offline gold uses the general (Polygon) calendar
+}
 
 
 def calendar_for(provider: str) -> SessionCalendar:

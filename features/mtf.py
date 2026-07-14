@@ -17,7 +17,7 @@ from datetime import datetime
 from pydantic import BaseModel
 
 from data_collector.providers.base import Candle, validate_series
-from data_collector.session import timeframe_quality
+from data_collector.session import DEFAULT_CALENDAR, SessionCalendar, timeframe_quality
 from features.engineering import MIN_BARS, timeframe_features
 from features.version import FEATURE_PIPELINE_VERSION
 
@@ -96,6 +96,7 @@ def build_feature_packet(
     spread_pct: float | None = None,
     news_digest: list[dict] | None = None,
     basis_observed: dict | None = None,
+    calendar: SessionCalendar = DEFAULT_CALENDAR,
 ) -> FeaturePacket:
     for role in (MACRO_TF, TREND_TF, STRUCTURE_TF, TRIGGER_TF):
         if role not in tf_candles:
@@ -116,7 +117,7 @@ def build_feature_packet(
     data_quality: dict[str, dict] = {}
     for name, candles in tf_candles.items():
         gaps = validate_series(candles, name)
-        data_quality[name] = timeframe_quality(len(candles), MIN_BARS, gaps, name)
+        data_quality[name] = timeframe_quality(len(candles), MIN_BARS, gaps, name, calendar)
 
     tf = {name: timeframe_features(candles) for name, candles in tf_candles.items()}
     macro, trend, structure, trigger = tf[MACRO_TF], tf[TREND_TF], tf[STRUCTURE_TF], tf[TRIGGER_TF]

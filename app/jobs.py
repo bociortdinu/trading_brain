@@ -113,7 +113,8 @@ async def _finalize_and_store(settings, windows, as_of, *, brain_symbol, provide
     # Persist the immutable observation first, then its separate mode+policy eligibility.
     status, snap_id = upsert_snapshot(settings.db_dsn, packet)
     if snap_id is not None and status != "conflict":
-        result = compute_eligibility(windows, as_of, settings, mode=mode, now=now, quote_time=quote_time)
+        result = compute_eligibility(windows, as_of, settings, mode=mode, now=now,
+                                     quote_time=quote_time, provider_name=provider_name)
         insert_evaluation(settings.db_dsn, snap_id, result)
     return status
 

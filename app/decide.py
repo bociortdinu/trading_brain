@@ -72,7 +72,8 @@ async def _run(settings, *, mode: str, use_fake: bool, all_regimes: bool = False
 
     # Recapture the clock AFTER the quote (anti future-quote; see app/collect).
     now = datetime.now(timezone.utc)
-    result = compute_eligibility(windows, as_of, settings, mode=mode, now=now, quote_time=quote_time)
+    result = compute_eligibility(windows, as_of, settings, mode=mode, now=now,
+                                 quote_time=quote_time, provider_name=provider_name)
     status, snap_id = upsert_snapshot(settings.db_dsn, packet)
     print(f"[db] {status} snapshot id={snap_id}  bar_close={packet.bar_close.isoformat()}")
     if snap_id is None or status == "conflict":
