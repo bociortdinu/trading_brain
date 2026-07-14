@@ -24,7 +24,7 @@ from data_collector.providers.factory import build_provider
 from data_collector.session import calendar_for
 from decision.pipeline import run_decision
 from decision.prefilter import PrefilterConfig
-from decision.schema import DecisionOutput
+from decision.schema import DecisionOutput, build_decision_input
 from features.eligibility import EligibilityConfig, evaluate_eligibility
 from features.engineering import MIN_BARS
 from features.mtf import TRIGGER_TF, build_feature_packet
@@ -62,9 +62,15 @@ async def backtest_over_windows(
     eligibility_config: EligibilityConfig | None = None,
     shadow_config: ShadowConfig | None = None,
     min_bars: int = MIN_BARS,
+    persist_dsn: str | None = None,
+    run_id: str | None = None,
+    model_name: str = "deterministic-confluence",
 ) -> list[dict]:
-    """Pure backtest over provided windows. Returns per-bar dicts:
-    {as_of, stage, direction, approved, outcome(dict|None)}."""
+    """Backtest over provided windows. Returns per-bar dicts:
+    {as_of, stage, direction, approved, outcome(dict|None)}. When `persist_dsn`+`run_id` are
+    given, the full chain (snapshot -> evaluation -> decision -> trade) is written for each
+    APPROVED trade so the run leaves auditable shadow trades in the DB (idempotent on
+    (decision_id, run_id))."""
     calendar = calendar_for(provider_name)
     prefilter_config = prefilter_config or PrefilterConfig()
     risk_config = risk_config or RiskConfig()
@@ -96,8 +102,35 @@ async def backtest_over_windows(
             future = [c for c in m15 if c.open_time >= as_of]
             o = reconcile(trade, future, shadow_config)
             row["outcome"] = o.model_dump()
+            if persist_dsn and run_id:
+                _persist_chain(persist_dsn, run_id, model_name, symbol, provider_name,
+                               packet, elig, rec, trade, o, shadow_config)
         out.append(row)
     return out
+
+
+def _persist_chain(dsn, run_id, model_name, symbol, provider_name, packet, elig, rec, trade,
+                   outcome, shadow_config) -> None:
+    """Write snapshot -> evaluation -> decision -> trade for one approved backtest trade."""
+    from database.repository import (
+        insert_decision, insert_evaluation, upsert_shadow_trade, upsert_snapshot,
+    )
+
+    status, snap_id = upsert_snapshot(dsn, packet)
+    if snap_id is None or status == "conflict":
+        return
+    eval_id = insert_evaluation(dsn, snap_id, elig)
+    inp = build_decision_input(packet, mode="replay")
+    dec_id = insert_decision(
+        dsn, snapshot_id=snap_id, evaluation_id=eval_id, model=model_name, record=rec,
+        ai_input=inp.model_dump(mode="json"),
+        ai_output=rec.decision.model_dump(mode="json") if rec.decision else None,
+        mode="shadow", data_provider=provider_name,
+    )
+    upsert_shadow_trade(
+        dsn, decision_id=dec_id, run_id=run_id, symbol=symbol, trade=trade, outcome=outcome,
+        timeframe=TRIGGER_TF, timeout_bars=shadow_config.timeout_bars,
+    )
 
 
 def report(rows: list[dict]) -> dict:
@@ -111,7 +144,7 @@ def report(rows: list[dict]) -> dict:
     }
 
 
-async def _run(settings, *, count: int) -> None:
+async def _run(settings, *, count: int, run_id: str | None) -> None:
     provider = build_provider(settings)
     symbol = settings.symbol_query
     provider_symbol = settings.provider_symbol(symbol)
@@ -125,21 +158,29 @@ async def _run(settings, *, count: int) -> None:
     rows = await backtest_over_windows(
         windows, symbol=symbol, provider_name=settings.market_data_provider,
         decision_maker=ConfluenceStrategy(), modeled_spread_pct=settings.replay_spread_pct,
+        persist_dsn=settings.db_dsn if run_id else None, run_id=run_id,
     )
     rep = report(rows)
     print(f"[backtest] provider={settings.market_data_provider} symbol={symbol} "
           f"bars_evaluated={rep['bars_evaluated']} prefiltered_out={rep['prefiltered_out']} "
-          f"approved={rep['approved']}")
+          f"approved={rep['approved']}" + (f" persisted run_id={run_id}" if run_id else ""))
     print(f"[metrics] {rep['metrics']}")
 
 
 def main() -> int:
+    from datetime import datetime, timezone
+
     from config.settings import load_settings
 
     parser = argparse.ArgumentParser(description="Shadow backtest over historical bars (no execution).")
     parser.add_argument("--count", type=int, default=1500, help="bars per timeframe to fetch")
+    parser.add_argument("--persist", action="store_true", help="write shadow trades to the DB")
+    parser.add_argument("--run-id", help="experiment id for persisted trades (default: timestamped)")
     args = parser.parse_args()
-    asyncio.run(_run(load_settings(), count=args.count))
+    run_id = None
+    if args.persist:
+        run_id = args.run_id or f"backtest-confluence-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    asyncio.run(_run(load_settings(), count=args.count, run_id=run_id))
     return 0
 
 
