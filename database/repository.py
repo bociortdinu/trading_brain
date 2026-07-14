@@ -205,6 +205,23 @@ def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, mo
     return row[0]
 
 
+def open_shadow_trades(dsn: str, run_id: str) -> list[dict]:
+    """OPEN shadow trades for a run — enough to reconstruct the VirtualTrade and reconcile
+    them against new bars on a later tick."""
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        rows = conn.execute(
+            "SELECT decision_id, symbol, side, entry_price, sl_price, tp_price, opened_at, "
+            "spread_pct, spread_provenance FROM trades "
+            "WHERE mode = 'shadow' AND status = 'open' AND run_id = %s",
+            (run_id,),
+        ).fetchall()
+    keys = ["decision_id", "symbol", "side", "entry_price", "sl_price", "tp_price",
+            "opened_at", "spread_pct", "spread_provenance"]
+    return [dict(zip(keys, r)) for r in rows]
+
+
 def insert_llm_call(dsn: str, result, *, snapshot_id: int | None = None) -> int:
     """Audit-log one LLM call (success OR failure) with its full manifest + cost. `result`
     is a decision.llm_client.LlmCallResult. Persisting failures too means a failed/refused/

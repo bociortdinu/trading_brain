@@ -233,6 +233,52 @@ def test_upsert_shadow_trade_idempotent_open_then_closed():
         _cleanup(sym)
 
 
+def test_reconcile_open_trades_closes_hit_trades_idempotently():
+    from core.models import Direction
+    from data_collector.providers.base import Candle
+    from database.repository import insert_decision, insert_evaluation, upsert_shadow_trade, upsert_snapshot
+    from decision.pipeline import DecisionRecord
+    from decision.prefilter import PrefilterResult
+    from decision.schema import DecisionOutput
+    from risk.engine import RiskVerdict
+    from shadow.online import reconcile_open_trades
+    from shadow.reconciler import reconcile
+    from shadow.virtual_broker import open_virtual_trade
+
+    sym = "TST_" + os.urandom(3).hex()
+    end = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    run_id = "online-test"
+    try:
+        _, snap_id = upsert_snapshot(DSN, _packet(sym, spread=0.02))
+        eval_id = insert_evaluation(DSN, snap_id, _eval("online", True, []))
+        decision = DecisionOutput(direction="BUY", confidence=0.8, rationale="x")
+        risk = RiskVerdict(approved=True, reason=None, direction="BUY", confidence=0.8,
+                           sl_pct=0.3, tp_pct=0.6, risk_config_version="v")
+        rec = DecisionRecord(stage="decided", symbol=sym, as_of=end, mode="online",
+                             prefilter=PrefilterResult(passed=True, reasons=[], config_version="pf"),
+                             decision=decision, risk=risk, input_hash="h",
+                             manifest={"prompt_version": "p", "output_schema_version": "s",
+                                       "feature_pipeline_version": "1.2.0", "strategy_version": "st",
+                                       "risk_config_version": "v"})
+        dec_id = insert_decision(DSN, snapshot_id=snap_id, evaluation_id=eval_id, model="fake",
+                                 record=rec, ai_input={}, ai_output=decision.model_dump(mode="json"),
+                                 mode="shadow", data_provider="csv")
+        trade = open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6, spread_pct=0.02,
+                                   spread_provenance="observed_xtb", opened_at=end)
+        upsert_shadow_trade(DSN, decision_id=dec_id, run_id=run_id, symbol=sym, trade=trade,
+                            outcome=reconcile(trade, []), timeframe="15min", timeout_bars=96)  # open
+        tp_bar = Candle(open_time=end, close_time=end + timedelta(minutes=15),
+                        open=4000, high=4030, low=3999, close=4025, volume=1.0)
+        assert reconcile_open_trades(DSN, [tp_bar], run_id=run_id) == 1   # closes the open trade
+        with psycopg.connect(DSN) as c:
+            row = c.execute("SELECT status, exit_reason FROM trades WHERE decision_id=%s AND run_id=%s",
+                            (dec_id, run_id)).fetchone()
+        assert row[0] == "closed" and row[1] == "tp_hit"
+        assert reconcile_open_trades(DSN, [tp_bar], run_id=run_id) == 0   # idempotent: none left open
+    finally:
+        _cleanup(sym)
+
+
 def test_insert_llm_call_logs_success_and_failure():
     from database.repository import insert_llm_call, upsert_snapshot
     from decision.llm_client import LlmCallResult
