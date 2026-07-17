@@ -406,10 +406,11 @@ def load_decided_outcome(dsn: str, *, input_fingerprint: str, run_id: str) -> di
         row = conn.execute(
             """
             SELECT d.id AS decision_id, d.direction, d.risk_verdict, d.blocked_reason,
-                   d.sl_pct, d.tp_pct,
+                   d.sl_pct, d.tp_pct, d.confidence, s.regime,
                    t.status, t.exit_reason, t.exit_price, t.closed_at, t.opened_at,
                    t.r_multiple, t.r_pessimistic, t.r_optimistic, t.ambiguous
             FROM decisions d
+            JOIN market_snapshots s ON s.id = d.snapshot_id
             LEFT JOIN trades t ON t.decision_id = d.id AND t.run_id = d.run_id
             WHERE d.input_fingerprint = %s AND d.run_id = %s
             LIMIT 1

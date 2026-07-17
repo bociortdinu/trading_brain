@@ -131,8 +131,8 @@ trading_brain/
 ├── brokers_bridge/  client HTTP tipizat pentru trading_hands (8 endpointuri, incl. /candles)
 ├── decision/        schema I/O strictă, prefilter, client LLM (Structured Outputs), pipeline
 ├── risk/            validare rigidă: spread, SL obligatoriu, cooldown, fail-closed; SL/TP determinist mărginit
-├── shadow/          broker virtual + reconciler + runner (backtest) + online (continuu) + metrics
-├── database/        schema, repository, feedback (statistici + situații similare)
+├── shadow/          broker virtual + reconciler + runner (backtest) + online (continuu) + metrics + evaluation (walk-forward)
+├── database/        schema, repository, feedback (statistici pe regim + ultimele K trades, as_of-safe)
 └── app/             orchestrator (loop M15) + jobs (scheduler + reconciler)
 ```
 

@@ -234,7 +234,9 @@ async def _backtest_over_windows(
                    else None)
         row = {"as_of": as_of, "stage": rec.stage,
                "direction": rec.decision.direction.value if rec.decision else "NO_TRADE",
-               "approved": rec.risk_approved, "blocked": blocked, "outcome": None}
+               "approved": rec.risk_approved, "blocked": blocked, "outcome": None,
+               "regime": packet.regime,   # for evaluation coverage/calibration
+               "confidence": rec.decision.confidence if rec.decision else None}
 
         # Persist EVERY decided bar (not only approved ones) so a paid re-run resumes past
         # NO_TRADE/rejected bars too — the LLM was called for them, so they must be deduped.
@@ -306,7 +308,8 @@ def _recover_bar(dsn, run_id, symbol, prior, packet, m15, as_of, busy_until, sin
     all come from the stored decision; only the (deterministic) trade is rebuilt if it is missing."""
     row = {"as_of": as_of, "stage": "recovered", "direction": prior["direction"],
            "approved": prior["risk_verdict"] == "approved", "blocked": prior["blocked_reason"],
-           "outcome": None}
+           "outcome": None, "regime": prior.get("regime"),
+           "confidence": float(prior["confidence"]) if prior.get("confidence") is not None else None}
     if prior["status"] is not None:                 # trade already on disk -> just reconstruct it
         row["outcome"] = _outcome_dict(prior)
         if single_position:
@@ -340,12 +343,14 @@ def _resume_row(dsn, as_of, run_id, fingerprint, claim) -> dict:
 
     prior = load_decided_outcome(dsn, input_fingerprint=fingerprint, run_id=run_id)
     row = {"as_of": as_of, "stage": "resumed", "direction": "NO_TRADE",
-           "approved": False, "blocked": None, "outcome": None}
+           "approved": False, "blocked": None, "outcome": None, "regime": None, "confidence": None}
     if prior is None:
         return row
     row["direction"] = prior["direction"]
     row["approved"] = prior["risk_verdict"] == "approved"
     row["blocked"] = prior["blocked_reason"]
+    row["regime"] = prior.get("regime")
+    row["confidence"] = float(prior["confidence"]) if prior.get("confidence") is not None else None
     row["outcome"] = _outcome_dict(prior)   # a trade was opened for this bar (or None)
     return row
 

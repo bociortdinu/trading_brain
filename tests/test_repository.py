@@ -1110,6 +1110,48 @@ def test_llm_call_records_retry_count_and_links_the_decision():
         _cleanup(sym)
 
 
+def test_feedback_is_as_of_safe_only_trades_closed_before_the_decision():
+    """Feedback loop (Faza 5) must NEVER leak the future: a decision at `as_of` may only see
+    trades that CLOSED strictly before `as_of`. A trade that closes AFTER it contributes nothing
+    to regime stats or the recent-trades list."""
+    from core.models import Direction
+    from database.feedback import build_feedback, recent_closed_trades, regime_performance
+    from database.repository import upsert_shadow_trade
+    from shadow.reconciler import Outcome
+    from shadow.virtual_broker import open_virtual_trade
+
+    sym, run_id = "TST_" + os.urandom(3).hex(), "fb-" + os.urandom(3).hex()
+    as_of = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
+    try:
+        # Two closed trades on the same run: one closed BEFORE as_of, one AFTER.
+        for i, (closed_at, r) in enumerate([(as_of - timedelta(hours=2), 0.8),
+                                            (as_of + timedelta(hours=2), -1.0)]):
+            dec_id = _seed_decision(sym, run_id=run_id, input_fingerprint=f"fb{i}")
+            trade = open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6, spread_pct=0.0,
+                                       spread_provenance="modeled", opened_at=closed_at - timedelta(hours=1))
+            outcome = Outcome(status="closed", exit_reason="tp_hit" if r > 0 else "sl_hit",
+                              exit_price=4000.0, closed_at=closed_at, r_multiple=r,
+                              r_pessimistic=r, r_optimistic=r)
+            upsert_shadow_trade(DSN, decision_id=dec_id, run_id=run_id, symbol=sym, trade=trade,
+                                outcome=outcome, timeframe="15min", timeout_bars=96)
+
+        fb = build_feedback(DSN, run_id=run_id, before=as_of)
+        assert len(fb["recent_trades"]) == 1, "only the trade closed before as_of is visible"
+        assert fb["recent_trades"][0]["r_multiple"] == 0.8
+        regimes = regime_performance(DSN, run_id=run_id, before=as_of)
+        assert sum(int(r["trades"]) for r in regimes) == 1   # the future trade is excluded
+        # Far enough in the future, BOTH are visible.
+        later = build_feedback(DSN, run_id=run_id, before=as_of + timedelta(hours=5))
+        assert len(later["recent_trades"]) == 2
+        assert len(recent_closed_trades(DSN, run_id=run_id, before=as_of, k=5)) == 1
+    finally:
+        with psycopg.connect(DSN) as c:
+            c.execute("DELETE FROM trades WHERE run_id=%s", (run_id,))
+            c.execute("DELETE FROM decisions WHERE run_id=%s", (run_id,))
+            c.commit()
+        _cleanup(sym)
+
+
 def test_spread_status_tracks_a_bar_with_no_observation_yet():
     """The ONLINE scheduler retries the quote only for a bar that has no spread observation yet —
     now answered from spread_observations, not from a (removed) snapshot column."""

@@ -42,7 +42,8 @@ from database.repository import (
 )
 from decision.pipeline import run_decision
 from decision.prefilter import PrefilterConfig
-from decision.schema import build_decision_input, decision_fingerprint
+from database.feedback import build_feedback
+from decision.schema import FeedbackContext, build_decision_input, decision_fingerprint
 from features.mtf import TRIGGER_TF
 from risk.engine import RiskConfig
 from shadow.reconciler import reconcile
@@ -135,10 +136,18 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     result = compute_eligibility(windows, as_of, settings, mode="online", now=eval_now,
                                  quote_time=quote_time, provider_name=provider_name)
 
+    # FEEDBACK (Faza 5): the as_of-safe shadow track record, part of the decision input so the
+    # model can learn from its own closed trades. Only trades closed before `as_of` are included.
+    _fb = build_feedback(settings.db_dsn, run_id=run_id, before=as_of)
+    feedback = FeedbackContext(regime_performance=_fb["regime_performance"],
+                               recent_trades=_fb["recent_trades"])
+
     # DEDUPE BEFORE THE (paid) LLM: if this exact input was already decided in this run (same M15
     # bar reprocessed after a restart), skip — don't re-call the model or duplicate the audit.
+    # The fingerprint MUST include feedback (it is part of the input): a decision made with a
+    # different track record is a different decision.
     fingerprint = decision_fingerprint(
-        input_hash=build_decision_input(packet, mode="online").input_hash(),
+        input_hash=build_decision_input(packet, mode="online", feedback=feedback).input_hash(),
         model=model_name, provider=provider_name, risk_config_version=RiskConfig().version)
     if find_decision_by_fingerprint(settings.db_dsn, input_fingerprint=fingerprint, run_id=run_id) is not None:
         summary["decision"] = "skipped:already_decided"
@@ -159,7 +168,7 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
         eval_id = insert_evaluation(settings.db_dsn, snap_id, result)
         record = await run_decision(packet, result, decision_maker, mode="online",
                                     prefilter_config=PrefilterConfig(), risk_config=RiskConfig(),
-                                    calendar=calendar_for(provider_name))
+                                    calendar=calendar_for(provider_name), feedback=feedback)
         last = getattr(decision_maker, "last_result", None)
         if record.stage == "llm_failed":
             # A failed call yielded no decision -> audit it with decision_id NULL.
@@ -167,7 +176,7 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
                 insert_llm_call(settings.db_dsn, last, snapshot_id=snap_id)
             summary["decision"] = f"llm_failed:{record.llm_error}"
         else:
-            inp = build_decision_input(packet, mode="online")
+            inp = build_decision_input(packet, mode="online", feedback=feedback)
             # ATOMIC + idempotent on (input_fingerprint, run_id): a concurrent/duplicate insert
             # returns the existing decision id instead of creating a second row.
             dec_id, _ = insert_decision(

@@ -35,7 +35,7 @@ from core.models import Direction
 
 # Reproducibility manifest versions (stored on every decision).
 DECISION_PROMPT_VERSION = "decision-prompt-2026.1"
-DECISION_SCHEMA_VERSION = "decision-schema-2026.2"   # 2026.2: per-tf view + news status + spread provenance
+DECISION_SCHEMA_VERSION = "decision-schema-2026.3"   # 2026.3: + as_of-safe feedback context (Faza 5)
 STRATEGY_VERSION = "strategy-mvp-2026.1"
 
 Mode = Literal["online", "replay"]
@@ -64,6 +64,13 @@ class NewsContext(BaseModel):
     items: list[dict] = Field(default_factory=list)
 
 
+class FeedbackContext(BaseModel):
+    """The shadow track record so far (Faza 5), as_of-safe. Only trades CLOSED before this
+    decision's as_of are ever included (see database.feedback). Empty for a fresh run."""
+    regime_performance: list[dict] = Field(default_factory=list)  # per-regime win_rate/expectancy
+    recent_trades: list[dict] = Field(default_factory=list)       # last K closed trades, verbatim-ish
+
+
 class DecisionInput(BaseModel):
     symbol: str
     as_of: datetime
@@ -77,6 +84,7 @@ class DecisionInput(BaseModel):
     spread_provenance: SpreadProvenance = "unavailable"
     timeframes: dict[str, TimeframeView] = Field(default_factory=dict)
     news: NewsContext = Field(default_factory=NewsContext)
+    feedback: FeedbackContext = Field(default_factory=FeedbackContext)
     feature_pipeline_version: str
     schema_version: str = DECISION_SCHEMA_VERSION
 
@@ -127,8 +135,11 @@ def _spread_provenance(packet, mode: str) -> SpreadProvenance:
     return "observed_xtb" if mode == "online" else "modeled"
 
 
-def build_decision_input(packet, *, mode: str, news: NewsContext | None = None) -> DecisionInput:
-    """Deterministically project a FeaturePacket into the LLM-facing input."""
+def build_decision_input(packet, *, mode: str, news: NewsContext | None = None,
+                         feedback: FeedbackContext | None = None) -> DecisionInput:
+    """Deterministically project a FeaturePacket into the LLM-facing input. `feedback` is the
+    as_of-safe shadow track record (database.feedback); empty when not supplied. It IS part of
+    the input hash — a decision made with feedback X differs from one made with feedback Y."""
     tfs = {k: TimeframeView(**packet.timeframes.get(k, {})) for k in _TF_KEYS if k in packet.timeframes}
     return DecisionInput(
         symbol=packet.symbol,
@@ -143,5 +154,6 @@ def build_decision_input(packet, *, mode: str, news: NewsContext | None = None) 
         spread_provenance=_spread_provenance(packet, mode),
         timeframes=tfs,
         news=news if news is not None else NewsContext(status="unavailable"),
+        feedback=feedback if feedback is not None else FeedbackContext(),
         feature_pipeline_version=packet.pipeline_version,
     )

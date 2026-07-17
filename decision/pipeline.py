@@ -91,11 +91,12 @@ async def run_decision(
                                 # fallback to Polygon (which would open the session gate when
                                 # XTB is closed, e.g. Sunday 21:00-22:00 UTC).
     news: NewsContext | None = None,
+    feedback=None,
 ) -> DecisionRecord:
     # Fail-closed binding: right mode, right bar. Raises before any LLM call.
     _bind_evaluation(eligibility, packet, mode)
 
-    inp = build_decision_input(packet, mode=mode, news=news)
+    inp = build_decision_input(packet, mode=mode, news=news, feedback=feedback)
     manifest = _manifest(inp, prefilter_config, risk_config, eligibility)
     pf = prefilter(packet, eligibility, prefilter_config)
 
