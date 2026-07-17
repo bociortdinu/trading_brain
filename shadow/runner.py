@@ -81,7 +81,25 @@ def _bar_seconds(bars: list[Candle]) -> float:
     return deltas[len(deltas) // 2] if deltas else 900.0
 
 
-async def backtest_over_windows(
+async def backtest_over_windows(windows: dict[str, list[Candle]], **kw) -> list[dict]:
+    """Run a backtest, holding an EXCLUSIVE lock on the run_id for its whole duration.
+
+    The lock is not optional bookkeeping: this backtest is STATEFUL (`busy_until` carries the open
+    position from bar to bar). Per-bar reservations stop two workers paying twice for the same
+    bar, but they do not make the run parallelisable — two workers just split the bars and each
+    tracks its own open position, so "one position at a time" quietly stops being true (measured:
+    2 workers -> 19 trades, 11 overlapping pairs). Serialise the run, or the headline result is
+    not the strategy you think you measured.
+    """
+    persist_dsn, run_id = kw.get("persist_dsn"), kw.get("run_id")
+    if not (persist_dsn and run_id):
+        return await _backtest_over_windows(windows, **kw)   # nothing persisted -> nothing to guard
+    from database.repository import run_lock
+    with run_lock(persist_dsn, run_id):
+        return await _backtest_over_windows(windows, **kw)
+
+
+async def _backtest_over_windows(
     windows: dict[str, list[Candle]],
     *,
     symbol: str,
@@ -134,6 +152,14 @@ async def backtest_over_windows(
         elig = evaluate_eligibility(sliced, TRIGGER_TF, as_of, mode="replay", now=as_of,
                                     config=eligibility_config, calendar=calendar)
 
+        # HARD LLM BUDGET first — BEFORE any claim. Reserving and then breaking on the cap
+        # stranded an 'in_progress' reservation with no decision behind it, blocking that bar
+        # until its lease expired (measured with cap=0: 1 reservation, 0 decisions).
+        if counting and max_llm_calls is not None and decision_maker.calls >= max_llm_calls:
+            out.append({"as_of": as_of, "stage": "llm_cap_reached", "direction": "NO_TRADE",
+                        "approved": False, "blocked": None, "outcome": None})
+            break
+
         # RESERVE BEFORE THE (paid) LLM. A plain SELECT here would not stop two concurrent
         # workers from both missing it and both paying — uniqueness only discards the loser's
         # ROW, never the CHARGE. The claim below is atomic: exactly one worker may call the model.
@@ -141,36 +167,39 @@ async def backtest_over_windows(
         # Only bars that will actually REACH the model are reserved: the prefilter is pure and
         # free, so a bar it rejects costs nothing, is recomputed identically on a resume, and must
         # not leave an unfinished reservation behind.
-        fingerprint = None
+        fingerprint = claim_token = None
         if persist_dsn and run_id and prefilter(packet, elig, prefilter_config).passed:
             from database.repository import reserve_decision
             fingerprint = decision_fingerprint(
                 input_hash=build_decision_input(packet, mode="replay").input_hash(),
                 model=model_name, provider=provider_name, risk_config_version=risk_config.version)
-            claim = reserve_decision(persist_dsn, input_fingerprint=fingerprint, run_id=run_id,
-                                     worker=worker_id)
-            if claim != "reserved":   # "done" -> resume; "held" -> another worker is paying
+            claim, claim_token = reserve_decision(
+                persist_dsn, input_fingerprint=fingerprint, run_id=run_id, worker=worker_id)
+            if claim == "held":
+                # Impossible under the run lock we hold — another worker would have to be inside
+                # the same run. Fail loudly rather than skip the bar: skipping is what let two
+                # workers split a stateful run and produce overlapping positions.
+                raise RuntimeError(
+                    f"reservation for {as_of.isoformat()} is held by another worker despite the "
+                    f"exclusive lock on run {run_id!r} — refusing to continue")
+            if claim == "done":
                 row = _resume_row(persist_dsn, as_of, run_id, fingerprint, claim)
-                # Restoring busy_until matters: a resumed run that forgot an open position would
-                # happily open a second one on top of it.
-                if row["outcome"] and row["outcome"].get("closed_at"):
-                    busy_until = row["outcome"]["closed_at"] + timedelta(
-                        seconds=bar_seconds * cooldown_bars)
+                busy_until = _resume_busy_until(row, busy_until, m15, bar_seconds, cooldown_bars)
                 out.append(row)
                 continue
-        # HARD LLM BUDGET: stop cleanly before exceeding the cap (fail-closed on paid runs).
-        if counting and max_llm_calls is not None and decision_maker.calls >= max_llm_calls:
-            out.append({"as_of": as_of, "stage": "llm_cap_reached", "direction": "NO_TRADE",
-                        "approved": False, "blocked": None, "outcome": None})
-            break
 
         rec = await run_decision(packet, elig, decision_maker, mode="replay",
                                  prefilter_config=prefilter_config, risk_config=risk_config,
                                  calendar=calendar)
         llm_result = getattr(decision_maker, "last_result", None)
+        # Decide the BLOCKED disposition before persisting, so the decision row records it and a
+        # resume can tell "approved and traded" from "approved but a position was already open".
+        blocked = ("position_open" if (rec.risk_approved and single_position
+                                       and busy_until is not None and as_of < busy_until)
+                   else None)
         row = {"as_of": as_of, "stage": rec.stage,
                "direction": rec.decision.direction.value if rec.decision else "NO_TRADE",
-               "approved": rec.risk_approved, "blocked": None, "outcome": None}
+               "approved": rec.risk_approved, "blocked": blocked, "outcome": None}
 
         # Persist EVERY decided bar (not only approved ones) so a paid re-run resumes past
         # NO_TRADE/rejected bars too — the LLM was called for them, so they must be deduped.
@@ -178,17 +207,17 @@ async def backtest_over_windows(
         if persist_dsn and run_id and rec.stage == "decided":
             dec_id = _persist_decision(persist_dsn, run_id, model_name, symbol, provider_name,
                                        packet, elig, rec, fingerprint=fingerprint,
-                                       llm_result=llm_result)
-        # Close out the claim. 'failed' (e.g. the LLM errored) stays retryable by any worker;
-        # 'done' is terminal. Released here — NOT after the trade — so the `blocked` path below
-        # cannot `continue` past it and strand the reservation until its lease expires.
+                                       llm_result=llm_result, blocked_reason=blocked)
+        # Close out the claim. 'failed' (the LLM errored, OR the snapshot was unusable so nothing
+        # was persisted) stays retryable; 'done' is terminal and must only be claimed when a
+        # decision actually landed — marking 'done' with decision_id NULL would tell every later
+        # run "already decided" about a decision that does not exist.
         if fingerprint is not None:
             _release(persist_dsn, fingerprint, run_id,
-                     "done" if rec.stage == "decided" else "failed", dec_id)
+                     "done" if dec_id is not None else "failed", dec_id, claim_token)
         if rec.risk_approved:
-            if single_position and busy_until is not None and as_of < busy_until:
-                row["blocked"] = "position_open"   # approved but not tradeable -> not a trade
-                out.append(row)
+            if blocked:
+                out.append(row)   # approved but not tradeable -> not a trade
                 continue
             future = [c for c in m15 if c.open_time >= as_of]
             entry_ref = future[0].open if future else packet.price  # fill at next bar's open (latency)
@@ -208,25 +237,39 @@ async def backtest_over_windows(
     return out
 
 
-def _release(dsn, fingerprint, run_id, status, decision_id) -> None:
+def _release(dsn, fingerprint, run_id, status, decision_id, claim_token) -> None:
     from database.repository import complete_decision_reservation
 
     complete_decision_reservation(dsn, input_fingerprint=fingerprint, run_id=run_id,
-                                  status=status, decision_id=decision_id)
+                                  status=status, decision_id=decision_id, claim_token=claim_token)
+
+
+def _resume_busy_until(row, current, m15, bar_seconds, cooldown_bars):
+    """Rebuild the open-position clock from a resumed bar. An outcome with NO closed_at is still
+    OPEN at the end of the data and must block for the rest of the run — mirroring what the live
+    path does with `future[-1]`. Forgetting this let a resume open a second position on top."""
+    outcome = row.get("outcome")
+    if not outcome:
+        return current   # nothing traded on this bar (NO_TRADE / rejected / blocked)
+    closed_at = outcome.get("closed_at") or (m15[-1].close_time if m15 else None)
+    if closed_at is None:
+        return current
+    return closed_at + timedelta(seconds=bar_seconds * cooldown_bars)
 
 
 def _resume_row(dsn, as_of, run_id, fingerprint, claim) -> dict:
-    """Rebuild the report row for a bar an earlier (or concurrent) worker already handled, from
-    what was persisted — so a resumed run reproduces the original instead of reporting blanks."""
+    """Rebuild the report row for a bar an earlier run already handled, from what was persisted —
+    so a resumed run reproduces the original instead of reporting blanks."""
     from database.repository import load_decided_outcome
 
     prior = load_decided_outcome(dsn, input_fingerprint=fingerprint, run_id=run_id)
-    row = {"as_of": as_of, "stage": "resumed" if claim == "done" else "held_by_other",
-           "direction": "NO_TRADE", "approved": False, "blocked": None, "outcome": None}
+    row = {"as_of": as_of, "stage": "resumed", "direction": "NO_TRADE",
+           "approved": False, "blocked": None, "outcome": None}
     if prior is None:
         return row
     row["direction"] = prior["direction"]
     row["approved"] = prior["risk_verdict"] == "approved"
+    row["blocked"] = prior["blocked_reason"]
     if prior["status"] is not None:   # a trade was opened for this bar
         row["outcome"] = {
             "status": prior["status"], "exit_reason": prior["exit_reason"],
@@ -241,7 +284,7 @@ def _resume_row(dsn, as_of, run_id, fingerprint, claim) -> dict:
 
 
 def _persist_decision(dsn, run_id, model_name, symbol, provider_name, packet, elig, rec, *,
-                      fingerprint, llm_result) -> int | None:
+                      fingerprint, llm_result, blocked_reason=None) -> int | None:
     """Write snapshot -> evaluation -> decision (+ the LLM call, if any) for one decided bar.
     ATOMIC/idempotent on (input_fingerprint, run_id) via insert_decision's ON CONFLICT. Returns
     the decision id, or None if the snapshot wasn't usable."""
@@ -261,6 +304,7 @@ def _persist_decision(dsn, run_id, model_name, symbol, provider_name, packet, el
         ai_input=inp.model_dump(mode="json"),
         ai_output=rec.decision.model_dump(mode="json") if rec.decision else None,
         mode="shadow", data_provider=provider_name, run_id=run_id, input_fingerprint=fingerprint,
+        blocked_reason=blocked_reason,
     )
 
 

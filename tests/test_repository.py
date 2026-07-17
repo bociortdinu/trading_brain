@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -416,9 +417,9 @@ def test_concurrent_workers_exactly_one_may_call_the_model():
 
     def claim(i):
         barrier.wait()   # release all workers at once to maximise the overlap
-        r = reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker=f"w{i}")
+        state, _token = reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker=f"w{i}")
         with lock:
-            results.append(r)
+            results.append(state)
 
     threads = [threading.Thread(target=claim, args=(i,)) for i in range(workers)]
     try:
@@ -441,15 +442,15 @@ def test_reservation_lease_survives_a_crashed_worker():
     try:
         # A claims with a live lease, then "crashes" (never completes).
         assert reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="A",
-                                lease_seconds=300) == "reserved"
+                                lease_seconds=300)[0] == "reserved"
         # B must NOT be allowed to pay while A's lease is alive.
-        assert reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="B") == "held"
+        assert reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="B")[0] == "held"
         # Once the lease has expired, the work is reclaimable.
         with psycopg.connect(DSN) as c:
             c.execute("UPDATE decision_reservations SET lease_expires_at = now() - interval '1s' "
                       "WHERE input_fingerprint = %s AND run_id = %s", (fp, run_id))
             c.commit()
-        assert reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="B") == "reserved"
+        assert reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="B")[0] == "reserved"
     finally:
         _clear_reservations(run_id)
 
@@ -459,13 +460,53 @@ def test_done_is_terminal_and_failed_is_retryable():
 
     fp, run_id = "fp-" + os.urandom(4).hex(), "term-" + os.urandom(3).hex()
     try:
-        assert reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="A") == "reserved"
+        state, tok_a = reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="A")
+        assert state == "reserved"
         # A failed call may legitimately be retried by anyone.
-        complete_decision_reservation(DSN, input_fingerprint=fp, run_id=run_id, status="failed")
-        assert reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="B") == "reserved"
+        complete_decision_reservation(DSN, input_fingerprint=fp, run_id=run_id, status="failed",
+                                      claim_token=tok_a)
+        state, tok_b = reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="B")
+        assert state == "reserved"
         # A completed decision is never redone (and never re-paid).
-        complete_decision_reservation(DSN, input_fingerprint=fp, run_id=run_id, status="done")
-        assert reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="C") == "done"
+        complete_decision_reservation(DSN, input_fingerprint=fp, run_id=run_id, status="done",
+                                      claim_token=tok_b)
+        assert reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="C")[0] == "done"
+    finally:
+        _clear_reservations(run_id)
+
+
+def test_a_stale_worker_cannot_complete_a_reservation_it_lost():
+    """OWNERSHIP. Without a claim token, a worker whose lease expired could wake up and stamp
+    'done' over the claim someone else now holds — leaving status=done, worker=<the other one>,
+    decision_id=NULL, and every later worker told 'already decided' about a decision that does
+    not exist. Reproduced exactly that before the token existed."""
+    from database.repository import (
+        StaleClaimError, complete_decision_reservation, reserve_decision,
+    )
+
+    fp, run_id = "fp-" + os.urandom(4).hex(), "stale-" + os.urandom(3).hex()
+    try:
+        state, tok_a = reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="A")
+        assert state == "reserved"
+        with psycopg.connect(DSN) as c:   # A hangs; its lease lapses
+            c.execute("UPDATE decision_reservations SET lease_expires_at = now() - interval '1s' "
+                      "WHERE input_fingerprint = %s AND run_id = %s", (fp, run_id))
+            c.commit()
+        state, tok_b = reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="B")
+        assert state == "reserved" and tok_b != tok_a   # B legitimately took over
+
+        # A wakes up stale: its completion must be REFUSED, not silently applied.
+        with pytest.raises(StaleClaimError):
+            complete_decision_reservation(DSN, input_fingerprint=fp, run_id=run_id,
+                                          status="done", claim_token=tok_a, decision_id=None)
+        with psycopg.connect(DSN) as c:
+            status, worker = c.execute(
+                "SELECT status, worker FROM decision_reservations WHERE input_fingerprint = %s",
+                (fp,)).fetchone()
+        assert (status, worker) == ("in_progress", "B"), "B's live claim must be untouched"
+        # And B can still finish its own work.
+        complete_decision_reservation(DSN, input_fingerprint=fp, run_id=run_id, status="done",
+                                      claim_token=tok_b, decision_id=None)
     finally:
         _clear_reservations(run_id)
 
@@ -529,10 +570,83 @@ def test_backtest_rerun_resumes_without_repeating_decisions_or_paid_calls():
         _cleanup(sym)
 
 
+def _synthetic_windows():
+    end = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    return {name: trend(n=250, step=1.0, tf_min=m, start=end - timedelta(minutes=m * 250))
+            for name, m in (("1day", 1440), ("4h", 240), ("1h", 60), ("15min", 15))}
+
+
+def test_llm_cap_does_not_strand_a_reservation():
+    """The cap used to be checked AFTER the claim, so stopping on budget left an 'in_progress'
+    reservation with no decision behind it — blocking that bar until its lease lapsed."""
+    from shadow.runner import ConfluenceStrategy, _CountingMaker, backtest_over_windows
+    from tests.helpers import run as arun
+
+    sym, run_id = "TST_" + os.urandom(3).hex(), "cap-" + os.urandom(3).hex()
+    try:
+        rows = arun(backtest_over_windows(
+            _synthetic_windows(), symbol=sym, provider_name="csv", modeled_spread_pct=0.02,
+            decision_maker=_CountingMaker(ConfluenceStrategy()), max_llm_calls=0,
+            persist_dsn=DSN, run_id=run_id, model_name="fake"))
+        assert rows[-1]["stage"] == "llm_cap_reached"
+        with psycopg.connect(DSN) as c:
+            left = c.execute("SELECT count(*) FROM decision_reservations WHERE run_id = %s",
+                             (run_id,)).fetchone()[0]
+        assert left == 0, "stopping on the budget must not leave a claim behind"
+    finally:
+        with psycopg.connect(DSN) as c:
+            c.execute("DELETE FROM decision_reservations WHERE run_id = %s", (run_id,))
+            c.commit()
+        _cleanup(sym)
+
+
+def test_a_stateful_run_refuses_a_second_concurrent_worker():
+    """Per-bar reservations stop double PAYING, they do not make a stateful run parallelisable:
+    two workers just split the bars, each tracks its own busy_until, and 'one position at a time'
+    silently stops holding (measured before the lock: 19 trades, 11 overlapping pairs). The run
+    lock refuses the second worker instead."""
+    import threading
+
+    from database.repository import RunLockedError
+    from shadow.runner import ConfluenceStrategy, _CountingMaker, backtest_over_windows
+
+    sym, run_id = "TST_" + os.urandom(3).hex(), "lock-" + os.urandom(3).hex()
+    windows = _synthetic_windows()
+    outcomes = {}
+
+    def go(tag):
+        try:
+            asyncio.run(backtest_over_windows(
+                windows, symbol=sym, provider_name="csv", modeled_spread_pct=0.02,
+                decision_maker=_CountingMaker(ConfluenceStrategy()), persist_dsn=DSN,
+                run_id=run_id, model_name="fake", worker_id=tag))
+            outcomes[tag] = "ran"
+        except RunLockedError:
+            outcomes[tag] = "refused"
+
+    try:
+        threads = [threading.Thread(target=go, args=(t,)) for t in ("A", "B")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert sorted(outcomes.values()) == ["ran", "refused"], f"got {outcomes}"
+        trades = _trades_of(run_id)
+        overlaps = sum(1 for i in range(len(trades)) for j in range(i + 1, len(trades))
+                       if trades[j][0] < (trades[i][2] or trades[j][0]))
+        assert overlaps == 0, "a serialised run must never hold two positions at once"
+    finally:
+        with psycopg.connect(DSN) as c:
+            for t in ("trades", "decisions", "decision_reservations"):
+                c.execute(f"DELETE FROM {t} WHERE run_id = %s", (run_id,))
+            c.commit()
+        _cleanup(sym)
+
+
 def _trades_of(run_id):
     with psycopg.connect(DSN) as c:
         return c.execute(
-            "SELECT opened_at, side, status, exit_reason, r_multiple FROM trades "
+            "SELECT opened_at, side, closed_at, status, exit_reason, r_multiple FROM trades "
             "WHERE run_id = %s ORDER BY opened_at", (run_id,)).fetchall()
 
 

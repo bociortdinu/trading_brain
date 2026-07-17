@@ -19,6 +19,8 @@ on the existing row, so racing inserts don't raise a unique violation.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 from features.mtf import FeaturePacket
 
 
@@ -187,7 +189,8 @@ def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, mo
                     record, ai_input: dict, ai_output: dict | None, mode: str,
                     data_provider: str, tokens: dict | None = None,
                     run_id: str | None = None, input_fingerprint: str | None = None,
-                    spread_observation_id: int | None = None) -> int:
+                    spread_observation_id: int | None = None,
+                    blocked_reason: str | None = None) -> int:
     """Persist a DecisionRecord (decision/pipeline.py) with its reproducibility manifest and
     the FK to the authorizing evaluation. Never fabricates an approved verdict — the
     risk_verdict comes straight from the record.
@@ -217,8 +220,9 @@ def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, mo
                  risk_verdict, risk_reason, ai_input, ai_output, prompt_tokens, output_tokens,
                  latency_ms, cache_hit, mode, prompt_version, output_schema_version,
                  feature_pipeline_version, strategy_version, risk_config_version, data_provider,
-                 input_hash, as_of, run_id, input_fingerprint, spread_observation_id)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 input_hash, as_of, run_id, input_fingerprint, spread_observation_id,
+                 blocked_reason)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (input_fingerprint, run_id)
                 WHERE run_id IS NOT NULL AND input_fingerprint IS NOT NULL DO NOTHING
             RETURNING id
@@ -236,7 +240,7 @@ def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, mo
                 manifest.get("feature_pipeline_version"), manifest.get("strategy_version"),
                 manifest.get("risk_config_version"), data_provider,
                 record.input_hash, record.as_of, run_id, input_fingerprint,
-                spread_observation_id,
+                spread_observation_id, blocked_reason,
             ),
         ).fetchone()
         if row is None:   # ON CONFLICT DO NOTHING -> the decision already exists for this run
@@ -248,62 +252,122 @@ def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, mo
     return row[0]
 
 
+class RunLockedError(RuntimeError):
+    """Another worker is already processing this run_id."""
+
+
+@contextmanager
+def run_lock(dsn: str, run_id: str):
+    """EXCLUSIVE lock for the whole run. A backtest is STATEFUL: `busy_until` carries the open
+    position forward, bar by bar. Per-bar reservations stop two workers from paying twice for the
+    same bar, but they do NOT make the run parallelisable — two workers simply split the bars
+    between them and each keeps its OWN busy_until, so both open positions and the
+    "one position at a time" strategy silently stops holding (measured: 2 workers -> 19 trades,
+    11 overlapping pairs). The single-position result is only meaningful if the run is serial.
+
+    Fail-closed: refuse rather than wait, so a second worker cannot quietly corrupt an experiment.
+    Session-scoped advisory lock, released when this connection closes.
+    """
+    import psycopg
+
+    conn = psycopg.connect(dsn)
+    try:
+        got = conn.execute("SELECT pg_try_advisory_lock(hashtext(%s)::bigint)", (run_id,)).fetchone()[0]
+        if not got:
+            raise RunLockedError(
+                f"run_id {run_id!r} is already being processed by another worker. A stateful "
+                f"backtest must run serially — parallel workers would each track their own open "
+                f"position and produce overlapping trades."
+            )
+        yield
+    finally:
+        try:
+            conn.execute("SELECT pg_advisory_unlock(hashtext(%s)::bigint)", (run_id,))
+        finally:
+            conn.close()
+
+
+class StaleClaimError(RuntimeError):
+    """Completion was attempted for a claim this worker no longer owns (its lease was taken
+    over). Fail loudly: silently writing the result would corrupt the other worker's claim."""
+
+
 def reserve_decision(dsn: str, *, input_fingerprint: str, run_id: str, worker: str,
-                     lease_seconds: int = 300) -> str:
+                     lease_seconds: int = 300) -> tuple[str, str | None]:
     """Atomically claim the right to make (and PAY for) this decision. Call BEFORE the model.
 
-    Returns:
-      "reserved" — we own it; we are the ONLY worker allowed to call the model for this input.
-      "done"     — already decided in this run; skip (resume).
-      "held"     — another worker owns a live lease; skip (it is paying, we must not).
+    Returns (state, claim_token):
+      ("reserved", token) — we own it; the ONLY worker allowed to call the model for this input.
+                            `token` must be handed back to complete_decision_reservation.
+      ("done", None)      — already decided in this run; skip (resume).
+      ("held", None)      — another worker owns a live lease; it is paying, we must not.
 
     Atomic because the claim is a single INSERT ... ON CONFLICT: concurrent workers cannot both
     win. A dead worker's claim is reclaimable once its lease expires, and a 'failed' attempt may
     be retried; 'done' is terminal.
+
+    The token is what makes ownership real. Without it, a worker whose lease expired could wake
+    up and complete a claim now held by somebody else — stamping 'done' over live work and
+    leaving an input decided-but-decisionless forever.
     """
+    import uuid
+
     import psycopg
 
+    token = uuid.uuid4().hex
     with psycopg.connect(dsn) as conn:
         row = conn.execute(
             """
             INSERT INTO decision_reservations
-                (input_fingerprint, run_id, status, worker, reserved_at, lease_expires_at)
-            VALUES (%s, %s, 'in_progress', %s, now(), now() + make_interval(secs => %s))
+                (input_fingerprint, run_id, status, worker, claim_token, reserved_at, lease_expires_at)
+            VALUES (%s, %s, 'in_progress', %s, %s, now(), now() + make_interval(secs => %s))
             ON CONFLICT (input_fingerprint, run_id) DO UPDATE SET
                 worker           = EXCLUDED.worker,
+                claim_token      = EXCLUDED.claim_token,
                 reserved_at      = now(),
                 lease_expires_at = EXCLUDED.lease_expires_at,
                 status           = 'in_progress'
             WHERE decision_reservations.status = 'failed'
                OR (decision_reservations.status = 'in_progress'
                    AND decision_reservations.lease_expires_at < now())
-            RETURNING input_fingerprint
+            RETURNING claim_token
             """,
-            (input_fingerprint, run_id, worker, lease_seconds),
+            (input_fingerprint, run_id, worker, token, lease_seconds),
         ).fetchone()
         if row is not None:
             conn.commit()
-            return "reserved"
+            return "reserved", row[0]
         existing = conn.execute(
             "SELECT status FROM decision_reservations WHERE input_fingerprint = %s AND run_id = %s",
             (input_fingerprint, run_id),
         ).fetchone()
         conn.commit()
-    return "done" if existing and existing[0] == "done" else "held"
+    return ("done", None) if existing and existing[0] == "done" else ("held", None)
 
 
 def complete_decision_reservation(dsn: str, *, input_fingerprint: str, run_id: str, status: str,
-                                  decision_id: int | None = None) -> None:
-    """Close out a reservation we own: 'done' (terminal) or 'failed' (retryable by any worker)."""
+                                  claim_token: str, decision_id: int | None = None) -> None:
+    """Close out a reservation WE own: 'done' (terminal) or 'failed' (retryable by any worker).
+
+    Compare-and-set on the claim token: only the worker still holding the claim may close it. If
+    the lease was taken over while we were working, the UPDATE matches nothing and we raise —
+    better a loud failure than silently overwriting the new owner's claim.
+    """
     import psycopg
 
     with psycopg.connect(dsn) as conn:
-        conn.execute(
+        cur = conn.execute(
             "UPDATE decision_reservations SET status = %s, decision_id = %s "
-            "WHERE input_fingerprint = %s AND run_id = %s",
-            (status, decision_id, input_fingerprint, run_id),
+            "WHERE input_fingerprint = %s AND run_id = %s AND claim_token = %s "
+            "AND status = 'in_progress'",
+            (status, decision_id, input_fingerprint, run_id, claim_token),
         )
         conn.commit()
+        if cur.rowcount != 1:
+            raise StaleClaimError(
+                f"claim for {input_fingerprint[:12]}… in run {run_id!r} is no longer ours "
+                f"(rows matched: {cur.rowcount}); another worker took the lease over"
+            )
 
 
 def load_decided_outcome(dsn: str, *, input_fingerprint: str, run_id: str) -> dict | None:
@@ -318,7 +382,7 @@ def load_decided_outcome(dsn: str, *, input_fingerprint: str, run_id: str) -> di
     with psycopg.connect(dsn, row_factory=dict_row) as conn:
         row = conn.execute(
             """
-            SELECT d.id AS decision_id, d.direction, d.risk_verdict,
+            SELECT d.id AS decision_id, d.direction, d.risk_verdict, d.blocked_reason,
                    t.status, t.exit_reason, t.exit_price, t.closed_at, t.opened_at,
                    t.r_multiple, t.r_pessimistic, t.r_optimistic, t.ambiguous
             FROM decisions d

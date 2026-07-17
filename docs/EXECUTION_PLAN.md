@@ -167,10 +167,52 @@ Close. Testul pică pe codul vechi cu „connection installed AFTER Close".
 **Docs:** `/candles` lipsea (8 endpointuri, nu 7); „fără reconnect auto" era fals; modelul de fill era
 descris ASK/BID deși implementarea e **mid + cost plat**.
 
+---
+
+## Runda 7 — rezervarea era doar parțial corectă
+
+Raportasem „toate 8 închise". **Greșit**: rezervarea și resume-ul erau incorecte sub concurență.
+Reviewer-ul a avut dreptate; fiecare afirmație a fost reprodusă local înainte de a fi acceptată.
+
+1. **Lease fără ownership.** `complete_decision_reservation` scria după `(fingerprint, run_id)`, fără
+   să verifice cine deține claim-ul. Reprodus: A rezervă → lease-ul expiră → B preia → A, stale,
+   completează → `status=done, worker=B, decision_id=NULL`, iar orice worker ulterior primește
+   definitiv „done" pentru o decizie **inexistentă**. Fix: `claim_token` per claim + finalizare
+   **CAS** (`WHERE status='in_progress' AND claim_token=:token`) care trebuie să atingă exact un
+   rând, altfel `StaleClaimError`.
+2. **Cap-ul lăsa rezervarea abandonată.** Claim-ul se lua înainte de verificarea capului. Măsurat cu
+   cap=0: `[('in_progress', 1)]` rezervări, 0 decizii. Fix: capul se verifică **înainte** de claim
+   (verificat: 0 rezervări rămase).
+3. **Concurența rupea position gate-ul** — cel mai important. Rezervarea garantează un apel per
+   fingerprint, dar backtestul e **stateful** (`busy_until`): doi workeri împart barele și fiecare
+   își ține propria poziție. Măsurat: 26/25 apeluri, 19 trade-uri, **11 perechi suprapuse**. Fix:
+   **lock exclusiv pe `run_id`** (advisory, fail-closed) — un experiment stateful nu se
+   paralelizează pe bare. Re-măsurat cu lock: al doilea worker **refuzat**, **0 suprapuneri**.
+   `held` sub lock e acum invariant violat → eroare, nu „sari bara".
+4. **Resume incomplet**: `busy_until` nu se seta pentru un outcome încă **open** (acum: blochează
+   până la finalul datelor, ca în rularea live); dispoziția `blocked_position_open` nu era
+   persistată (acum: `decisions.blocked_reason`, decisă *înainte* de insert); `done` se putea marca
+   deși `_persist_decision` întorsese `None` (acum: `done` doar dacă o decizie chiar a aterizat).
+5. **Migrarea 0014 stricase propriul discriminator**: scrisesem nota de migrare **în `basis`**, deci
+   toate cele 47 de rânduri deveniseră `basis IS NOT NULL` — exact opusul regulii pe care o
+   documentasem („`basis NOT NULL` ⟺ quote real"). 0017 pune `basis = NULL` la cele modelate; nota
+   stă în comentariul migrării, nu într-o coloană de date. Verificat: invariantul ține din nou.
+6. **„Append-only" era impropriu.** E **UPDATE-protected**, nu append-only: DELETE rămâne acordat
+   (retenție + CASCADE), deci delete+reinsert poate emula un update. Documentat ca atare, nu
+   pretins rezolvat. `schema_migrations` e acum **read-only** pentru app-role (nu mai poate falsifica
+   istoricul migrărilor).
+7. **Docs**: ASK/BID → mid + cost plat; `execution/reconciler.py` (inexistent) → `shadow/reconciler.py`;
+   `record_shadow_trade` → `upsert_shadow_trade`; concluzia „toate sl_hit" marcată ca **superseded**
+   (event-study fără position gate, fereastră îngustă, manifest greșit).
+
+**Datorii rămase (oneste):** DELETE într-un rol separat de retenție (append-only real); swap
+long/short + DST + triple; reconcilierea folosește configul curent, nu cel salvat în `costs`;
+`llm_calls` per-attempt; perf O(n²); Faza 4 = spike; edge real cu LLM = neplătit, nemăsurat.
+
 **Ordinea recomandată** (per reviewer): ~~separarea snapshot/spread~~ (runda 4) → ~~mock WebSocket/
-reconnect~~ (runda 5) → ~~rezervare atomică + provenance + resume~~ (runda 6) → **urmează**: pornirea
-monitorizată a Shadow Online. Rămâne valabil: **nu** rula `--maker claude` pe mii de bare (perf O(n²)
-+ cost), iar online-ul acceptă doar makerul determinist.
+reconnect~~ (runda 5) → ~~rezervare atomică + provenance + resume~~ (rundele 6–7) → **urmează**:
+pornirea monitorizată a Shadow Online. Rămâne valabil: **nu** rula `--maker claude` pe mii de bare
+(perf O(n²) + cost), iar online-ul acceptă doar makerul determinist.
 
 ---
 
@@ -289,13 +331,16 @@ default) sau `--maker claude` (plătit — cu cap `--max-llm-calls`, estimare de
 
 **Scop:** măsori dacă există *vreun* edge, cu costuri corect modelate, fără bani reali.
 
-- `shadow/virtual_broker.py`: intrare ASK(long)/BID(short), ieșire BID/ASK — **un** spread per
-  round-trip. Nu folosi balance/equity ca PnL.
+- `shadow/virtual_broker.py` — **LIVRAT, dar NU ca ASK/BID** (planul inițial cerea asta): barele
+  sunt tratate ca **MID**, iar spreadul e dedus ca **un cost round-trip plat** din R (+ slippage
+  advers la intrare/ieșire, gap-through-stop, comision/swap dacă ratele sunt setate). E o
+  aproximare documentată, nu o simulare bid/ask. Nu folosim balance/equity ca PnL.
 - Verificare **intrabar** SL/TP (M1 dacă e disponibil). Când SL și TP cad în același interval:
   raportează **bandă pesimist (SL-first) / optimist (TP-first)** + **rata de ambiguitate**; nu elimina cazurile.
 - Separă **shadow online** (quote de intrare observat live după decizie; latență reală) de
   **replay istoric** (latență **modelată**, ex. fill la open-ul M1 următor + slippage).
-- `execution/reconciler.py` (shadow): închide virtual pe `/quote` sau date fine; calculează
+- **`execution/` NU există**; reconcilierea shadow e în [shadow/reconciler.py](../shadow/reconciler.py):
+  închide virtual pe bare post-intrare; calculează
   R-multiple; populează `trades` cu `mode='shadow'`, `pnl_modeled`, benzi + ambiguitate.
 - Modelare costuri: spread (măsurat), comision (dacă instrumentul are — de verificat), swap
   (aproximat pentru holduri overnight), slippage/latență (modelate). Marchează măsurat vs. aproximat.
@@ -309,14 +354,17 @@ Nucleul Shadow Mode e gata (pur, determinist, testat):
 - [shadow/virtual_broker.py](../shadow/virtual_broker.py) — `open_virtual_trade` (nivele SL/TP din `sl_pct/tp_pct` deterministe; intrare la ask/bid; spread ca un cost round-trip; provenance measured|modeled).
 - [shadow/reconciler.py](../shadow/reconciler.py) — `reconcile` verificare **intrabar** SL/TP; când ambele cad în aceeași bară → **bandă pesimist (SL-first) / optimist (TP-first)** + flag `ambiguous` (nu se elimină cazul); R-multiple **net de spread**; timeout; open. Funcționează cu orice timeframe de bare (M15 acum, M1 mai târziu).
 - [shadow/metrics.py](../shadow/metrics.py) — `summarize`: win rate, expectancy R, **rată de ambiguitate**, bandă `avg_r_pessimistic..optimistic`, breakdown pe motiv de ieșire.
-- `database.repository.record_shadow_trade` → tabelul `trades` (`mode='shadow'`, benzi + ambiguitate).
+- `database.repository.upsert_shadow_trade` (nu `record_shadow_trade` — a fost înlocuit) → tabelul
+  `trades` (`mode='shadow'`, benzi + ambiguitate, idempotent pe `(decision_id, run_id)`, monoton).
 Teste: `tests/test_shadow.py` (22, incl. politica conservatoare pe bara parțială) +
 `tests/test_shadow_runner.py` (4, incl. position gate + cap `--max-llm-calls`) +
 `tests/test_repository.py` (13, incl. lanțul complet snapshot→eval→decizie→trade, upsert monoton
 și **resume real**: backtestul rulat de două ori → 0 apeluri LLM repetate, 0 duplicate).
 
 **Livrat (post-audit):**
-- **Backtest replay** — [shadow/runner.py](../shadow/runner.py): `backtest_over_windows` + spread modelat (`replay_spread_pct`); metrici de edge (win rate, expectancy R, bandă ambiguitate); `--persist` scrie lanțul complet (snapshot→eval→decizie→trade) cu `run_id`. Rulat real pe XTB (strategia deterministă nu are edge — toate sl_hit).
+- **Backtest replay** — [shadow/runner.py](../shadow/runner.py): `backtest_over_windows` + spread modelat (`replay_spread_pct`); metrici de edge (win rate, expectancy R, bandă ambiguitate); `--persist` scrie lanțul complet (snapshot→eval→decizie→trade) cu `run_id`. Rulat real pe XTB. **Concluzia „nu are edge — toate sl_hit" NU se susține**: acea rulare era un
+event-study fără position gate (până la 23 poziții suprapuse), pe o fereastră intraday îngustă, cu
+manifestul de cost greșit. A fost superseded; edge-ul real nu e măsurat.
 - **Shadow online continuu** — [shadow/online.py](../shadow/online.py): pe fiecare tick decide + (dacă aprobat) deschide trade `open`, iar la tick-urile următoare `reconcile_open_trades` închide ce a atins SL/TP (idempotent). Rulat live pe XTB (a deschis un SELL shadow, `observed_xtb`). `--once` sau buclă la fiecare M15.
 - **Persistență completă** — `decisions`, `snapshot_evaluations`, `trades` (idempotent, run_id, benzi), `llm_calls` (orice apel incl. eșec + cost).
 
