@@ -70,6 +70,18 @@ class _CountingMaker:
         return getattr(self.inner, "last_result", None)
 
 
+# A trade that never resolves within the data is still OPEN — it blocks new entries for the REST
+# of the run, not merely until the last bar's close. Using the last close let the boundary bar
+# (as_of == that close, and the gate is a strict `<`) slip through and open a SECOND position.
+_FOREVER = datetime.max.replace(tzinfo=timezone.utc)
+
+
+def _busy_until(outcome_closed_at, bar_seconds: float, cooldown_bars: int) -> datetime:
+    if outcome_closed_at is None:
+        return _FOREVER   # still open -> hold for the whole remaining run
+    return outcome_closed_at + timedelta(seconds=bar_seconds * cooldown_bars)
+
+
 def _slice(windows: dict[str, list[Candle]], as_of: datetime) -> dict[str, list[Candle]]:
     return {tf: [c for c in cs if c.close_time <= as_of] for tf, cs in windows.items()}
 
@@ -208,17 +220,7 @@ async def _backtest_over_windows(
             dec_id = _persist_decision(persist_dsn, run_id, model_name, symbol, provider_name,
                                        packet, elig, rec, fingerprint=fingerprint,
                                        llm_result=llm_result, blocked_reason=blocked)
-        # Close out the claim. 'failed' (the LLM errored, OR the snapshot was unusable so nothing
-        # was persisted) stays retryable; 'done' is terminal and must only be claimed when a
-        # decision actually landed — marking 'done' with decision_id NULL would tell every later
-        # run "already decided" about a decision that does not exist.
-        if fingerprint is not None:
-            _release(persist_dsn, fingerprint, run_id,
-                     "done" if dec_id is not None else "failed", dec_id, claim_token)
-        if rec.risk_approved:
-            if blocked:
-                out.append(row)   # approved but not tradeable -> not a trade
-                continue
+        if rec.risk_approved and not blocked:
             future = [c for c in m15 if c.open_time >= as_of]
             entry_ref = future[0].open if future else packet.price  # fill at next bar's open (latency)
             trade = open_virtual_trade(
@@ -229,10 +231,18 @@ async def _backtest_over_windows(
             o = reconcile(trade, future, shadow_config)
             row["outcome"] = o.model_dump()
             if single_position:
-                closed_at = o.closed_at or (future[-1].close_time if future else as_of)
-                busy_until = closed_at + timedelta(seconds=bar_seconds * cooldown_bars)
+                busy_until = _busy_until(o.closed_at, bar_seconds, cooldown_bars)
             if dec_id is not None:
                 _persist_trade(persist_dsn, run_id, symbol, dec_id, trade, o, shadow_config)
+
+        # Close out the claim LAST, after the trade (if any) is on disk, so 'done' means the
+        # WHOLE chain is terminal — decision + (trade | no-trade-needed) — not just a decisions
+        # row. A crash before this leaves the claim 'in_progress'; its lease lapses and a retry
+        # re-claims it, reuses the existing decision, and re-upserts the trade idempotently
+        # (self-healing). 'failed' when the LLM errored or the snapshot was unusable (no decision).
+        if fingerprint is not None:
+            _release(persist_dsn, fingerprint, run_id,
+                     "done" if dec_id is not None else "failed", dec_id, claim_token)
         out.append(row)
     return out
 
@@ -245,16 +255,13 @@ def _release(dsn, fingerprint, run_id, status, decision_id, claim_token) -> None
 
 
 def _resume_busy_until(row, current, m15, bar_seconds, cooldown_bars):
-    """Rebuild the open-position clock from a resumed bar. An outcome with NO closed_at is still
-    OPEN at the end of the data and must block for the rest of the run — mirroring what the live
-    path does with `future[-1]`. Forgetting this let a resume open a second position on top."""
+    """Rebuild the open-position clock from a resumed bar, using the SAME rule as the live path:
+    a trade with no closed_at is still OPEN and blocks the rest of the run (_FOREVER). Forgetting
+    this let a resume open a second position on top of one that was still open."""
     outcome = row.get("outcome")
     if not outcome:
         return current   # nothing traded on this bar (NO_TRADE / rejected / blocked)
-    closed_at = outcome.get("closed_at") or (m15[-1].close_time if m15 else None)
-    if closed_at is None:
-        return current
-    return closed_at + timedelta(seconds=bar_seconds * cooldown_bars)
+    return _busy_until(outcome.get("closed_at"), bar_seconds, cooldown_bars)
 
 
 def _resume_row(dsn, as_of, run_id, fingerprint, claim) -> dict:

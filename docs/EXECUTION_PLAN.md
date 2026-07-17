@@ -42,7 +42,11 @@ Supraevaluări corectate (reviewer-ul a avut dreptate de fiecare dată):
 1. **Dedupe ÎNAINTE de LLM + atomic** (migrarea 0011): `decisions.run_id` + `input_fingerprint`
    (input_hash ⊕ model ⊕ prompt/strategy/risk version ⊕ provider) cu UNIQUE parțial; `insert_decision`
    face `ON CONFLICT DO NOTHING` → două procese concurente nu mai pot insera dublu (fără TOCTOU).
-   O re-rulare **face RESUME: zero apeluri plătite** (dovedit de test, nu doar de lookup).
+   O re-rulare completă **face RESUME: zero apeluri plătite** (dovedit de test, nu doar de lookup).
+   **Garanție onestă:** at-most-one-concurrent, NU exact-once — dacă un worker apelează modelul cu
+   succes și moare înainte să persiste, după expirarea lease-ului alt worker reapelează (o plată
+   duplicată). Fereastra se închide doar cu o cheie de idempotency acceptată de provider, pe care
+   nu o avem. Nu pretindem „no duplicate charge".
 2. **Guardrails financiare pentru `--maker claude`**: `--max-llm-calls` (cap hard, oprire curată),
    estimare worst-case de cost + confirmare explicită (`--yes`), `llm_calls` persistate și în
    backtest, clientul Anthropic închis în `finally`.
@@ -209,10 +213,44 @@ Reviewer-ul a avut dreptate; fiecare afirmație a fost reprodusă local înainte
 long/short + DST + triple; reconcilierea folosește configul curent, nu cel salvat în `costs`;
 `llm_calls` per-attempt; perf O(n²); Faza 4 = spike; edge real cu LLM = neplătit, nemăsurat.
 
-**Ordinea recomandată** (per reviewer): ~~separarea snapshot/spread~~ (runda 4) → ~~mock WebSocket/
-reconnect~~ (runda 5) → ~~rezervare atomică + provenance + resume~~ (rundele 6–7) → **urmează**:
-pornirea monitorizată a Shadow Online. Rămâne valabil: **nu** rula `--maker claude` pe mii de bare
-(perf O(n²) + cost), iar online-ul acceptă doar makerul determinist.
+---
+
+## Runda 8 — starea terminală a rezervării + fereastra decizie→trade
+
+Reviewer-ul a avut din nou dreptate; fiecare afirmație reprodusă local înainte de fix.
+
+1. **DB permitea `done` fără decizie** (0018). `done, decision_id=NULL` era acceptat → orice worker
+   ulterior primea „already decided" pentru o decizie inexistentă. Trei constrângeri DB (+ validare
+   în repository): `done ⇒ decision_id NOT NULL`, `in_progress ⇒ claim_token NOT NULL`, și **FK
+   compus** care leagă `decision_id` de **același** `(input_fingerprint, run_id)`.
+2. **Fereastra decizie→trade.** `done` se elibera înainte de trade, deci un crash între ele lăsa
+   decizie + rezervare `done` + **trade inexistent**, iar resume-ul îl considera final. Acum `done`
+   se eliberează **după** persistarea trade-ului: un crash lasă `in_progress`, lease-ul expiră,
+   iar resume-ul re-revendică, refolosește decizia și **reconstruiește trade-ul** (self-healing).
+   Test dedicat: crash injectat între decizie și trade → resume → identic cu rularea curată.
+3. **Exact-once NU e garantabil sub crash** — documentat onest: **at-most-one-concurrent**, nu
+   exact-once. Un crash după apelul reușit dar înainte de persistare → reapelare (plată duplicată).
+   Fără cheie de idempotency acceptată de provider, fereastra e inevitabilă.
+4. **Teste de resume dedicate** (nu doar tabela trades): raport complet egal cu rularea curată;
+   `blocked_position_open` persistat (`decisions.blocked_reason`) și reconstruit; crash între
+   decizie și trade; eroare la persistarea trade-ului.
+5. **Bug real găsit de detectorul corectat de overlap.** Testul vechi (`closed_at or opened`) era
+   **orb la trade-urile deschise**. Detectorul corect (COALESCE …'infinity') a expus un bug de
+   producție: un trade care rămâne **open** până la finalul datelor seta `busy_until` la close-ul
+   ultimei bare, iar bara de graniță (`as_of == busy_until`, gate `<` strict) deschidea o **a doua
+   poziție**. Fix: un trade deschis blochează **tot restul rulării** (`_FOREVER`), pe calea live ȘI
+   la resume. Re-măsurat: 0 suprapuneri.
+6. **`run_lock` ținea o tranzacție deschisă** (`idle in transaction` pe toată durata backtestului).
+   Fix: conexiune `autocommit=True` (verificat: 0 idle-in-transaction).
+
+**Datorii rămase (oneste):** cheie de idempotency provider (exact-once real); DELETE într-un rol
+separat de retenție (append-only real); swap long/short + DST; reconcilierea folosește configul
+curent nu cel salvat; `llm_calls` per-attempt; perf O(n²); Faza 4 = spike; edge real = nemăsurat.
+
+**Ordinea recomandată** (per reviewer): ~~snapshot/spread~~ (r4) → ~~mock reconnect~~ (r5) →
+~~rezervare atomică + provenance + resume~~ (r6–7) → ~~stare terminală + fereastra decizie→trade~~
+(r8) → **urmează**: pornirea monitorizată a Shadow Online (doar maker determinist). Rămâne valabil:
+**nu** rula `--maker claude` pe mii de bare (perf O(n²) + cost).
 
 ---
 

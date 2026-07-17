@@ -302,7 +302,8 @@ def test_online_and_replay_decisions_share_a_bar_without_contradiction():
 
 
 def _seed_decision(sym, *, input_hash="h", model="fake", end=None, snapshot_id=None,
-                   spread_pct=None, provenance=None, spread_observation_id=None):
+                   spread_pct=None, provenance=None, spread_observation_id=None,
+                   run_id=None, input_fingerprint=None, blocked_reason=None):
     """Snapshot -> evaluation -> decision; returns (dec_id). Shared by the idempotency tests."""
     from database.repository import insert_decision, insert_evaluation, upsert_snapshot
     from decision.pipeline import DecisionRecord
@@ -330,7 +331,9 @@ def _seed_decision(sym, *, input_hash="h", model="fake", end=None, snapshot_id=N
                            record=rec, ai_input=ai_input,
                            ai_output=decision.model_dump(mode="json"),
                            mode="shadow", data_provider="csv",
-                           spread_observation_id=spread_observation_id)
+                           spread_observation_id=spread_observation_id,
+                           run_id=run_id, input_fingerprint=input_fingerprint,
+                           blocked_reason=blocked_reason)
 
 
 def test_upsert_shadow_trade_never_reopens_a_closed_trade():
@@ -458,8 +461,10 @@ def test_reservation_lease_survives_a_crashed_worker():
 def test_done_is_terminal_and_failed_is_retryable():
     from database.repository import complete_decision_reservation, reserve_decision
 
+    sym = "TST_" + os.urandom(3).hex()
     fp, run_id = "fp-" + os.urandom(4).hex(), "term-" + os.urandom(3).hex()
     try:
+        dec_id = _seed_decision(sym, run_id=run_id, input_fingerprint=fp)
         state, tok_a = reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="A")
         assert state == "reserved"
         # A failed call may legitimately be retried by anyone.
@@ -469,8 +474,29 @@ def test_done_is_terminal_and_failed_is_retryable():
         assert state == "reserved"
         # A completed decision is never redone (and never re-paid).
         complete_decision_reservation(DSN, input_fingerprint=fp, run_id=run_id, status="done",
-                                      claim_token=tok_b)
+                                      claim_token=tok_b, decision_id=dec_id)
         assert reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="C")[0] == "done"
+    finally:
+        _clear_reservations(run_id)
+        _cleanup(sym)
+
+
+def test_done_requires_a_decision_in_repo_and_in_db():
+    """'done' means a COMPLETE chain: it must carry a real decision. The repository refuses a
+    NULL decision_id up front, and the DB CHECK is the backstop against any other writer."""
+    from database.repository import complete_decision_reservation, reserve_decision
+
+    fp, run_id = "fp-" + os.urandom(4).hex(), "req-" + os.urandom(3).hex()
+    try:
+        _, tok = reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="A")
+        with pytest.raises(ValueError):   # repository guard
+            complete_decision_reservation(DSN, input_fingerprint=fp, run_id=run_id,
+                                          status="done", claim_token=tok, decision_id=None)
+        with psycopg.connect(DSN) as c:   # DB backstop
+            with pytest.raises(psycopg.errors.CheckViolation):
+                c.execute("UPDATE decision_reservations SET status='done', decision_id=NULL "
+                          "WHERE input_fingerprint=%s AND run_id=%s", (fp, run_id))
+            c.rollback()
     finally:
         _clear_reservations(run_id)
 
@@ -484,8 +510,10 @@ def test_a_stale_worker_cannot_complete_a_reservation_it_lost():
         StaleClaimError, complete_decision_reservation, reserve_decision,
     )
 
+    sym = "TST_" + os.urandom(3).hex()
     fp, run_id = "fp-" + os.urandom(4).hex(), "stale-" + os.urandom(3).hex()
     try:
+        dec_id = _seed_decision(sym, run_id=run_id, input_fingerprint=fp)
         state, tok_a = reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="A")
         assert state == "reserved"
         with psycopg.connect(DSN) as c:   # A hangs; its lease lapses
@@ -498,7 +526,7 @@ def test_a_stale_worker_cannot_complete_a_reservation_it_lost():
         # A wakes up stale: its completion must be REFUSED, not silently applied.
         with pytest.raises(StaleClaimError):
             complete_decision_reservation(DSN, input_fingerprint=fp, run_id=run_id,
-                                          status="done", claim_token=tok_a, decision_id=None)
+                                          status="done", claim_token=tok_a, decision_id=dec_id)
         with psycopg.connect(DSN) as c:
             status, worker = c.execute(
                 "SELECT status, worker FROM decision_reservations WHERE input_fingerprint = %s",
@@ -506,9 +534,10 @@ def test_a_stale_worker_cannot_complete_a_reservation_it_lost():
         assert (status, worker) == ("in_progress", "B"), "B's live claim must be untouched"
         # And B can still finish its own work.
         complete_decision_reservation(DSN, input_fingerprint=fp, run_id=run_id, status="done",
-                                      claim_token=tok_b, decision_id=None)
+                                      claim_token=tok_b, decision_id=dec_id)
     finally:
         _clear_reservations(run_id)
+        _cleanup(sym)
 
 
 class _CountingFake:
@@ -631,10 +660,7 @@ def test_a_stateful_run_refuses_a_second_concurrent_worker():
         for t in threads:
             t.join()
         assert sorted(outcomes.values()) == ["ran", "refused"], f"got {outcomes}"
-        trades = _trades_of(run_id)
-        overlaps = sum(1 for i in range(len(trades)) for j in range(i + 1, len(trades))
-                       if trades[j][0] < (trades[i][2] or trades[j][0]))
-        assert overlaps == 0, "a serialised run must never hold two positions at once"
+        assert _overlapping_pairs(run_id) == 0, "a serialised run must never hold two positions"
     finally:
         with psycopg.connect(DSN) as c:
             for t in ("trades", "decisions", "decision_reservations"):
@@ -648,6 +674,23 @@ def _trades_of(run_id):
         return c.execute(
             "SELECT opened_at, side, closed_at, status, exit_reason, r_multiple FROM trades "
             "WHERE run_id = %s ORDER BY opened_at", (run_id,)).fetchall()
+
+
+def _overlapping_pairs(run_id):
+    """Count pairs of trades whose holding intervals overlap. An OPEN trade (closed_at IS NULL)
+    is held to +infinity — the earlier no-op `closed_at or opened` made this blind to exactly the
+    open trades it was meant to catch, so a still-open position never counted as an overlap."""
+    with psycopg.connect(DSN) as c:
+        return c.execute(
+            """
+            SELECT count(*) FROM trades a JOIN trades b
+              ON a.run_id = b.run_id AND a.id < b.id
+             AND b.opened_at < COALESCE(a.closed_at, 'infinity'::timestamptz)
+             AND a.opened_at < COALESCE(b.closed_at, 'infinity'::timestamptz)
+            WHERE a.run_id = %s
+            """,
+            (run_id,),
+        ).fetchone()[0]
 
 
 def test_interrupted_run_resumes_to_the_same_result_as_an_uninterrupted_one():
@@ -682,12 +725,118 @@ def test_interrupted_run_resumes_to_the_same_result_as_an_uninterrupted_one():
         resumed_rows = go(interrupted, None)          # resume the SAME run to completion
         assert any(r["stage"] == "resumed" for r in resumed_rows)
 
-        go(clean, None)                               # an uninterrupted run for comparison
+        clean_rows = go(clean, None)                   # an uninterrupted run for comparison
         assert _trades_of(interrupted) == _trades_of(clean), (
             "a resumed run must reproduce the uninterrupted one, trade for trade")
+        # FULL report equality, not just the trades table: every bar's disposition
+        # (direction / approved / blocked / outcome) must match, stage aside.
+        assert _report_shape(resumed_rows) == _report_shape(clean_rows), (
+            "the resumed run's per-bar report must equal the uninterrupted one")
     finally:
         with psycopg.connect(DSN) as c:
             for r in (interrupted, clean):
+                c.execute("DELETE FROM trades WHERE run_id = %s", (r,))
+                c.execute("DELETE FROM decisions WHERE run_id = %s", (r,))
+                c.execute("DELETE FROM decision_reservations WHERE run_id = %s", (r,))
+            c.commit()
+        _cleanup(sym)
+
+
+def _report_shape(rows):
+    """Per-bar disposition, ignoring `stage` (a resumed bar legitimately reads 'resumed' where a
+    fresh one reads 'decided'). Outcome floats are rounded so DB round-trips compare equal."""
+    def norm(o):
+        if not o:
+            return None
+        return {k: (round(v, 6) if isinstance(v, float) else v)
+                for k, v in o.items() if k != "exit_price"}
+    return [(r["as_of"], r["direction"], r["approved"], r["blocked"], norm(r["outcome"]))
+            for r in rows if r["stage"] != "llm_cap_reached"]
+
+
+def test_blocked_disposition_is_persisted_and_reconstructed_on_resume():
+    """approved-but-blocked (a position was already open) is a real disposition, not a blank. It
+    is stored on the decision and rebuilt on resume, so a resumed report can tell it apart from
+    'approved and traded'."""
+    from database.repository import load_decided_outcome
+    from shadow.runner import _resume_row
+
+    sym = "TST_" + os.urandom(3).hex()
+    fp, run_id = "fp-" + os.urandom(4).hex(), "blk-" + os.urandom(3).hex()
+    try:
+        _seed_decision(sym, run_id=run_id, input_fingerprint=fp, blocked_reason="position_open")
+        loaded = load_decided_outcome(DSN, input_fingerprint=fp, run_id=run_id)
+        assert loaded["blocked_reason"] == "position_open"
+        assert loaded["status"] is None   # blocked -> no trade row
+        row = _resume_row(DSN, datetime(2026, 7, 1, tzinfo=timezone.utc), run_id, fp, "done")
+        assert row["approved"] is True and row["blocked"] == "position_open"
+        assert row["outcome"] is None     # reconstructed as approved-but-not-traded
+    finally:
+        _clear_reservations(run_id)
+        _cleanup(sym)
+
+
+def test_resume_reconstructs_a_trade_after_a_crash_between_decision_and_trade():
+    """The narrow window the reviewer flagged: the decision is persisted, then the process dies
+    BEFORE the trade. 'done' is released only after the trade, so the claim is left 'in_progress'
+    (not 'done'); its lease lapses and the resume re-claims it, reuses the decision, and rebuilds
+    the missing trade. The run then equals a clean one."""
+    import shadow.runner as runner
+    from shadow.runner import _CountingMaker, backtest_over_windows
+    from tests.helpers import run as arun
+
+    sym = "TST_" + os.urandom(3).hex()
+    crashed, clean = "crash-" + os.urandom(3).hex(), "ok-" + os.urandom(3).hex()
+    windows = _synthetic_windows()
+
+    real_persist_trade = runner._persist_trade
+    state = {"n": 0}
+
+    def crash_on_second_trade(*a, **k):
+        state["n"] += 1
+        if state["n"] == 2:
+            raise RuntimeError("simulated crash AFTER the decision, BEFORE the trade")
+        return real_persist_trade(*a, **k)
+
+    def go(run_id):
+        return arun(backtest_over_windows(
+            windows, symbol=sym, provider_name="csv", modeled_spread_pct=0.02,
+            decision_maker=_CountingMaker(_CountingFake()), persist_dsn=DSN, run_id=run_id,
+            model_name="fake"))
+
+    try:
+        runner._persist_trade = crash_on_second_trade
+        with pytest.raises(RuntimeError):
+            go(crashed)
+        # State a crash leaves: a decision with no trade, and its reservation NOT 'done'.
+        with psycopg.connect(DSN) as c:
+            orphan = c.execute(
+                "SELECT count(*) FROM decisions d WHERE d.run_id = %s AND d.risk_verdict='approved' "
+                "AND d.blocked_reason IS NULL "  # a blocked bar is legitimately trade-less
+                "AND NOT EXISTS (SELECT 1 FROM trades t WHERE t.decision_id = d.id)", (crashed,)
+            ).fetchone()[0]
+        assert orphan >= 1, "the crash must have left a decided-but-untraded bar"
+        # Expire the lease so the resume may re-claim the interrupted bar.
+        with psycopg.connect(DSN) as c:
+            c.execute("UPDATE decision_reservations SET lease_expires_at = now() - interval '1s' "
+                      "WHERE run_id = %s", (crashed,))
+            c.commit()
+
+        runner._persist_trade = real_persist_trade
+        go(crashed)                                    # resume: rebuilds the missing trade
+        go(clean)                                      # reference run
+        with psycopg.connect(DSN) as c:
+            still_orphan = c.execute(
+                "SELECT count(*) FROM decisions d WHERE d.run_id = %s AND d.risk_verdict='approved' "
+                "AND d.blocked_reason IS NULL "
+                "AND NOT EXISTS (SELECT 1 FROM trades t WHERE t.decision_id = d.id)", (crashed,)
+            ).fetchone()[0]
+        assert still_orphan == 0, "resume must rebuild the trade the crash skipped"
+        assert _trades_of(crashed) == _trades_of(clean)
+    finally:
+        runner._persist_trade = real_persist_trade
+        with psycopg.connect(DSN) as c:
+            for r in (crashed, clean):
                 c.execute("DELETE FROM trades WHERE run_id = %s", (r,))
                 c.execute("DELETE FROM decisions WHERE run_id = %s", (r,))
                 c.execute("DELETE FROM decision_reservations WHERE run_id = %s", (r,))

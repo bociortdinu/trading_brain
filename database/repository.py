@@ -270,7 +270,10 @@ def run_lock(dsn: str, run_id: str):
     """
     import psycopg
 
-    conn = psycopg.connect(dsn)
+    # autocommit: a session advisory lock does not need a transaction, and holding one open for
+    # the entire backtest would show up as 'idle in transaction' the whole time (and could pin
+    # vacuum). Each statement here stands alone.
+    conn = psycopg.connect(dsn, autocommit=True)
     try:
         got = conn.execute("SELECT pg_try_advisory_lock(hashtext(%s)::bigint)", (run_id,)).fetchone()[0]
         if not got:
@@ -309,6 +312,12 @@ def reserve_decision(dsn: str, *, input_fingerprint: str, run_id: str, worker: s
     The token is what makes ownership real. Without it, a worker whose lease expired could wake
     up and complete a claim now held by somebody else — stamping 'done' over live work and
     leaving an input decided-but-decisionless forever.
+
+    HONEST GUARANTEE: this is AT-MOST-ONE CONCURRENT attempt, NOT exact-once. If a worker calls
+    the model successfully and then dies BEFORE persisting, its lease eventually expires and a
+    second worker will call the model AGAIN — a duplicate CHARGE. Closing that window needs a
+    provider-accepted idempotency key on the API call itself, which we do not have. Do not claim
+    "no duplicate charge".
     """
     import uuid
 
@@ -352,8 +361,17 @@ def complete_decision_reservation(dsn: str, *, input_fingerprint: str, run_id: s
     Compare-and-set on the claim token: only the worker still holding the claim may close it. If
     the lease was taken over while we were working, the UPDATE matches nothing and we raise —
     better a loud failure than silently overwriting the new owner's claim.
+
+    'done' means a COMPLETE chain, so it must carry the decision it produced. Enforced here as
+    well as by the DB check (ck_reservation_done_has_decision): a 'done' with no decision would
+    tell every later run "already decided" about a decision that does not exist.
     """
     import psycopg
+
+    if status not in ("done", "failed"):
+        raise ValueError(f"a reservation is completed as 'done' or 'failed', not {status!r}")
+    if status == "done" and decision_id is None:
+        raise ValueError("cannot mark a reservation 'done' without the decision it produced")
 
     with psycopg.connect(dsn) as conn:
         cur = conn.execute(

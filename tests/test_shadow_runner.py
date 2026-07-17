@@ -5,12 +5,41 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from shadow.runner import ConfluenceStrategy, backtest_over_windows, report
+from shadow.runner import (
+    _FOREVER,
+    _busy_until,
+    _resume_busy_until,
+    ConfluenceStrategy,
+    backtest_over_windows,
+    report,
+)
 from tests.helpers import run
 from tests.synthetic import trend
 
 UTC = timezone.utc
 _END = datetime(2026, 7, 1, tzinfo=UTC)
+
+
+def test_open_trade_blocks_for_the_rest_of_the_run():
+    """A trade that never closed (closed_at is None) is still OPEN: it must block every later bar,
+    not just up to the last bar's close. The old `future[-1].close` let the boundary bar (as_of ==
+    that close, gate is a strict `<`) open a SECOND position — a real single-position violation."""
+    closed = datetime(2026, 6, 30, 12, 0, tzinfo=UTC)
+    assert _busy_until(closed, 900.0, 0) == closed            # a closed trade blocks until close
+    assert _busy_until(None, 900.0, 0) == _FOREVER            # an OPEN trade blocks the whole run
+    # cooldown extends a CLOSED trade's block, but an open one is already forever.
+    assert _busy_until(closed, 900.0, 2) == closed + timedelta(seconds=1800)
+
+
+def test_resume_busy_until_matches_the_live_rule():
+    prev = datetime(2026, 6, 30, 9, 0, tzinfo=UTC)
+    bars = [type("B", (), {"close_time": _END})()]
+    # An open outcome on resume must also block forever (not just to the window end).
+    assert _resume_busy_until({"outcome": {"closed_at": None}}, prev, bars, 900.0, 0) == _FOREVER
+    closed = datetime(2026, 6, 30, 12, 0, tzinfo=UTC)
+    assert _resume_busy_until({"outcome": {"closed_at": closed}}, prev, bars, 900.0, 0) == closed
+    # A bar that traded nothing leaves the clock untouched.
+    assert _resume_busy_until({"outcome": None}, prev, bars, 900.0, 0) == prev
 
 
 def _windows(step=1.0, n=250):
