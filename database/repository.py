@@ -190,10 +190,12 @@ def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, mo
                     data_provider: str, tokens: dict | None = None,
                     run_id: str | None = None, input_fingerprint: str | None = None,
                     spread_observation_id: int | None = None,
-                    blocked_reason: str | None = None) -> int:
+                    blocked_reason: str | None = None) -> tuple[int, bool]:
     """Persist a DecisionRecord (decision/pipeline.py) with its reproducibility manifest and
     the FK to the authorizing evaluation. Never fabricates an approved verdict — the
-    risk_verdict comes straight from the record.
+    risk_verdict comes straight from the record. Returns (decision_id, inserted): `inserted` is
+    False when this (input_fingerprint, run_id) already existed — the caller then MUST treat the
+    returned id as a PRE-EXISTING decision and not as the product of its own `record`.
 
     When `run_id` + `input_fingerprint` are given (shadow experiments), the insert is ATOMIC and
     idempotent: ON CONFLICT (input_fingerprint, run_id) DO NOTHING, so two concurrent inserts
@@ -243,13 +245,16 @@ def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, mo
                 spread_observation_id, blocked_reason,
             ),
         ).fetchone()
+        inserted = row is not None
         if row is None:   # ON CONFLICT DO NOTHING -> the decision already exists for this run
             row = conn.execute(
                 "SELECT id FROM decisions WHERE input_fingerprint = %s AND run_id = %s",
                 (input_fingerprint, run_id),
             ).fetchone()
         conn.commit()
-    return row[0]
+    # (id, inserted): a caller that hit a conflict must NOT proceed as if it produced this
+    # decision — the row belongs to an earlier attempt and any fresh `rec` would be discarded.
+    return row[0], inserted
 
 
 class RunLockedError(RuntimeError):
@@ -401,6 +406,7 @@ def load_decided_outcome(dsn: str, *, input_fingerprint: str, run_id: str) -> di
         row = conn.execute(
             """
             SELECT d.id AS decision_id, d.direction, d.risk_verdict, d.blocked_reason,
+                   d.sl_pct, d.tp_pct,
                    t.status, t.exit_reason, t.exit_price, t.closed_at, t.opened_at,
                    t.r_multiple, t.r_pessimistic, t.r_optimistic, t.ambiguous
             FROM decisions d

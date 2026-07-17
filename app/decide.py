@@ -138,7 +138,7 @@ async def _run(settings, *, mode: str, use_fake: bool, all_regimes: bool = False
                   "latency_ms": last.latency_ms,
                   "cache_hit": bool(last.cache_read_input_tokens)}
     ai_output = record.decision.model_dump(mode="json") if record.decision else None
-    dec_id = insert_decision(
+    dec_id, _ = insert_decision(
         settings.db_dsn, snapshot_id=snap_id, evaluation_id=eval_id, model=model_name,
         record=record, ai_input=inp.model_dump(mode="json"), ai_output=ai_output,
         mode="shadow", data_provider=provider_name, tokens=tokens,

@@ -156,7 +156,7 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
             inp = build_decision_input(packet, mode="online")
             # ATOMIC + idempotent on (input_fingerprint, run_id): a concurrent/duplicate insert
             # returns the existing decision id instead of creating a second row.
-            dec_id = insert_decision(
+            dec_id, _ = insert_decision(
                 settings.db_dsn, snapshot_id=snap_id, evaluation_id=eval_id, model=model_name,
                 record=record, ai_input=inp.model_dump(mode="json"),
                 ai_output=record.decision.model_dump(mode="json") if record.decision else None,

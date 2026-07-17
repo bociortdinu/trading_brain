@@ -11,6 +11,21 @@
 --   2. in_progress   => claim_token IS NOT NULL   (an owned claim always has an owner token)
 --   3. decision_id, when set, belongs to the SAME (input_fingerprint, run_id) as the
 --      reservation — a reservation can't be closed out against another input's decision.
+--
+-- REPAIR BEFORE CONSTRAINING. A DB that already ran the old code may hold rows that violate
+-- these — a 'done' with no decision, an 'in_progress' with no token, or a decision_id whose
+-- (fingerprint, run_id) doesn't match. ADD CONSTRAINT would then FAIL. Reset such rows to
+-- 'failed' first: a failed reservation is reclaimable, so a later run re-does that input cleanly
+-- and no corrupt state survives. (Fresh databases have an empty table here — this is a no-op.)
+UPDATE decision_reservations SET status = 'failed', decision_id = NULL
+ WHERE (status = 'done' AND decision_id IS NULL)
+    OR (status = 'in_progress' AND claim_token IS NULL)
+    OR (decision_id IS NOT NULL AND NOT EXISTS (
+          SELECT 1 FROM decisions d
+          WHERE d.id = decision_reservations.decision_id
+            AND d.input_fingerprint = decision_reservations.input_fingerprint
+            AND d.run_id = decision_reservations.run_id));
+
 ALTER TABLE decision_reservations
     ADD CONSTRAINT ck_reservation_done_has_decision
     CHECK (status <> 'done' OR decision_id IS NOT NULL);

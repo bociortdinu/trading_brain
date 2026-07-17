@@ -199,6 +199,20 @@ async def _backtest_over_windows(
                 busy_until = _resume_busy_until(row, busy_until, m15, bar_seconds, cooldown_bars)
                 out.append(row)
                 continue
+            # claim == "reserved": FRESH, or RECOVERING a crashed run. A reclaimed lease may sit on
+            # top of a decision an earlier run already persisted (it crashed after the decision,
+            # before the trade). Then we must NOT call the maker again — rebuild the chain from the
+            # stored decision, so the trade matches the decision that was actually recorded.
+            from database.repository import load_decided_outcome
+            prior = load_decided_outcome(persist_dsn, input_fingerprint=fingerprint, run_id=run_id)
+            if prior is not None:
+                row, busy_until = _recover_bar(
+                    persist_dsn, run_id, symbol, prior, packet, m15, as_of, busy_until,
+                    single_position, bar_seconds, cooldown_bars, modeled_spread_pct,
+                    slippage_pct, shadow_config)
+                _release(persist_dsn, fingerprint, run_id, "done", prior["decision_id"], claim_token)
+                out.append(row)
+                continue
 
         rec = await run_decision(packet, elig, decision_maker, mode="replay",
                                  prefilter_config=prefilter_config, risk_config=risk_config,
@@ -221,19 +235,12 @@ async def _backtest_over_windows(
                                        packet, elig, rec, fingerprint=fingerprint,
                                        llm_result=llm_result, blocked_reason=blocked)
         if rec.risk_approved and not blocked:
-            future = [c for c in m15 if c.open_time >= as_of]
-            entry_ref = future[0].open if future else packet.price  # fill at next bar's open (latency)
-            trade = open_virtual_trade(
-                rec.decision.direction, entry_ref, rec.risk.sl_pct, rec.risk.tp_pct,
-                spread_pct=modeled_spread_pct, spread_provenance="modeled",
-                slippage_pct=slippage_pct, opened_at=as_of,
-            )
-            o = reconcile(trade, future, shadow_config)
+            o = _open_reconcile_persist(
+                persist_dsn, run_id, symbol, dec_id, rec.decision.direction, rec.risk.sl_pct,
+                rec.risk.tp_pct, packet, m15, as_of, modeled_spread_pct, slippage_pct, shadow_config)
             row["outcome"] = o.model_dump()
             if single_position:
                 busy_until = _busy_until(o.closed_at, bar_seconds, cooldown_bars)
-            if dec_id is not None:
-                _persist_trade(persist_dsn, run_id, symbol, dec_id, trade, o, shadow_config)
 
         # Close out the claim LAST, after the trade (if any) is on disk, so 'done' means the
         # WHOLE chain is terminal — decision + (trade | no-trade-needed) — not just a decisions
@@ -252,6 +259,59 @@ def _release(dsn, fingerprint, run_id, status, decision_id, claim_token) -> None
 
     complete_decision_reservation(dsn, input_fingerprint=fingerprint, run_id=run_id,
                                   status=status, decision_id=decision_id, claim_token=claim_token)
+
+
+def _open_reconcile_persist(dsn, run_id, symbol, dec_id, direction, sl_pct, tp_pct, packet, m15,
+                            as_of, modeled_spread_pct, slippage_pct, shadow_config):
+    """Open the virtual trade, reconcile it, and (when persisting) upsert it. Shared by the fresh
+    path and the crash-recovery path so a rebuilt trade is IDENTICAL to the one first produced —
+    the entry rule, spread and slippage are all deterministic from the decision + the window."""
+    future = [c for c in m15 if c.open_time >= as_of]
+    entry_ref = future[0].open if future else packet.price  # fill at the next bar's open (latency)
+    trade = open_virtual_trade(
+        direction, entry_ref, sl_pct, tp_pct,
+        spread_pct=modeled_spread_pct, spread_provenance="modeled",
+        slippage_pct=slippage_pct, opened_at=as_of,
+    )
+    o = reconcile(trade, future, shadow_config)
+    if dsn is not None and dec_id is not None:
+        _persist_trade(dsn, run_id, symbol, dec_id, trade, o, shadow_config)
+    return o
+
+
+def _outcome_dict(prior):
+    if prior["status"] is None:
+        return None
+    f = lambda k: float(prior[k]) if prior[k] is not None else None  # noqa: E731
+    return {"status": prior["status"], "exit_reason": prior["exit_reason"],
+            "exit_price": f("exit_price"), "closed_at": prior["closed_at"],
+            "r_multiple": f("r_multiple"), "r_pessimistic": f("r_pessimistic"),
+            "r_optimistic": f("r_optimistic"), "ambiguous": prior["ambiguous"]}
+
+
+def _recover_bar(dsn, run_id, symbol, prior, packet, m15, as_of, busy_until, single_position,
+                 bar_seconds, cooldown_bars, modeled_spread_pct, slippage_pct, shadow_config):
+    """Rebuild a bar from its PERSISTED decision after a crash — WITHOUT calling the maker. Calling
+    it again could return a DIFFERENT verdict and we'd attach a new trade (or none) to the OLD
+    decision, so 'done' would no longer mean a consistent chain. The verdict, direction and SL/TP
+    all come from the stored decision; only the (deterministic) trade is rebuilt if it is missing."""
+    row = {"as_of": as_of, "stage": "recovered", "direction": prior["direction"],
+           "approved": prior["risk_verdict"] == "approved", "blocked": prior["blocked_reason"],
+           "outcome": None}
+    if prior["status"] is not None:                 # trade already on disk -> just reconstruct it
+        row["outcome"] = _outcome_dict(prior)
+        if single_position:
+            busy_until = _busy_until(prior["closed_at"], bar_seconds, cooldown_bars)
+        return row, busy_until
+    if prior["risk_verdict"] == "approved" and prior["blocked_reason"] is None:
+        o = _open_reconcile_persist(dsn, run_id, symbol, prior["decision_id"],
+                                    Direction(prior["direction"]), float(prior["sl_pct"]),
+                                    float(prior["tp_pct"]), packet, m15, as_of,
+                                    modeled_spread_pct, slippage_pct, shadow_config)
+        row["outcome"] = o.model_dump()
+        if single_position:
+            busy_until = _busy_until(o.closed_at, bar_seconds, cooldown_bars)
+    return row, busy_until
 
 
 def _resume_busy_until(row, current, m15, bar_seconds, cooldown_bars):
@@ -277,16 +337,7 @@ def _resume_row(dsn, as_of, run_id, fingerprint, claim) -> dict:
     row["direction"] = prior["direction"]
     row["approved"] = prior["risk_verdict"] == "approved"
     row["blocked"] = prior["blocked_reason"]
-    if prior["status"] is not None:   # a trade was opened for this bar
-        row["outcome"] = {
-            "status": prior["status"], "exit_reason": prior["exit_reason"],
-            "exit_price": float(prior["exit_price"]) if prior["exit_price"] is not None else None,
-            "closed_at": prior["closed_at"],
-            "r_multiple": float(prior["r_multiple"]) if prior["r_multiple"] is not None else None,
-            "r_pessimistic": float(prior["r_pessimistic"]) if prior["r_pessimistic"] is not None else None,
-            "r_optimistic": float(prior["r_optimistic"]) if prior["r_optimistic"] is not None else None,
-            "ambiguous": prior["ambiguous"],
-        }
+    row["outcome"] = _outcome_dict(prior)   # a trade was opened for this bar (or None)
     return row
 
 
@@ -306,13 +357,22 @@ def _persist_decision(dsn, run_id, model_name, symbol, provider_name, packet, el
         insert_llm_call(dsn, llm_result, snapshot_id=snap_id)
     eval_id = insert_evaluation(dsn, snap_id, elig)
     inp = build_decision_input(packet, mode="replay")
-    return insert_decision(
+    dec_id, inserted = insert_decision(
         dsn, snapshot_id=snap_id, evaluation_id=eval_id, model=model_name, record=rec,
         ai_input=inp.model_dump(mode="json"),
         ai_output=rec.decision.model_dump(mode="json") if rec.decision else None,
         mode="shadow", data_provider=provider_name, run_id=run_id, input_fingerprint=fingerprint,
         blocked_reason=blocked_reason,
     )
+    # The fresh path only reaches here after confirming no decision existed AND under the
+    # exclusive run lock, so this insert must be genuinely new. A conflict would mean `rec` (a
+    # fresh maker response) is being silently dropped in favour of an older decision — the exact
+    # bug the recovery branch exists to prevent. Fail loudly instead.
+    if not inserted:
+        raise RuntimeError(
+            f"insert_decision hit an unexpected conflict for {fingerprint[:12]}… in run {run_id!r}"
+            " — a recovery path should have handled the pre-existing decision")
+    return dec_id
 
 
 def _persist_trade(dsn, run_id, symbol, dec_id, trade, outcome, shadow_config) -> None:

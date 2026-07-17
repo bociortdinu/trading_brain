@@ -203,7 +203,7 @@ def test_decision_references_immutable_evaluation():
         )
         # decisions.mode is the EXECUTION mode (shadow|live), distinct from the market mode
         # (online|replay, captured via the evaluation FK + manifest). Phase 2 is shadow-only.
-        dec_id = insert_decision(DSN, snapshot_id=snap_id, evaluation_id=eval_id, model="deterministic-fake",
+        dec_id, _ = insert_decision(DSN, snapshot_id=snap_id, evaluation_id=eval_id, model="deterministic-fake",
                                  record=rec, ai_input={"x": 1}, ai_output=decision.model_dump(mode="json"),
                                  mode="shadow", data_provider="csv")
         with psycopg.connect(DSN) as c:
@@ -240,7 +240,7 @@ def test_upsert_shadow_trade_idempotent_open_then_closed():
                              manifest={"prompt_version": "p", "output_schema_version": "s",
                                        "feature_pipeline_version": "1.2.0", "strategy_version": "st",
                                        "risk_config_version": "risk-mvp-2026.2"})
-        dec_id = insert_decision(DSN, snapshot_id=snap_id, evaluation_id=eval_id, model="fake",
+        dec_id, _ = insert_decision(DSN, snapshot_id=snap_id, evaluation_id=eval_id, model="fake",
                                  record=rec, ai_input={}, ai_output=decision.model_dump(mode="json"),
                                  mode="shadow", data_provider="csv")
         trade = open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6,
@@ -327,13 +327,14 @@ def _seed_decision(sym, *, input_hash="h", model="fake", end=None, snapshot_id=N
     ai_input = {}
     if spread_pct is not None:
         ai_input = {"spread_pct": spread_pct, "spread_provenance": provenance}
-    return insert_decision(DSN, snapshot_id=snapshot_id, evaluation_id=eval_id, model=model,
-                           record=rec, ai_input=ai_input,
-                           ai_output=decision.model_dump(mode="json"),
-                           mode="shadow", data_provider="csv",
-                           spread_observation_id=spread_observation_id,
-                           run_id=run_id, input_fingerprint=input_fingerprint,
-                           blocked_reason=blocked_reason)
+    dec_id, _ = insert_decision(DSN, snapshot_id=snapshot_id, evaluation_id=eval_id, model=model,
+                                record=rec, ai_input=ai_input,
+                                ai_output=decision.model_dump(mode="json"),
+                                mode="shadow", data_provider="csv",
+                                spread_observation_id=spread_observation_id,
+                                run_id=run_id, input_fingerprint=input_fingerprint,
+                                blocked_reason=blocked_reason)
+    return dec_id
 
 
 def test_upsert_shadow_trade_never_reopens_a_closed_trade():
@@ -776,6 +777,121 @@ def test_blocked_disposition_is_persisted_and_reconstructed_on_resume():
         _cleanup(sym)
 
 
+class _VerdictMaker:
+    """A maker whose verdict we control per run, so a recovery run can be given a DIFFERENT
+    verdict than the one persisted — proving recovery reuses the STORED decision, not a fresh
+    call. Counts calls so we can assert the recovery makes none."""
+
+    def __init__(self, verdict):
+        self.verdict, self.calls = verdict, 0
+
+    async def decide(self, inp):
+        from core.models import Direction
+        from decision.schema import DecisionOutput
+
+        self.calls += 1
+        if self.verdict == "bull" and inp.confluence == "aligned_bull":
+            return DecisionOutput(direction=Direction.BUY, confidence=0.7, rationale="x")
+        return DecisionOutput(direction=Direction.NO_TRADE, confidence=0.5, rationale="x")
+
+
+def test_recovery_reuses_the_stored_decision_and_never_recalls_the_maker():
+    """The blocking bug the reviewer reproduced: after a reclaimed lease the runner used to re-call
+    the maker and attach the NEW verdict's trade to the OLD decision. Here the first run decides
+    BUY and persists; ONE approved bar is then corrupted to look like a crash-after-decision (its
+    trade deleted, its reservation reset to an expired in_progress). The resume runs a maker that
+    would say NO_TRADE — yet it must make ZERO calls and rebuild the BUY trade the stored decision
+    describes."""
+    from shadow.runner import backtest_over_windows
+    from tests.helpers import run as arun
+
+    sym = "TST_" + os.urandom(3).hex()
+    run_id = "recov-" + os.urandom(3).hex()
+    windows = _synthetic_windows()
+
+    def go(maker):
+        return arun(backtest_over_windows(
+            windows, symbol=sym, provider_name="csv", modeled_spread_pct=0.02,
+            decision_maker=maker, persist_dsn=DSN, run_id=run_id, model_name="fake"))
+
+    try:
+        go(_VerdictMaker("bull"))                      # full BUY run: decisions + trades persisted
+        with psycopg.connect(DSN) as c:                # corrupt ONE approved bar -> crash shape
+            dec = c.execute(
+                "SELECT d.id, d.input_fingerprint FROM decisions d JOIN trades t ON t.decision_id=d.id "
+                "WHERE d.run_id=%s AND d.risk_verdict='approved' AND d.blocked_reason IS NULL "
+                "ORDER BY d.as_of LIMIT 1", (run_id,)).fetchone()
+            c.execute("DELETE FROM trades WHERE decision_id=%s", (dec[0],))
+            c.execute("UPDATE decision_reservations SET status='in_progress', claim_token='stale', "
+                      "lease_expires_at = now() - interval '1s' "
+                      "WHERE input_fingerprint=%s AND run_id=%s", (dec[1], run_id))
+            c.commit()
+
+        recovery = _VerdictMaker("notrade")            # would say NO_TRADE if asked
+        go(recovery)
+        assert recovery.calls == 0, "recovery must reuse the stored decision, never re-call the maker"
+        with psycopg.connect(DSN) as c:
+            side = c.execute("SELECT side FROM trades WHERE decision_id=%s", (dec[0],)).fetchone()
+            done = c.execute("SELECT status, decision_id FROM decision_reservations "
+                             "WHERE input_fingerprint=%s AND run_id=%s", (dec[1], run_id)).fetchone()
+        assert side is not None and side[0] == "buy", "trade must match the PERSISTED decision, not NO_TRADE"
+        assert done == ("done", dec[0]), "the recovered chain must be terminal against its decision"
+    finally:
+        with psycopg.connect(DSN) as c:
+            for t in ("trades", "decisions", "decision_reservations"):
+                c.execute(f"DELETE FROM {t} WHERE run_id = %s", (run_id,))
+            c.commit()
+        _cleanup(sym)
+
+
+def test_resume_after_a_crash_between_trade_and_release_validates_the_chain():
+    """Crash in the OTHER window: the trade WAS persisted but the reservation was never released,
+    so it is left 'in_progress'. Resume re-claims it, sees the trade already exists, rebuilds
+    nothing, and just finalises 'done'. No maker call, no duplicate trade."""
+    from shadow.runner import backtest_over_windows
+    from tests.helpers import run as arun
+
+    sym = "TST_" + os.urandom(3).hex()
+    run_id = "rel-" + os.urandom(3).hex()
+    windows = _synthetic_windows()
+
+    def go(maker):
+        return arun(backtest_over_windows(
+            windows, symbol=sym, provider_name="csv", modeled_spread_pct=0.02,
+            decision_maker=maker, persist_dsn=DSN, run_id=run_id, model_name="fake"))
+
+    try:
+        go(_VerdictMaker("bull"))
+        with psycopg.connect(DSN) as c:                # trade kept, reservation left in_progress
+            dec = c.execute(
+                "SELECT d.id, d.input_fingerprint FROM decisions d JOIN trades t ON t.decision_id=d.id "
+                "WHERE d.run_id=%s AND d.risk_verdict='approved' AND d.blocked_reason IS NULL "
+                "ORDER BY d.as_of LIMIT 1", (run_id,)).fetchone()
+            before = c.execute("SELECT id, opened_at, closed_at FROM trades WHERE decision_id=%s",
+                               (dec[0],)).fetchone()
+            c.execute("UPDATE decision_reservations SET status='in_progress', claim_token='stale', "
+                      "lease_expires_at = now() - interval '1s' "
+                      "WHERE input_fingerprint=%s AND run_id=%s", (dec[1], run_id))
+            c.commit()
+
+        recovery = _VerdictMaker("notrade")
+        go(recovery)
+        assert recovery.calls == 0
+        with psycopg.connect(DSN) as c:
+            after = c.execute("SELECT id, opened_at, closed_at FROM trades WHERE decision_id=%s",
+                              (dec[0],)).fetchall()
+            done = c.execute("SELECT status FROM decision_reservations "
+                             "WHERE input_fingerprint=%s AND run_id=%s", (dec[1], run_id)).fetchone()
+        assert len(after) == 1 and after[0] == before, "the existing trade must be untouched, not duplicated"
+        assert done[0] == "done"
+    finally:
+        with psycopg.connect(DSN) as c:
+            for t in ("trades", "decisions", "decision_reservations"):
+                c.execute(f"DELETE FROM {t} WHERE run_id = %s", (run_id,))
+            c.commit()
+        _cleanup(sym)
+
+
 def test_resume_reconstructs_a_trade_after_a_crash_between_decision_and_trade():
     """The narrow window the reviewer flagged: the decision is persisted, then the process dies
     BEFORE the trade. 'done' is released only after the trade, so the claim is left 'in_progress'
@@ -871,7 +987,7 @@ def test_reconcile_open_trades_closes_hit_trades_idempotently():
                              manifest={"prompt_version": "p", "output_schema_version": "s",
                                        "feature_pipeline_version": "1.2.0", "strategy_version": "st",
                                        "risk_config_version": "v"})
-        dec_id = insert_decision(DSN, snapshot_id=snap_id, evaluation_id=eval_id, model="fake",
+        dec_id, _ = insert_decision(DSN, snapshot_id=snap_id, evaluation_id=eval_id, model="fake",
                                  record=rec, ai_input={}, ai_output=decision.model_dump(mode="json"),
                                  mode="shadow", data_provider="csv")
         trade = open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6, spread_pct=0.02,

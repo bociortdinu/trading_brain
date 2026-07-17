@@ -247,12 +247,42 @@ Reviewer-ul a avut din nou dreptate; fiecare afirmație reprodusă local înaint
 separat de retenție (append-only real); swap long/short + DST; reconcilierea folosește configul
 curent nu cel salvat; `llm_calls` per-attempt; perf O(n²); Faza 4 = spike; edge real = nemăsurat.
 
+---
+
+## Runda 9 — „self-healing"-ul era el însuși defect
+
+Afirmasem că resume-ul „refolosește decizia și reconstruiește trade-ul". **Fals în implementare** —
+reviewer-ul a reprodus, iar eu am confirmat (46 apeluri la maker în recovery, 1 lanț `done` fără trade).
+
+**Bug-ul (reprodus):** după re-revendicarea unui lease expirat, codul **reapela maker-ul**. Abia apoi
+`insert_decision ... ON CONFLICT` întorcea id-ul deciziei **vechi**. Cu un maker care întorcea alt
+verdict la resume (BUY→NO_TRADE), sistemul lega (sau nu) un trade nou de decizia veche approved →
+`done` fără trade. Invariantul „done = lanț complet" încălcat. Testul meu nu prindea asta: același
+maker determinist + fără verificarea numărului de apeluri.
+
+**Reparat:**
+- **Ramură reală de recovery.** După „reserved", dacă există deja o decizie pentru
+  `(input_fingerprint, run_id)` → **NU** se apelează maker-ul. Trade-ul se reconstruiește **exclusiv**
+  din decizia persistată (direcție, SL, TP — deterministe din decizie + fereastră), printr-un helper
+  partajat cu calea fresh (trade identic). Dacă trade-ul există deja → doar validează + finalizează.
+- `insert_decision` întoarce acum explicit `(decision_id, inserted)`; calea fresh **eșuează zgomotos**
+  la un conflict neașteptat (un `rec` nou nu mai poate fi continuat peste o decizie veche).
+- **Dovedit cu dinți:** primul run BUY, un bar corupt (trade șters + rezervare resetată), resume cu
+  maker care ar zice NO_TRADE → `second.calls == 0`, trade-ul reconstruit `buy` (din decizia
+  persistată, nu NO_TRADE), rezervarea `done` legată de decizia ei. + test crash-după-trade
+  (rezervare `in_progress`, trade există) → resume validează, nu duplică, `done`.
+- **Migrarea 0018 repară înainte de constrângere.** Adăuga constrângerile direct — pe o bază cu
+  rânduri legacy corupte (`done`+decizie NULL) ar fi **eșuat** la ADD CONSTRAINT. Acum resetează întâi
+  rândurile invalide la `failed` (reclaimabile). Validat: no-op pe baza curată.
+
+**Datorii rămase (oneste):** cheie de idempotency provider (exact-once real); DELETE într-un rol
+separat de retenție (append-only real); swap long/short + DST; reconcilierea folosește configul
+curent nu cel salvat; `llm_calls` per-attempt; perf O(n²); Faza 4 = spike; edge real = nemăsurat.
+
 **Ordinea recomandată** (per reviewer): ~~snapshot/spread~~ (r4) → ~~mock reconnect~~ (r5) →
 ~~rezervare atomică + provenance + resume~~ (r6–7) → ~~stare terminală + fereastra decizie→trade~~
-(r8) → **urmează**: pornirea monitorizată a Shadow Online (doar maker determinist). Rămâne valabil:
-**nu** rula `--maker claude` pe mii de bare (perf O(n²) + cost).
-
----
+(r8) → ~~recovery real fără reapelarea maker-ului~~ (r9) → **urmează**: pornirea monitorizată a Shadow
+Online (doar maker determinist). Rămâne valabil: **nu** rula `--maker claude` pe mii de bare.
 
 ## Faza 0 — Fundație
 
