@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 from data_collector.providers.base import Candle, validate_series
 from data_collector.session import DEFAULT_CALENDAR, SessionCalendar, timeframe_quality
-from features.engineering import MIN_BARS, timeframe_features
+from features.engineering import MIN_BARS, TimeframeSeries, timeframe_features
 from features.version import FEATURE_PIPELINE_VERSION
 
 # Role -> timeframe key (must exist in config.timeframes).
@@ -97,7 +97,13 @@ def build_feature_packet(
     news_digest: list[dict] | None = None,
     basis_observed: dict | None = None,
     calendar: SessionCalendar = DEFAULT_CALENDAR,
+    precomputed: dict[str, TimeframeSeries] | None = None,
 ) -> FeaturePacket:
+    """`precomputed` is an O(n^2)->O(n) fast path for backtests: a TimeframeSeries per timeframe,
+    each built over a FULL window whose first bars are exactly `tf_candles[name]` (a prefix). The
+    timeframe features are then read by indexing instead of recomputed over the slice. Everything
+    else (anchor checks, data_quality, confluence, assembly) is the SAME code path, so a fast
+    packet is identical to a slow one — see test_backtest_fast_path_matches_slow_path."""
     for role in (MACRO_TF, TREND_TF, STRUCTURE_TF, TRIGGER_TF):
         if role not in tf_candles:
             raise ValueError(f"missing candles for timeframe {role!r}")
@@ -119,7 +125,12 @@ def build_feature_packet(
         gaps = validate_series(candles, name)
         data_quality[name] = timeframe_quality(len(candles), MIN_BARS, gaps, name, calendar)
 
-    tf = {name: timeframe_features(candles) for name, candles in tf_candles.items()}
+    if precomputed is not None:
+        # features_at(len-1) over the full series == timeframe_features(prefix) (proven equivalent).
+        tf = {name: precomputed[name].features_at(len(candles) - 1)
+              for name, candles in tf_candles.items()}
+    else:
+        tf = {name: timeframe_features(candles) for name, candles in tf_candles.items()}
     macro, trend, structure, trigger = tf[MACRO_TF], tf[TREND_TF], tf[STRUCTURE_TF], tf[TRIGGER_TF]
 
     return FeaturePacket(

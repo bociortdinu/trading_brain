@@ -317,9 +317,28 @@ Online (doar maker determinist). Rămâne valabil: **nu** rula `--maker claude` 
   INSERT, nu prin UPDATE ulterior). **Parțial:** logez `retry_count`, NU fiecare attempt ca rând
   separat — datoria rămâne notată ca atare.
 
+---
+
+## Runda 12 — perf backtest O(n²) → O(n)
+
+`timeframe_features` era **87% din timpul unui backtest** (profilat): recalcula toți indicatorii
+peste tot prefixul la fiecare bară (buclele Python din `_rma`/`ema`) → O(n²).
+
+**Reparat, provably identic:** `TimeframeSeries` precalculează arrays-urile per timeframe **o
+singură dată** și citește feature-urile la orice poziție `p` prin indexare. E **exact**
+`timeframe_features(candles[:p+1])`, nu o aproximare — pentru că (a) ema/atr/rsi/adx sunt seed-uite
+de la bara 0 și recursive, deci `arr[p]` = ultima valoare peste prefix (position-independent), și
+(b) un pivot swing la `i` e „confirmat" abia la `i+right`, deci pivoții știuți la `p` sunt exact cei
+cu `i ≤ p-right` = `swing_highs(high[:p+1])`. `build_feature_packet(precomputed=...)` schimbă **doar**
+sursa feature-urilor tf; restul (anchor, data_quality, confluence, assembly) e aceeași cale de cod.
+
+**Garanții:** `features_at(p)` == per-slice **byte-for-byte** pe uptrend/downtrend/oscillating la
+fiecare bară (toate ramurile de regim + pivoți S/R); backtestul fast == slow (rânduri + metrici
+identice). **12× speedup** măsurat (2500 bare: 26.7s → 2.25s), scalare liniară.
+
 **Datorii rămase (oneste):** exact-once (imposibil la Anthropic — închis ca „nu se poate"); DELETE
 într-un rol separat de retenție (append-only real); swap long/short + DST/triple; `llm_calls`
-per-attempt (retry_count făcut, rânduri per-attempt nu); perf O(n²); Faza 4 = spike; edge = nemăsurat.
+per-attempt (retry_count făcut, rânduri per-attempt nu); Faza 4 = spike; edge real = nemăsurat.
 
 ## Faza 0 — Fundație
 

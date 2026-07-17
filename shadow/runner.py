@@ -32,7 +32,7 @@ from decision.schema import (
     decision_fingerprint,
 )
 from features.eligibility import EligibilityConfig, evaluate_eligibility
-from features.engineering import MIN_BARS
+from features.engineering import MIN_BARS, TimeframeSeries
 from features.mtf import TRIGGER_TF, build_feature_packet
 from risk.engine import RiskConfig
 from shadow.metrics import summarize
@@ -131,6 +131,7 @@ async def _backtest_over_windows(
     run_id: str | None = None,
     model_name: str = "deterministic-confluence",
     worker_id: str | None = None,      # identifies this worker's reservations (default: host:pid)
+    fast_features: bool = True,        # O(n) precompute; False forces the per-slice path (tests)
 ) -> list[dict]:
     """Backtest over provided windows. Returns per-bar dicts:
     {as_of, stage, direction, approved, outcome(dict|None)}. When `persist_dsn`+`run_id` are
@@ -145,6 +146,13 @@ async def _backtest_over_windows(
 
     m15 = windows[TRIGGER_TF]
     out: list[dict] = []
+    # O(n^2) -> O(n): precompute each timeframe's indicator arrays ONCE over the full window,
+    # then read features by index at each bar instead of recomputing over the growing prefix.
+    # A TimeframeSeries needs >= MIN_BARS; a shorter TF simply has no fast path (rare in a real
+    # backtest, but the slow path stays correct).
+    series_by_tf = {tf: TimeframeSeries(bars) for tf, bars in windows.items()
+                    if fast_features and len(bars) >= MIN_BARS}
+    precomputed = series_by_tf if len(series_by_tf) == len(windows) else None
     # Position policy: a single account holds ONE position at a time. Without this gate the
     # backtest opens a new trade on every approved bar (the reviewer saw 23 concurrent
     # positions), which is NOT an executable strategy — the summed R is meaningless. We block
@@ -160,6 +168,7 @@ async def _backtest_over_windows(
         packet = build_feature_packet(
             symbol, sliced, as_of=as_of, provider=provider_name, provider_symbol=symbol,
             ingested_at=as_of, spread_pct=modeled_spread_pct, calendar=calendar,
+            precomputed=precomputed,
         )
         elig = evaluate_eligibility(sliced, TRIGGER_TF, as_of, mode="replay", now=as_of,
                                     config=eligibility_config, calendar=calendar)

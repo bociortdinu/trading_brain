@@ -102,6 +102,19 @@ def test_max_llm_calls_caps_a_paid_run():
     assert uncapped.calls > 5                                  # cap is what stopped the first run
 
 
+def test_backtest_fast_path_matches_slow_path():
+    """The O(n^2)->O(n) precompute must not change a single result: the fast path (default) and
+    the per-slice path must produce identical per-bar rows AND identical metrics."""
+    windows = _windows(step=1.0)
+    fast = run(backtest_over_windows(
+        windows, symbol="GOLD", provider_name="csv",
+        decision_maker=ConfluenceStrategy(), modeled_spread_pct=0.02, fast_features=True))
+    slow = run(backtest_over_windows(
+        windows, symbol="GOLD", provider_name="csv",
+        decision_maker=ConfluenceStrategy(), modeled_spread_pct=0.02, fast_features=False))
+    assert fast == slow and report(fast) == report(slow)
+
+
 def test_backtest_no_lookahead_reconciles_only_future_bars():
     # Every reconciled trade closes strictly AFTER its entry bar (guaranteed by the reconciler);
     # here we just assert the runner yields outcomes and the metrics are net-of-spread finite.
