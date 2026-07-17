@@ -353,8 +353,6 @@ def _persist_decision(dsn, run_id, model_name, symbol, provider_name, packet, el
     status, snap_id = upsert_snapshot(dsn, packet)
     if snap_id is None or status == "conflict":
         return None
-    if llm_result is not None:   # persist the paid API call (success or failure) for audit
-        insert_llm_call(dsn, llm_result, snapshot_id=snap_id)
     eval_id = insert_evaluation(dsn, snap_id, elig)
     inp = build_decision_input(packet, mode="replay")
     dec_id, inserted = insert_decision(
@@ -372,6 +370,8 @@ def _persist_decision(dsn, run_id, model_name, symbol, provider_name, packet, el
         raise RuntimeError(
             f"insert_decision hit an unexpected conflict for {fingerprint[:12]}… in run {run_id!r}"
             " — a recovery path should have handled the pre-existing decision")
+    if llm_result is not None:   # audit the paid API call, LINKED to the decision it produced
+        insert_llm_call(dsn, llm_result, snapshot_id=snap_id, decision_id=dec_id)
     return dec_id
 
 

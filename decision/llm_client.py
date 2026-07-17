@@ -76,6 +76,7 @@ class LlmCallResult(BaseModel):
     cache_creation_input_tokens: int | None = None
     latency_ms: int | None = None
     estimated_cost_usd: float | None = None
+    retry_count: int = 0     # transient retries performed before this result (0 = first attempt)
     prompt_version: str = DECISION_PROMPT_VERSION
     schema_version: str = DECISION_SCHEMA_VERSION
     input_hash: str
@@ -150,6 +151,7 @@ class AnthropicDecisionMaker:
         last_err = "unknown"
 
         for attempt in range(self._max_retries + 1):
+            base["retry_count"] = attempt   # carried into every return path via **base
             try:
                 resp = await self._client.messages.parse(
                     model=self._model,

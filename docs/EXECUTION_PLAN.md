@@ -301,6 +301,26 @@ perf O(n²); Faza 4 = spike; edge real = nemăsurat.
 (r8) → ~~recovery real fără reapelarea maker-ului~~ (r9) → **urmează**: pornirea monitorizată a Shadow
 Online (doar maker determinist). Rămâne valabil: **nu** rula `--maker claude` pe mii de bare.
 
+---
+
+## Runda 11 — datorii proprii închise (fără review)
+
+- **Reconciliere cu configul de la deschidere** (mai sus, r10): un config schimbat între deschidere
+  și închidere nu mai re-preţează silențios R-ul unei poziții deschise.
+- **Cheie de idempotency la provider — DEAD-END VERIFICAT.** SDK-ul Anthropic are infrastructura
+  (`_idempotency_header`), dar clientul **nu setează niciodată** header-ul → cheia nu se trimite, iar
+  API-ul nu deduplică. Deci exact-once chiar **nu** e posibil la Anthropic; „at-most-once" documentat
+  e corect și inerent. Nu am livrat un „fix" no-op.
+- **Audit `llm_calls` întărit** (migrarea 0019): `retry_count` (câte retry-uri transiente înainte de
+  rezultat) + `decision_id` (leagă apelul plătit de decizia produsă; NULL pentru un apel eșuat).
+  Apelul se logează acum **după** decizie (tabela e UPDATE-protected, deci legătura se scrie la
+  INSERT, nu prin UPDATE ulterior). **Parțial:** logez `retry_count`, NU fiecare attempt ca rând
+  separat — datoria rămâne notată ca atare.
+
+**Datorii rămase (oneste):** exact-once (imposibil la Anthropic — închis ca „nu se poate"); DELETE
+într-un rol separat de retenție (append-only real); swap long/short + DST/triple; `llm_calls`
+per-attempt (retry_count făcut, rânduri per-attempt nu); perf O(n²); Faza 4 = spike; edge = nemăsurat.
+
 ## Faza 0 — Fundație
 
 **Scop:** un schelet care rulează și confirmă că vedem date reale de la trading_hands.

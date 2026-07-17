@@ -161,9 +161,10 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
                                     prefilter_config=PrefilterConfig(), risk_config=RiskConfig(),
                                     calendar=calendar_for(provider_name))
         last = getattr(decision_maker, "last_result", None)
-        if last is not None:
-            insert_llm_call(settings.db_dsn, last, snapshot_id=snap_id)
         if record.stage == "llm_failed":
+            # A failed call yielded no decision -> audit it with decision_id NULL.
+            if last is not None:
+                insert_llm_call(settings.db_dsn, last, snapshot_id=snap_id)
             summary["decision"] = f"llm_failed:{record.llm_error}"
         else:
             inp = build_decision_input(packet, mode="online")
@@ -176,6 +177,8 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
                 mode="shadow", data_provider=provider_name, run_id=run_id,
                 input_fingerprint=fingerprint, spread_observation_id=spread_obs_id,
             )
+            if last is not None:   # audit the paid call, LINKED to the decision it produced
+                insert_llm_call(settings.db_dsn, last, snapshot_id=snap_id, decision_id=dec_id)
             summary["decision"] = f"{record.stage}:{record.decision.direction.value if record.decision else '-'}"
             if record.risk_approved:
                 # Online: fill at the OBSERVED quote mid (captures real latency), not the bar close.

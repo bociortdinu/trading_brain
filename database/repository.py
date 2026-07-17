@@ -448,10 +448,13 @@ def open_shadow_trades(dsn: str, run_id: str) -> list[dict]:
         ).fetchall()
 
 
-def insert_llm_call(dsn: str, result, *, snapshot_id: int | None = None) -> int:
+def insert_llm_call(dsn: str, result, *, snapshot_id: int | None = None,
+                    decision_id: int | None = None) -> int:
     """Audit-log one LLM call (success OR failure) with its full manifest + cost. `result`
     is a decision.llm_client.LlmCallResult. Persisting failures too means a failed/refused/
-    rate-limited call is never invisible under pay-per-token."""
+    rate-limited call is never invisible under pay-per-token. `retry_count` records how many
+    transient retries preceded this result; `decision_id` links the (paid) call to the decision
+    it produced (NULL for a failed call that yielded none)."""
     import psycopg
 
     with psycopg.connect(dsn) as conn:
@@ -461,8 +464,8 @@ def insert_llm_call(dsn: str, result, *, snapshot_id: int | None = None) -> int:
                 (snapshot_id, ok, error, requested_model, effective_model, request_id,
                  stop_reason, input_tokens, output_tokens, cache_read_tokens,
                  cache_creation_tokens, estimated_cost_usd, latency_ms, prompt_version,
-                 schema_version, input_hash)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 schema_version, input_hash, retry_count, decision_id)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING id
             """,
             (
@@ -471,6 +474,7 @@ def insert_llm_call(dsn: str, result, *, snapshot_id: int | None = None) -> int:
                 result.input_tokens, result.output_tokens, result.cache_read_input_tokens,
                 result.cache_creation_input_tokens, result.estimated_cost_usd, result.latency_ms,
                 result.prompt_version, result.schema_version, result.input_hash,
+                result.retry_count, decision_id,
             ),
         ).fetchone()
         conn.commit()

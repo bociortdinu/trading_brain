@@ -1079,6 +1079,37 @@ def test_insert_llm_call_logs_success_and_failure():
         _cleanup(sym)
 
 
+def test_llm_call_records_retry_count_and_links_the_decision():
+    """Pay-per-token audit: a call that RETRIED before succeeding records how many retries, and a
+    successful call is tied to the decision it produced; a failed call is logged unlinked."""
+    from database.repository import insert_llm_call, upsert_snapshot
+    from decision.llm_client import LlmCallResult
+
+    sym, run_id = "TST_" + os.urandom(3).hex(), "llm-" + os.urandom(3).hex()
+    try:
+        _, snap_id = upsert_snapshot(DSN, _packet(sym, spread=0.02))
+        dec_id = _seed_decision(sym, snapshot_id=snap_id, run_id=run_id, input_fingerprint="llmfp")
+        ok = LlmCallResult(ok=True, requested_model="claude-sonnet-5", request_id="r",
+                           input_tokens=900, output_tokens=200, estimated_cost_usd=0.004,
+                           latency_ms=800, retry_count=2, input_hash="h")
+        fail = LlmCallResult(ok=False, error="exhausted_retries:RateLimitError",
+                             requested_model="claude-sonnet-5", retry_count=3, input_hash="h")
+        ok_id = insert_llm_call(DSN, ok, snapshot_id=snap_id, decision_id=dec_id)
+        fail_id = insert_llm_call(DSN, fail, snapshot_id=snap_id)   # no decision -> unlinked
+        with psycopg.connect(DSN) as c:
+            got = {r[0]: (r[1], r[2]) for r in c.execute(
+                "SELECT id, retry_count, decision_id FROM llm_calls WHERE id = ANY(%s)",
+                ([ok_id, fail_id],)).fetchall()}
+        assert got[ok_id] == (2, dec_id), "successful call: retry_count + linked decision"
+        assert got[fail_id] == (3, None), "failed call: retry_count recorded, decision NULL"
+    finally:
+        with psycopg.connect(DSN) as c:
+            c.execute("DELETE FROM llm_calls WHERE snapshot_id=%s", (snap_id,))
+            c.execute("DELETE FROM decisions WHERE run_id=%s", (run_id,))
+            c.commit()
+        _cleanup(sym)
+
+
 def test_spread_status_tracks_a_bar_with_no_observation_yet():
     """The ONLINE scheduler retries the quote only for a bar that has no spread observation yet —
     now answered from spread_observations, not from a (removed) snapshot column."""

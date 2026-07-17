@@ -126,9 +126,9 @@ async def _run(settings, *, mode: str, use_fake: bool, all_regimes: bool = False
 
     # Audit-log the LLM call (success OR failure) with its full manifest + cost.
     last = getattr(maker, "last_result", None)
-    if last is not None:
-        insert_llm_call(settings.db_dsn, last, snapshot_id=snap_id)
     if record.stage == "llm_failed":
+        if last is not None:   # a failed call yielded no decision -> log it unlinked
+            insert_llm_call(settings.db_dsn, last, snapshot_id=snap_id)
         print(f"[llm] FAILED: {record.llm_error} (logged to llm_calls; no decision persisted)")
         return
 
@@ -144,6 +144,8 @@ async def _run(settings, *, mode: str, use_fake: bool, all_regimes: bool = False
         mode="shadow", data_provider=provider_name, tokens=tokens,
         spread_observation_id=spread_obs_id,
     )
+    if last is not None:   # audit the paid call, LINKED to the decision it produced
+        insert_llm_call(settings.db_dsn, last, snapshot_id=snap_id, decision_id=dec_id)
     verdict = "approved" if (record.risk and record.risk.approved) else "rejected"
     print(f"[db] decision id={dec_id} verdict={verdict} -> evaluation_id={eval_id} (shadow, NOT executed)")
 
