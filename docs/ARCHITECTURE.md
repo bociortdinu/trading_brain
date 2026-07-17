@@ -41,7 +41,7 @@ decizia (Risk Engine) și o trimite spre execuție către API-ul existent **trad
        │                                                                        │
        │ /quote, spread real                                                    │ payload validat
        ▼                                                                        ▼
-  ┌───────────────┐  HTTP (7 endpointuri + /trades/closed*)  ┌──────────────┐  WebSocket  ┌──────────┐
+  ┌───────────────┐  HTTP (8 endpointuri + /trades/closed*)  ┌──────────────┐  WebSocket  ┌──────────┐
   │ trading_brain │ ─────────────────────────────────────────►│ trading_hands│ ──────────► │ XTB demo │
   │   (Python)    │ ◄─────────────────────────────────────────│    (Go)      │  CoreAPI    │ xStation │
   └───────┬───────┘   status/quote/positions/balance          └──────┬───────┘             └──────────┘
@@ -56,7 +56,7 @@ decizia (Risk Engine) și o trimite spre execuție către API-ul existent **trad
 > nou pe trading_hands (`/trades/closed`, marcat `*`).
 
 ### 2.1 Interfața cu trading_hands (confirmat din cod)
-API HTTP la `http://127.0.0.1:4000`, 7 endpointuri:
+API HTTP la `http://127.0.0.1:4000`, 8 endpointuri:
 
 | Endpoint | Rol | Trading necesar |
 |---|---|---|
@@ -65,6 +65,7 @@ API HTTP la `http://127.0.0.1:4000`, 7 endpointuri:
 | `GET /positions` | **doar poziții deschise** (open_price, sl, tp absolute, side, external_id) | nu |
 | `GET /quote/{symbol}` | bid/ask live XTB (→ spread real) | nu |
 | `GET /instruments/{q}` | rezolvă simbol, tradeable, session_type, min_volume, volume_step | nu |
+| `GET /candles/{symbol}/{period}` | bare OHLC închise, real-time (paginat, până la 10k) — **feedul MTF** | nu |
 | `POST /purchase` | deschide o poziție | da |
 | `POST /close/{id}` | închide o poziție | da |
 
@@ -89,7 +90,7 @@ Aceste constrângeri sunt **hard** și modelează designul:
 | `stop_loss` = % pozitiv; SL/TP calculate **server-side** din quote | predictiondetails.go | Brain-ul trimite procente, nu prețuri |
 | `TradeResult` = `{accepted, external_id, symbol, side, volume}` — fără preț/PnL | client.go | Rezultatul se reconstruiește separat (Faza 4) |
 | Fără endpoint de tranzacții închise | (absență în cod) | Feedback loop-ul depinde de subproiectul ipax |
-| Client XTB = **snapshot request/response**, aruncă push-urile fără `reqId`; fără reconnect auto | readLoop | Reconcilierea trebuie idempotentă + backfill, nu event tranzitoriu |
+| Client XTB = **snapshot request/response**, aruncă push-urile fără `reqId`. Reconnect auto: **există și e dovedit** (keepalive detectează dropul → re-establish pe conexiune nouă; test cu mock CoreAPI) | readLoop | Reconcilierea trebuie idempotentă + backfill, nu event tranzitoriu |
 
 ---
 
@@ -127,7 +128,7 @@ trading_brain/
 ├── core/            interfețe (Protocol), modele interne, ceas/sesiuni
 ├── data_collector/  providers OHLCV (REST) + news (curățate, deduplicate)
 ├── features/        indicatori deterministi + agregare MTF (D1/H4/H1/M15)
-├── brokers_bridge/  client HTTP tipizat pentru trading_hands (7 endpointuri)
+├── brokers_bridge/  client HTTP tipizat pentru trading_hands (8 endpointuri, incl. /candles)
 ├── decision/        schema I/O strictă, prefilter, client LLM (Structured Outputs), pipeline
 ├── risk/            validare rigidă: spread, SL obligatoriu, cooldown, fail-closed; SL/TP determinist mărginit
 ├── shadow/          broker virtual + reconciler + runner (backtest) + online (continuu) + metrics
@@ -142,7 +143,7 @@ trading_brain/
 | **brokers_bridge** | Client async tipizat: `status`, `balance`, `positions`, `quote`, `instruments`, `purchase`, `close`. Rezolvă simbolul aur prin `/instruments`, verifică `tradeable`/`session_type`. |
 | **decision** | Construiește pachetul JSON (features + știri + feedback), apelează LLM cu **Structured Outputs** (schemă strictă) + **prompt caching**; întoarce `DecisionOutput` validat. Prefiltrul taie apelul când nu e setup; `pipeline` compune eligibilitate→prefilter→LLM→risc. |
 | **risk** | Poartă rigidă înaintea execuției: spread ≤ max (obligatoriu), SL obligatoriu, sesiune deschisă **pe calendarul providerului**, `confidence ≥ prag` altfel `NO_TRADE`. Calculează **SL/TP determinist** (ATR-based). Fail-closed. Cooldown/poziții-existente: gate-uri STATEFUL încă nelivrate → `execution_ready=False`. |
-| **shadow** | Broker virtual: intrare la ASK (long)/BID (short), ieșire la BID/ASK (**un** spread per round-trip), verificare intrabar, benzi pesimist/optimist + rată de ambiguitate când SL și TP cad în același interval. |
+| **shadow** | Broker virtual. **Implementarea NU e ASK/BID**: barele sunt tratate ca MID, iar spreadul e dedus ca **un cost round-trip plat** din R (plus slippage advers la intrare/ieșire, gap-through-stop, comision/swap dacă ratele sunt setate). Verificare intrabar cu benzi pesimist/optimist + rată de ambiguitate când SL și TP cad în același interval. |
 | **database** | PostgreSQL `trading_brain` (separat de trading_hands, același server). Coloane fierbinți promovate + JSONB rece. `feedback` extrage statistici agregate + ultimele K trades (+ pgvector opțional în Faza 5). |
 | **app** | Orchestrare: la fiecare **M15 închis** rulează pipeline-ul decizional; scheduler separat rulează reconciler-ul la interval. |
 

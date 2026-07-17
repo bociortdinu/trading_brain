@@ -116,7 +116,12 @@ def reconcile(trade: VirtualTrade, bars: list[Candle], config: ShadowConfig | No
         # credited (deferred to a fully-post-entry bar). Fully-post-entry bars fall through.
         if config.conservative_partial_entry and bar.open_time < trade.opened_at:
             if sl_hit:
-                fill = _exit_fill(trade, _stop_exit_ref(trade, bar))
+                # NOT _stop_exit_ref here: that models a gap THROUGH the stop using bar.open, and
+                # this bar opened BEFORE we entered. Using it could fill at a price that existed
+                # before the trade did — an impossible fill. We only know the stop was touched
+                # somewhere in the bar, so the honest worst case we can justify is the stop level
+                # itself plus adverse slippage.
+                fill = _exit_fill(trade, trade.sl_price)
                 r = _r_net(trade, fill, extra)
                 return Outcome(status="closed", exit_reason="sl_hit", exit_price=round(fill, 4),
                                closed_at=bar.close_time, r_multiple=r, r_pessimistic=r, r_optimistic=r)

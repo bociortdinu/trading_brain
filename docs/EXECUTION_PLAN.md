@@ -75,10 +75,13 @@ Modelul acum:
 - **Guard-ul de contaminare**: `should_observe_spread(mode, is_latest)` — un quote descrie ACUM, deci
   doar bara `latest` **și** doar în `online`. Replay nu observă nimic (fail-closed pe mod necunoscut).
 
-Dovada pe cazul reviewer-ului: aceeași bară (snapshot 392) găzduiește acum decizia online (0.0177,
-`observed_xtb`) și cea replay (0.02, `modeled`) **fără contradicție** — fiecare își reproduce inputul
-îngheţat. Teste: imutabilitatea snapshotului, append-only + idempotent, replay-never-observes,
-online-și-replay-pe-aceeași-bară. Cele 47 de observații istorice au fost migrate (nimic pierdut).
+Pe cazul reviewer-ului: aceeași bară (snapshot 392) găzduiește acum decizia online (0.0177,
+`observed_xtb`) și cea replay (0.02, `modeled`) **fără contradicție** — snapshotul nu mai afirmă
+niciun spread, deci nu mai poate contrazice pe niciuna. **Corectură:** raportasem că decizia online
+de pe 392 e „legată de observația ei" — **fals**. Ambele decizii istorice au `spread_observation_id
+= NULL`: coloana a apărut după ce au fost scrise, iar legătura NU a fost inferată retroactiv.
+Legarea e dovedită doar pentru decizii NOI (test dedicat). Teste: imutabilitatea snapshotului,
+append-only + idempotent, replay-never-observes, online-și-replay-pe-aceeași-bară.
 
 **Datorii deschise (oneste, NEreparate):**
 - Swap real long/short + DST + triple-swap; reconcilierea folosește configul CURENT, nu cel salvat în
@@ -118,9 +121,56 @@ sugestiv, nu dovadă. `unsubscribeElement` **este** o comandă reală (GetQuote 
 live, iar serviciul e oprit acum → nu pot valida. Am documentat-o în cod în loc să livrez o formă
 ghicită drept „fix".
 
-**Ordinea recomandată mai departe** (per reviewer): ~~separarea snapshot/spread~~ (**făcută**, runda 4)
-→ ~~mock WebSocket/reconnect~~ (**făcut**, runda 5) → **urmează**: pornirea monitorizată a Shadow Online.
-Rămâne valabil: **nu** rula `--maker claude` pe mii de bare (perf O(n²) + cost).
+---
+
+## Runda 6 — ce a găsit reviewul și ce am reparat
+
+**Cea mai gravă era a mea:** migrarea 0013 a **FABRICAT provenance**. A mutat `spread_pct` din
+snapshot în `spread_observations` hardcodând `'observed_xtb'`, presupunând că orice spread stocat
+venea de la un quote XTB. Fals: backtestul scrisese și el spreadul **modelat** (0.02) în acea coloană
+→ **43 din 47** de rânduri pretindeau un quote de broker care nu existase niciodată. Exact
+falsificarea pe care tabela există s-o prevină. **Migrarea 0014** le reetichetează `modeled`
+(semnalul e fără echivoc și a fost verificat pe date: `basis IS NOT NULL` ⟺ quote real, cu
+`quote_time` + `basis.xtb_spread_pct` potrivit — 4 rânduri; `basis IS NULL` ⟺ modelat — 43, toate
+0.02, toate cu decizii care spun `modeled`). Nu am rescris 0013 (deja aplicată).
+
+**Rezervare ATOMICĂ înainte de model (0016).** 0011 făcea unic RÂNDUL, nu **PLATA**: secvența era
+`SELECT → LLM → INSERT ON CONFLICT`, deci doi workeri concurenți rataţi amândoi la SELECT plăteau
+amândoi, iar unicitatea doar arunca rândul perdantului. Acum claim-ul se ia **înainte** de apel,
+atomic, cu **lease** (un worker mort nu blochează inputul pe veci; `done` e terminal, `failed`
+reîncercabil). Dovadă măsurată, nu argumentată: sub un barrier cu 8 workeri, logica veche →
+**8/8 ar fi plătit**; cea nouă → **exact 1/8**.
+
+**Resume-ul reconstruiește starea.** Înainte marca `resumed` și mergea mai departe, uitând orice
+poziție deschisă → putea stivui a doua peste ea. Acum reîncarcă decizia/trade-ul și **`busy_until`**.
+Test: rulare tăiată la jumătate → resume → **trade cu trade identic** cu o rulare neîntreruptă
+(verificat că testul pică fără restaurarea `busy_until`).
+
+**Fill imposibil pe bara parțială.** Pe bara de intrare parțială foloseam `_stop_exit_ref`, care
+modelează gap-through-stop din `bar.open` — dar acel open e **anterior intrării**. O bară deschisă la
+3900 sub un stop de 3988 „umplea" la 3900: o pierdere luată înainte ca trade-ul să existe (~−8R în
+loc de −1R). Acum: cel mult stopul + slippage.
+
+**`--maker claude` DEZACTIVAT în Shadow Online** — gardurile (cap, estimare, confirmare, închiderea
+clientului) există doar în backtest; bucla online e nelimitată. Fail-closed până există și acolo.
+
+**Integritate spread:** FK **compus** (0015) — o decizie nu mai poate indica observația altui
+snapshot. **Append-only chiar impus**: nu era nicăieri (doar comentarii), iar GRANT-ul global dădea
+UPDATE pe tot → acum `REVOKE UPDATE` pe `spread_observations`/`snapshot_evaluations`/`llm_calls`
+(verificat: UPDATE refuzat real). DELETE rămâne (retenție + CASCADE) — trade-off documentat, mai slab
+decât append-only strict.
+
+**Go:** `Close()` în timpul unui dial în zbor putea instala o conexiune **după** shutdown (verificarea
+`closed` era stală după apelurile de rețea) → re-verificare sub `connMu`, același lock pe care-l ia
+Close. Testul pică pe codul vechi cu „connection installed AFTER Close".
+
+**Docs:** `/candles` lipsea (8 endpointuri, nu 7); „fără reconnect auto" era fals; modelul de fill era
+descris ASK/BID deși implementarea e **mid + cost plat**.
+
+**Ordinea recomandată** (per reviewer): ~~separarea snapshot/spread~~ (runda 4) → ~~mock WebSocket/
+reconnect~~ (runda 5) → ~~rezervare atomică + provenance + resume~~ (runda 6) → **urmează**: pornirea
+monitorizată a Shadow Online. Rămâne valabil: **nu** rula `--maker claude` pe mii de bare (perf O(n²)
++ cost), iar online-ul acceptă doar makerul determinist.
 
 ---
 
@@ -131,7 +181,7 @@ Rămâne valabil: **nu** rula `--maker claude` pe mii de bare (perf O(n²) + cos
 - Folosește numele corect `trading_brain/`; elimină folderul-typo gol `traiding_brain/`.
 - `pyproject.toml` (Python 3.12+), structura de module din arhitectură, `settings.py` tipizat
   (URL trading_hands, DSN Postgres, chei API, timeframes, praguri de risc).
-- `brokers_bridge/trading_hands.py`: client async tipizat pentru cele 7 endpointuri.
+- `brokers_bridge/trading_hands.py`: client async tipizat pentru cele 8 endpointuri (incl. `/candles`).
 - DB `trading_brain` creat cu rol privilegiat (`database.bootstrap`) + migrare versionată `0001_initial` aplicată cu rolul aplicației (`database.migrate`), pe același server Postgres (port 5433).
 - Un script de smoke: `GET /status` → conectat + demo; `GET /instruments/gold` → rezolvă simbolul,
   `tradeable`, `session_type`; `GET /quote/{symbol}` → bid/ask real.

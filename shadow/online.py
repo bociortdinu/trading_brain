@@ -195,18 +195,24 @@ def _shadow_config(settings: Settings) -> ShadowConfig:
 
 
 def _build_maker(settings: Settings, kind: str):
-    """Select the shadow decision maker. `deterministic` = the free ConfluenceStrategy (default,
-    no API cost); `claude` = the real paid AnthropicDecisionMaker (needs BRAIN_ANTHROPIC_API_KEY).
-    Returns (maker, model_name) so the persisted decision records which maker produced it."""
+    """Select the shadow decision maker. Returns (maker, model_name) so the persisted decision
+    records which maker produced it.
+
+    `claude` is DELIBERATELY REFUSED here. The backtest runner guards a paid run (a hard
+    --max-llm-calls cap, a worst-case cost estimate, an explicit confirmation, and closing the
+    Anthropic client in a finally); this loop has NONE of that and runs unbounded, so enabling it
+    would mean an open-ended spend with no ceiling and a leaked client. Fail closed until those
+    guards exist here too — an unbounded paid loop is not something to leave one flag away.
+    """
     if kind == "deterministic":
         return ConfluenceStrategy(), "deterministic-confluence"
     if kind == "claude":
-        if not settings.anthropic_api_key:
-            raise SystemExit("--maker claude needs BRAIN_ANTHROPIC_API_KEY (real, paid API calls)")
-        from decision.llm_client import AnthropicDecisionMaker
-        maker = AnthropicDecisionMaker(settings.anthropic_api_key, settings.decision_model,
-                                       max_tokens=settings.decision_max_tokens)
-        return maker, settings.decision_model
+        raise SystemExit(
+            "--maker claude is disabled for shadow-online: this loop has no call cap, no cost "
+            "estimate/confirmation and does not close the Anthropic client, so it would spend "
+            "without a ceiling. Use `python -m shadow.runner --maker claude --max-llm-calls N` "
+            "(guarded) to measure the model, or run online with --maker deterministic."
+        )
     raise SystemExit(f"unknown --maker {kind!r} (expected deterministic|claude)")
 
 

@@ -59,6 +59,20 @@ def test_partial_entry_bar_still_honors_a_stop_touch():
     assert out.status == "closed" and out.exit_reason == "sl_hit"
 
 
+def test_partial_entry_bar_never_fills_at_a_pre_entry_gap_price():
+    """The partial bar OPENED before we entered, so its open is not a price we could ever have
+    been filled at. Gap-through-stop must not be modelled from it: a bar that opened at 3900
+    (far below the 3988 stop) would otherwise 'fill' us at 3900 — a loss taken before the trade
+    existed. The justifiable worst case is the stop level itself."""
+    trade = _long_midbar()   # entry 4000, sl 3988
+    # Opens 88 points BELOW the stop, but that open predates the entry at _T0+5min.
+    pre_entry_gap = _bar(3900, 4005, 3890, 3990, n=0)
+    out = reconcile(trade, [pre_entry_gap])
+    assert out.status == "closed" and out.exit_reason == "sl_hit"
+    assert out.exit_price == 3988.0, "must fill at the stop, not at the pre-entry open (3900)"
+    assert out.r_multiple == -1.0     # exactly -1R, not the impossible ~-8R the gap would imply
+
+
 def test_open_sets_levels():
     t = _long()
     assert t.sl_price == 3988.0 and t.tp_price == 4024.0 and t.risk_per_unit == 12.0

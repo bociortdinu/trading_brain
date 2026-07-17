@@ -69,8 +69,25 @@ def main() -> int:
                 conn.execute(pgsql.SQL(
                     "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
                     "GRANT USAGE, SELECT ON SEQUENCES TO {}").format(role))
+
+                # APPEND-ONLY, ENFORCED. These tables record FACTS: what was observed, what was
+                # evaluated, what an API call cost. Rewriting one silently rewrites history —
+                # which is precisely the class of bug that let a snapshot be "enriched" with a
+                # quote it never had. Being append-only was only ever a comment before this; the
+                # blanket GRANT above handed the app role UPDATE on all of them, so the REVOKE
+                # must come AFTER the grant (and a REVOKE inside a migration would be undone by
+                # this very block on the next run).
+                #
+                # DELETE is intentionally still granted: retention/cleanup is legitimate, and the
+                # FK CASCADE from market_snapshots must keep working. This is weaker than true
+                # append-only (delete+reinsert can emulate an update) and is a deliberate,
+                # documented trade-off, not an oversight.
+                for table in ("spread_observations", "snapshot_evaluations", "llm_calls"):
+                    conn.execute(pgsql.SQL("REVOKE UPDATE ON {} FROM {}").format(
+                        pgsql.Identifier(table), role))
                 conn.commit()
-                print(f"granted DML on trading_brain to app role {app_user}")
+                print(f"granted DML on trading_brain to app role {app_user} "
+                      f"(UPDATE revoked on append-only fact tables)")
     except Exception as exc:  # noqa: BLE001
         print(f"migration failed: {exc}", file=sys.stderr)
         return 1

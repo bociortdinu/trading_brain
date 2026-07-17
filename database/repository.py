@@ -248,6 +248,89 @@ def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, mo
     return row[0]
 
 
+def reserve_decision(dsn: str, *, input_fingerprint: str, run_id: str, worker: str,
+                     lease_seconds: int = 300) -> str:
+    """Atomically claim the right to make (and PAY for) this decision. Call BEFORE the model.
+
+    Returns:
+      "reserved" — we own it; we are the ONLY worker allowed to call the model for this input.
+      "done"     — already decided in this run; skip (resume).
+      "held"     — another worker owns a live lease; skip (it is paying, we must not).
+
+    Atomic because the claim is a single INSERT ... ON CONFLICT: concurrent workers cannot both
+    win. A dead worker's claim is reclaimable once its lease expires, and a 'failed' attempt may
+    be retried; 'done' is terminal.
+    """
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        row = conn.execute(
+            """
+            INSERT INTO decision_reservations
+                (input_fingerprint, run_id, status, worker, reserved_at, lease_expires_at)
+            VALUES (%s, %s, 'in_progress', %s, now(), now() + make_interval(secs => %s))
+            ON CONFLICT (input_fingerprint, run_id) DO UPDATE SET
+                worker           = EXCLUDED.worker,
+                reserved_at      = now(),
+                lease_expires_at = EXCLUDED.lease_expires_at,
+                status           = 'in_progress'
+            WHERE decision_reservations.status = 'failed'
+               OR (decision_reservations.status = 'in_progress'
+                   AND decision_reservations.lease_expires_at < now())
+            RETURNING input_fingerprint
+            """,
+            (input_fingerprint, run_id, worker, lease_seconds),
+        ).fetchone()
+        if row is not None:
+            conn.commit()
+            return "reserved"
+        existing = conn.execute(
+            "SELECT status FROM decision_reservations WHERE input_fingerprint = %s AND run_id = %s",
+            (input_fingerprint, run_id),
+        ).fetchone()
+        conn.commit()
+    return "done" if existing and existing[0] == "done" else "held"
+
+
+def complete_decision_reservation(dsn: str, *, input_fingerprint: str, run_id: str, status: str,
+                                  decision_id: int | None = None) -> None:
+    """Close out a reservation we own: 'done' (terminal) or 'failed' (retryable by any worker)."""
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        conn.execute(
+            "UPDATE decision_reservations SET status = %s, decision_id = %s "
+            "WHERE input_fingerprint = %s AND run_id = %s",
+            (status, decision_id, input_fingerprint, run_id),
+        )
+        conn.commit()
+
+
+def load_decided_outcome(dsn: str, *, input_fingerprint: str, run_id: str) -> dict | None:
+    """Everything a RESUME needs to reproduce what an earlier run already did for this input:
+    the decision's direction/verdict and the trade it opened (if any), with its outcome.
+
+    Without this a resumed backtest only knew "already decided" — it forgot any position that
+    was still open, so it could stack a second entry on top and report a different run."""
+    import psycopg
+    from psycopg.rows import dict_row
+
+    with psycopg.connect(dsn, row_factory=dict_row) as conn:
+        row = conn.execute(
+            """
+            SELECT d.id AS decision_id, d.direction, d.risk_verdict,
+                   t.status, t.exit_reason, t.exit_price, t.closed_at, t.opened_at,
+                   t.r_multiple, t.r_pessimistic, t.r_optimistic, t.ambiguous
+            FROM decisions d
+            LEFT JOIN trades t ON t.decision_id = d.id AND t.run_id = d.run_id
+            WHERE d.input_fingerprint = %s AND d.run_id = %s
+            LIMIT 1
+            """,
+            (input_fingerprint, run_id),
+        ).fetchone()
+    return row
+
+
 def find_decision_by_fingerprint(dsn: str, *, input_fingerprint: str, run_id: str) -> int | None:
     """Dedupe-BEFORE-the-LLM key: has this frozen input already been decided in this run? Lets a
     re-run RESUME without re-calling (re-paying) the model. Returns the decision id or None."""

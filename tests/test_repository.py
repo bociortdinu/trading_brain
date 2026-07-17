@@ -395,6 +395,81 @@ def test_find_shadow_trade_by_input_dedupes_across_reruns():
         _cleanup(sym)
 
 
+def _clear_reservations(run_id):
+    with psycopg.connect(DSN) as c:
+        c.execute("DELETE FROM decision_reservations WHERE run_id = %s", (run_id,))
+        c.commit()
+
+
+def test_concurrent_workers_exactly_one_may_call_the_model():
+    """THE atomicity proof. A plain SELECT-then-INSERT let two concurrent workers both miss, both
+    PAY, and only the loser's ROW get discarded — uniqueness never refunds a charge. The claim is
+    taken before the call, so exactly one worker may ever call the model for a given input."""
+    import threading
+
+    from database.repository import reserve_decision
+
+    fp, run_id = "fp-" + os.urandom(4).hex(), "conc-" + os.urandom(3).hex()
+    workers = 8
+    barrier = threading.Barrier(workers)
+    results, lock = [], threading.Lock()
+
+    def claim(i):
+        barrier.wait()   # release all workers at once to maximise the overlap
+        r = reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker=f"w{i}")
+        with lock:
+            results.append(r)
+
+    threads = [threading.Thread(target=claim, args=(i,)) for i in range(workers)]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert results.count("reserved") == 1, f"exactly one worker may pay, got {results}"
+        assert results.count("held") == workers - 1
+    finally:
+        _clear_reservations(run_id)
+
+
+def test_reservation_lease_survives_a_crashed_worker():
+    """A worker that dies mid-call must not block its input forever: the claim carries a lease,
+    and only once that lease expires may another worker take over."""
+    from database.repository import reserve_decision
+
+    fp, run_id = "fp-" + os.urandom(4).hex(), "lease-" + os.urandom(3).hex()
+    try:
+        # A claims with a live lease, then "crashes" (never completes).
+        assert reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="A",
+                                lease_seconds=300) == "reserved"
+        # B must NOT be allowed to pay while A's lease is alive.
+        assert reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="B") == "held"
+        # Once the lease has expired, the work is reclaimable.
+        with psycopg.connect(DSN) as c:
+            c.execute("UPDATE decision_reservations SET lease_expires_at = now() - interval '1s' "
+                      "WHERE input_fingerprint = %s AND run_id = %s", (fp, run_id))
+            c.commit()
+        assert reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="B") == "reserved"
+    finally:
+        _clear_reservations(run_id)
+
+
+def test_done_is_terminal_and_failed_is_retryable():
+    from database.repository import complete_decision_reservation, reserve_decision
+
+    fp, run_id = "fp-" + os.urandom(4).hex(), "term-" + os.urandom(3).hex()
+    try:
+        assert reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="A") == "reserved"
+        # A failed call may legitimately be retried by anyone.
+        complete_decision_reservation(DSN, input_fingerprint=fp, run_id=run_id, status="failed")
+        assert reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="B") == "reserved"
+        # A completed decision is never redone (and never re-paid).
+        complete_decision_reservation(DSN, input_fingerprint=fp, run_id=run_id, status="done")
+        assert reserve_decision(DSN, input_fingerprint=fp, run_id=run_id, worker="C") == "done"
+    finally:
+        _clear_reservations(run_id)
+
+
 class _CountingFake:
     """Stand-in for the PAID maker: counts real decide() calls so a resume can be proven to make
     ZERO of them."""
@@ -450,6 +525,58 @@ def test_backtest_rerun_resumes_without_repeating_decisions_or_paid_calls():
         with psycopg.connect(DSN) as c:
             c.execute("DELETE FROM trades WHERE run_id = %s", (run_id,))
             c.execute("DELETE FROM decisions WHERE run_id = %s", (run_id,))
+            c.commit()
+        _cleanup(sym)
+
+
+def _trades_of(run_id):
+    with psycopg.connect(DSN) as c:
+        return c.execute(
+            "SELECT opened_at, side, status, exit_reason, r_multiple FROM trades "
+            "WHERE run_id = %s ORDER BY opened_at", (run_id,)).fetchall()
+
+
+def test_interrupted_run_resumes_to_the_same_result_as_an_uninterrupted_one():
+    """Crash-in-the-middle -> resume must reproduce the uninterrupted run.
+
+    A resume that only knew 'already decided' forgot any position still open and would stack a
+    second entry on top of it, so the resumed run reported different trades than the run it was
+    supposed to be continuing. Here the first pass is cut short by the LLM budget (a partial,
+    persisted run), then resumed, and its trades must match a clean run bar for bar."""
+    from shadow.runner import _CountingMaker, backtest_over_windows
+    from tests.helpers import run as arun
+    from tests.synthetic import trend
+
+    sym = "TST_" + os.urandom(3).hex()
+    end = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    windows = {name: trend(n=250, step=1.0, tf_min=m, start=end - timedelta(minutes=m * 250))
+               for name, m in (("1day", 1440), ("4h", 240), ("1h", 60), ("15min", 15))}
+    interrupted, clean = "cut-" + os.urandom(3).hex(), "clean-" + os.urandom(3).hex()
+
+    def go(run_id, cap):
+        return arun(backtest_over_windows(
+            windows, symbol=sym, provider_name="csv", modeled_spread_pct=0.02,
+            decision_maker=_CountingMaker(_CountingFake()), max_llm_calls=cap,
+            persist_dsn=DSN, run_id=run_id, model_name="fake"))
+
+    try:
+        cut = go(interrupted, 3)                      # dies after 3 decisions
+        assert any(r["stage"] == "llm_cap_reached" for r in cut)
+        partial = _trades_of(interrupted)
+        assert len(partial) >= 1, "the interrupted run must have persisted real work"
+
+        resumed_rows = go(interrupted, None)          # resume the SAME run to completion
+        assert any(r["stage"] == "resumed" for r in resumed_rows)
+
+        go(clean, None)                               # an uninterrupted run for comparison
+        assert _trades_of(interrupted) == _trades_of(clean), (
+            "a resumed run must reproduce the uninterrupted one, trade for trade")
+    finally:
+        with psycopg.connect(DSN) as c:
+            for r in (interrupted, clean):
+                c.execute("DELETE FROM trades WHERE run_id = %s", (r,))
+                c.execute("DELETE FROM decisions WHERE run_id = %s", (r,))
+                c.execute("DELETE FROM decision_reservations WHERE run_id = %s", (r,))
             c.commit()
         _cleanup(sym)
 
