@@ -89,13 +89,38 @@ online-și-replay-pe-aceeași-bară. Cele 47 de observații istorice au fost mig
 - `llm_calls` agregat după retry (fără `retry_count`, fără FK direct la `decision_id`).
 - DoD prompt caching nevalidat (apelul real: cache 0/0). News live neconectat.
   `max_clock_skew_seconds` nu intră în hash-ul policy-version.
-- Reconnect XTB dovedit doar prin keepalive (fără test cu mock WebSocket); heartbeat-ul face
-  `GetBalance` cu subscribe la 15s fără unsubscribe.
+- **Leak de subscribe la heartbeat: NEVERIFICAT** (vezi runda 5 — nu l-am „reparat" cu o presupunere).
 - Faza 4 = **spike**. Edge real cu LLM = plătit, amânat de user.
 
+**Reparat în runda 5 — reconnect XTB dovedit (trading_hands):**
+- Înainte: reconnect-ul era doar *argumentat*. Testele Go acopereau exclusiv căile no-op
+  (deja-alive / closed) — niciunul nu dovedea că sesiunea chiar se **recuperează**.
+- De ce lipsea testul: `NewClient` impune allowlist pe endpoint (`api5demoa.x-station.eu`), deci
+  un mock local era imposibil de folosit. Soluție: **seams package-private** (`dialFn`/`ticketFn`),
+  setate de `NewClient` la implementările reale — **allowlist-ul rămâne intact** pentru orice
+  apelant real; doar testele (același pachet) le înlocuiesc.
+- `xstation/reconnect_test.go`: **mock CoreAPI WebSocket** (register/login/balance, răspunsuri pe
+  reqId ca API-ul real + drop controlat). Testul: connect → alive → drop → heartbeat eșuat →
+  re-establish → alive pe o conexiune **NOUĂ** + re-login + sesiunea recuperată chiar funcționează.
+  Plus: `Close` oprește definitiv reconectarea (nu mai redial-ează).
+- **Data race real reparat**: `parseLogin` rescrie `c.account` la fiecare reconnect, iar
+  `Account()`/`GetBalance` îl citeau nesincronizat → `accountMu`. Testul a fost **validat că are
+  dinți**: pe codul vechi `-race` raportează `WARNING: DATA RACE` (write vs read), pe cel nou trece.
+  (Prima versiune a testului NU prindea race-ul — dormea fix și fereastra se închidea cu un singur
+  login, deci fără scriere concurentă; acum așteaptă re-login-uri reale.)
+- 23 teste xstation; `go test -race ./...`, `vet`, `gofmt` curate.
+
+**Leak-ul de subscribe — de ce NU l-am reparat:** heartbeat-ul face `getAndSubscribeElement(eid 1043)`
+la fiecare tick fără unsubscribe. Dacă serverul acumulează o subscripție per apel (leak) sau tratează
+repetarea aceluiași eid ca idempotentă **nu e stabilit** — sesiuni de ore fără degradare vizibilă e
+sugestiv, nu dovadă. `unsubscribeElement` **este** o comandă reală (GetQuote o folosește pe eid 2, cu
+`keys`), dar forma fără `keys` de care ar avea nevoie eid 1043 nu a fost niciodată exercitată pe API-ul
+live, iar serviciul e oprit acum → nu pot valida. Am documentat-o în cod în loc să livrez o formă
+ghicită drept „fix".
+
 **Ordinea recomandată mai departe** (per reviewer): ~~separarea snapshot/spread~~ (**făcută**, runda 4)
-→ mock WebSocket/reconnect → abia apoi pornirea monitorizată a Shadow Online. **Nu** porni serviciul și
-**nu** rula `--maker claude` pe mii de bare înainte de reconnect.
+→ ~~mock WebSocket/reconnect~~ (**făcut**, runda 5) → **urmează**: pornirea monitorizată a Shadow Online.
+Rămâne valabil: **nu** rula `--maker claude` pe mii de bare (perf O(n²) + cost).
 
 ---
 
