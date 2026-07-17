@@ -275,9 +275,26 @@ maker determinist + fără verificarea numărului de apeluri.
   rânduri legacy corupte (`done`+decizie NULL) ar fi **eșuat** la ADD CONSTRAINT. Acum resetează întâi
   rândurile invalide la `failed` (reclaimabile). Validat: no-op pe baza curată.
 
+---
+
+## Runda 10 — reconcilierea onorează ratele de la deschidere
+
+Fără review nou; am închis o datorie proprie semnalată în rundele anterioare.
+
+**Problema:** `reconcile_open_trades` reconcilia pozițiile deschise cu ShadowConfig-ul **curent**, nu
+cu cel de la deschidere. O schimbare de config (ex. `swap_pct_per_night`) între deschidere și
+închidere re-preța silențios R-ul unei poziții deja deschise; ratele nu se reconstruiau din `costs`.
+
+**Reparat:** `cost_manifest` stochează acum și `rollover_hour_utc` + `conservative_partial_entry`;
+`open_shadow_trades` întoarce `costs` + `timeout_bars`; `shadow_config_from_costs(...)` reconstruiește
+ShadowConfig-ul de la **deschidere**, iar `reconcile_open_trades` reconciliază fiecare trade cu al
+**lui** (configul curent = doar fallback pentru manifeste legacy). Dovedit cu dinți: trade deschis cu
+swap 0.05 ținut peste un rollover, reconciliat cu config curent swap=0 → R **net de swap-ul de la
+deschidere**, nu de 0 (testul pică pe codul vechi).
+
 **Datorii rămase (oneste):** cheie de idempotency provider (exact-once real); DELETE într-un rol
-separat de retenție (append-only real); swap long/short + DST; reconcilierea folosește configul
-curent nu cel salvat; `llm_calls` per-attempt; perf O(n²); Faza 4 = spike; edge real = nemăsurat.
+separat de retenție (append-only real); swap long/short + DST/triple; `llm_calls` per-attempt;
+perf O(n²); Faza 4 = spike; edge real = nemăsurat.
 
 **Ordinea recomandată** (per reviewer): ~~snapshot/spread~~ (r4) → ~~mock reconnect~~ (r5) →
 ~~rezervare atomică + provenance + resume~~ (r6–7) → ~~stare terminală + fereastra decizie→trade~~

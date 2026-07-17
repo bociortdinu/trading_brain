@@ -73,6 +73,11 @@ def cost_manifest(trade: "VirtualTrade", config: ShadowConfig) -> dict:
         "spread_pct": trade.spread_pct, "spread_provenance": trade.spread_provenance,
         "slippage_pct": trade.slippage_pct,
         "commission_pct": config.commission_pct, "swap_pct_per_night": config.swap_pct_per_night,
+        # Persist the rate-bearing config too, so a trade opened NOW is reconciled on a LATER tick
+        # with the SAME terms even if the live config changed in between (rates were not
+        # reconstructed before -> a config change silently re-priced an open position's R).
+        "rollover_hour_utc": config.rollover_hour_utc,
+        "conservative_partial_entry": config.conservative_partial_entry,
         "modeled": modeled, "not_modeled": not_modeled,
     }
     if "swap" in not_modeled or "commission" in not_modeled:
@@ -80,6 +85,23 @@ def cost_manifest(trade: "VirtualTrade", config: ShadowConfig) -> dict:
                             "swap rate (no long/short split), fixed 22:00 UTC rollover, no DST/"
                             "triple-swap. Wire real XTB terms before trusting expectancy.")
     return manifest
+
+
+def shadow_config_from_costs(costs: dict | None, *, timeout_bars: int,
+                             fallback: "ShadowConfig | None" = None) -> ShadowConfig:
+    """Rebuild the ShadowConfig a trade was OPENED with, from its persisted cost manifest, so a
+    later reconciliation prices it with the same terms. `timeout_bars` comes from the trade row;
+    everything else from `costs`. `fallback` fills anything a legacy manifest didn't record."""
+    costs = costs or {}
+    fb = fallback or ShadowConfig()
+    return ShadowConfig(
+        timeout_bars=timeout_bars if timeout_bars is not None else fb.timeout_bars,
+        commission_pct=costs.get("commission_pct", fb.commission_pct),
+        swap_pct_per_night=costs.get("swap_pct_per_night", fb.swap_pct_per_night),
+        rollover_hour_utc=costs.get("rollover_hour_utc", fb.rollover_hour_utc),
+        conservative_partial_entry=costs.get("conservative_partial_entry",
+                                             fb.conservative_partial_entry),
+    )
 
 
 def open_virtual_trade(

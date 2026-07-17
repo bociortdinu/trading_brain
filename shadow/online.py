@@ -47,7 +47,13 @@ from features.mtf import TRIGGER_TF
 from risk.engine import RiskConfig
 from shadow.reconciler import reconcile
 from shadow.runner import ConfluenceStrategy
-from shadow.virtual_broker import ShadowConfig, VirtualTrade, cost_manifest, open_virtual_trade
+from shadow.virtual_broker import (
+    ShadowConfig,
+    VirtualTrade,
+    cost_manifest,
+    open_virtual_trade,
+    shadow_config_from_costs,
+)
 
 log = logging.getLogger(__name__)
 DEFAULT_RUN_ID = "shadow-online-confluence"
@@ -66,17 +72,24 @@ def _to_trade(row: dict) -> VirtualTrade:
 def reconcile_open_trades(dsn: str, m15_bars: list[Candle], *, run_id: str,
                           shadow_config: ShadowConfig | None = None) -> int:
     """Reconcile OPEN shadow trades against the latest M15 bars; update (close) those hit in
-    place. Returns how many transitioned out of 'open'."""
-    shadow_config = shadow_config or ShadowConfig()
+    place. Returns how many transitioned out of 'open'.
+
+    Each trade is reconciled with the ShadowConfig it was OPENED with (rebuilt from its stored
+    cost manifest), NOT the current one — a live config change must never silently re-price an
+    already-open position's R. `shadow_config` is only the fallback for anything a (legacy)
+    manifest didn't record."""
+    fallback = shadow_config or ShadowConfig()
     closed = 0
     for row in open_shadow_trades(dsn, run_id):
         trade = _to_trade(row)
-        outcome = reconcile(trade, m15_bars, shadow_config)
+        cfg = shadow_config_from_costs(row.get("costs"), timeout_bars=row.get("timeout_bars"),
+                                       fallback=fallback)
+        outcome = reconcile(trade, m15_bars, cfg)
         if outcome.status != "open":
             upsert_shadow_trade(dsn, decision_id=row["decision_id"], run_id=run_id,
                                 symbol=row["symbol"], trade=trade, outcome=outcome,
-                                timeframe=TRIGGER_TF, timeout_bars=shadow_config.timeout_bars,
-                                costs=cost_manifest(trade, shadow_config))
+                                timeframe=TRIGGER_TF, timeout_bars=cfg.timeout_bars,
+                                costs=cost_manifest(trade, cfg))
             closed += 1
     return closed
 

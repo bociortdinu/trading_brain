@@ -437,16 +437,15 @@ def open_shadow_trades(dsn: str, run_id: str) -> list[dict]:
     them against new bars on a later tick."""
     import psycopg
 
-    with psycopg.connect(dsn) as conn:
-        rows = conn.execute(
+    from psycopg.rows import dict_row
+
+    with psycopg.connect(dsn, row_factory=dict_row) as conn:
+        return conn.execute(
             "SELECT decision_id, symbol, side, entry_price, sl_price, tp_price, opened_at, "
-            "spread_pct, spread_provenance, slippage_pct FROM trades "
+            "spread_pct, spread_provenance, slippage_pct, timeout_bars, costs FROM trades "
             "WHERE mode = 'shadow' AND status = 'open' AND run_id = %s",
             (run_id,),
         ).fetchall()
-    keys = ["decision_id", "symbol", "side", "entry_price", "sl_price", "tp_price",
-            "opened_at", "spread_pct", "spread_provenance", "slippage_pct"]
-    return [dict(zip(keys, r)) for r in rows]
 
 
 def insert_llm_call(dsn: str, result, *, snapshot_id: int | None = None) -> int:

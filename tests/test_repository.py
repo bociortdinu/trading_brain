@@ -960,6 +960,53 @@ def test_resume_reconstructs_a_trade_after_a_crash_between_decision_and_trade():
         _cleanup(sym)
 
 
+def test_open_trade_is_reconciled_with_the_rates_it_was_opened_with():
+    """A live config change must NOT silently re-price a position that is already open. The trade
+    is opened with a non-zero overnight swap and held past a rollover; when it later closes, its
+    R must be net of the swap it was OPENED with even though the CURRENT config has swap=0."""
+    from core.models import Direction
+    from data_collector.providers.base import Candle
+    from database.repository import upsert_shadow_trade
+    from shadow.online import reconcile_open_trades
+    from shadow.reconciler import reconcile
+    from shadow.virtual_broker import ShadowConfig, cost_manifest, open_virtual_trade
+
+    sym, run_id = "TST_" + os.urandom(3).hex(), "swap-" + os.urandom(3).hex()
+    opened = datetime(2026, 7, 1, 20, 0, tzinfo=timezone.utc)   # before the 22:00 UTC rollover
+    opened_cfg = ShadowConfig(swap_pct_per_night=0.05, rollover_hour_utc=22)
+    try:
+        dec_id = _seed_decision(sym, run_id=run_id, input_fingerprint="swapfp")
+        trade = open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6, spread_pct=0.0,
+                                   spread_provenance="modeled", opened_at=opened)
+        upsert_shadow_trade(DSN, decision_id=dec_id, run_id=run_id, symbol=sym, trade=trade,
+                            outcome=reconcile(trade, [], opened_cfg), timeframe="15min",
+                            timeout_bars=96, costs=cost_manifest(trade, opened_cfg))
+
+        # A TP bar the NEXT day -> the position was held over one rollover (one swap night).
+        tp_bar = Candle(open_time=opened + timedelta(hours=26),
+                        close_time=opened + timedelta(hours=26, minutes=15),
+                        open=4000, high=4030, low=3999, close=4025, volume=1.0)
+        # CURRENT config says swap=0. The fix must ignore it for this already-open trade.
+        assert reconcile_open_trades(DSN, [tp_bar], run_id=run_id,
+                                     shadow_config=ShadowConfig(swap_pct_per_night=0.0)) == 1
+        with psycopg.connect(DSN) as c:
+            r_stored = float(c.execute("SELECT r_multiple FROM trades WHERE decision_id=%s",
+                                       (dec_id,)).fetchone()[0])
+
+        # Reference: reconcile the SAME trade directly with the opened config vs a swap-free one.
+        r_with_swap = reconcile(trade, [tp_bar], opened_cfg).r_multiple
+        r_no_swap = reconcile(trade, [tp_bar], ShadowConfig(swap_pct_per_night=0.0)).r_multiple
+        assert r_with_swap < r_no_swap, "the swap must actually move R (test precondition)"
+        assert r_stored == pytest.approx(r_with_swap), "closed with the OPENED swap, not current 0"
+        assert r_stored != pytest.approx(r_no_swap), "must NOT have used the current swap=0"
+    finally:
+        with psycopg.connect(DSN) as c:
+            c.execute("DELETE FROM trades WHERE run_id=%s", (run_id,))
+            c.execute("DELETE FROM decisions WHERE run_id=%s", (run_id,))
+            c.commit()
+        _cleanup(sym)
+
+
 def test_reconcile_open_trades_closes_hit_trades_idempotently():
     from core.models import Direction
     from data_collector.providers.base import Candle
