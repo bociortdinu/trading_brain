@@ -27,8 +27,9 @@ from data_collector.providers.factory import build_provider
 from data_collector.providers.polygon import ProviderError
 from database.repository import (
     insert_evaluation,
+    insert_spread_observation,
     latest_snapshot_bar_close,
-    snapshot_enrichment_status,
+    snapshot_spread_status,
     upsert_snapshot,
 )
 
@@ -97,22 +98,41 @@ class WindowCache:
         return window
 
 
+def should_observe_spread(market_mode: str, is_latest: bool) -> bool:
+    """May we attach a LIVE quote to this bar?
+
+    A quote describes NOW, so it belongs only to the LATEST bar, and only in ONLINE mode. Taking
+    the wall-clock quote for a replayed historical bar contaminates the record with a price from
+    the future of that bar. Fail-closed: anything not explicitly "online" observes nothing."""
+    return is_latest and market_mode == "online"
+
+
 async def _finalize_and_store(settings, windows, as_of, *, brain_symbol, provider_name,
                               provider_symbol, ingested_at, mode, now, observe_spread: bool) -> str:
     packet = build_packet_from_windows(
         windows, as_of, brain_symbol=brain_symbol, provider_name=provider_name,
         provider_symbol=provider_symbol, ingested_at=ingested_at,
     )
-    quote_time = None
+    quote_time = observed_at = None
+    spread_pct = basis = None
     if observe_spread:
         spread_pct, basis = await observe_xtb_spread(settings, packet.price, packet.bar_close)
         if basis is not None:
             packet = packet.model_copy(update={"spread_pct": spread_pct, "basis_observed": basis})
             if basis.get("quote_time"):
                 quote_time = datetime.fromisoformat(basis["quote_time"])
-    # Persist the immutable observation first, then its separate mode+policy eligibility.
+            if basis.get("observed_at"):
+                observed_at = datetime.fromisoformat(basis["observed_at"])
+    # Persist the IMMUTABLE observation first, then — as SEPARATE, append-only facts about it —
+    # the contextual spread and the mode+policy eligibility. Neither mutates the snapshot.
     status, snap_id = upsert_snapshot(settings.db_dsn, packet)
     if snap_id is not None and status != "conflict":
+        if basis is not None and spread_pct is not None:
+            insert_spread_observation(
+                settings.db_dsn, snapshot_id=snap_id, spread_pct=spread_pct,
+                provenance="observed_xtb", observed_at=observed_at or now,
+                quote_time=quote_time, basis=basis,
+            )
         result = compute_eligibility(windows, as_of, settings, mode=mode, now=now,
                                      quote_time=quote_time, provider_name=provider_name)
         insert_evaluation(settings.db_dsn, snap_id, result)
@@ -144,14 +164,16 @@ async def catch_up(settings: Settings, provider: MarketDataProvider, provider_na
         status = await _finalize_and_store(
             settings, windows, as_of, brain_symbol=brain_symbol, provider_name=provider_name,
             provider_symbol=provider_symbol, ingested_at=now,
-            mode=(settings.market_mode if is_latest else "replay"), now=now, observe_spread=is_latest,
+            mode=(settings.market_mode if is_latest else "replay"), now=now,
+            observe_spread=should_observe_spread(settings.market_mode, is_latest),
         )
         results[status] = results.get(status, 0) + 1
         log.info("bar %s -> %s", as_of.isoformat(), status)
 
-    # Enrichment retry: latest already stored but still missing spread/basis.
-    if latest is not None and latest not in targets:
-        exists, needs = snapshot_enrichment_status(settings.db_dsn, brain_symbol, latest)
+    # Retry the quote for a latest bar that is stored but still has NO spread observation.
+    # Online only — same rule as above.
+    if should_observe_spread(settings.market_mode, True) and latest is not None and latest not in targets:
+        exists, needs = snapshot_spread_status(settings.db_dsn, brain_symbol, latest)
         if exists and needs:
             status = await _finalize_and_store(
                 settings, windows, latest, brain_symbol=brain_symbol, provider_name=provider_name,
@@ -159,7 +181,7 @@ async def catch_up(settings: Settings, provider: MarketDataProvider, provider_na
                 mode=settings.market_mode, now=now, observe_spread=True,
             )
             results[f"retry_{status}"] = results.get(f"retry_{status}", 0) + 1
-            log.info("enrichment retry %s -> %s", latest.isoformat(), status)
+            log.info("spread retry %s -> %s", latest.isoformat(), status)
     return results
 
 

@@ -1,10 +1,15 @@
 """Persistence for market snapshots.
 
+A snapshot is an IMMUTABLE observation of a CLOSED bar: OHLCV-derived features for
+(symbol, bar_close). It deliberately carries NO spread — a spread comes from a live quote at
+some observation instant, which is NOT a property of the bar. Contextual spread lives in
+`spread_observations` (append-only, migration 0013) and a decision records exactly which
+observation it consumed. That way a snapshot can never assert a spread the decision never used.
+
 Conflict policy for (symbol, bar_close):
 - no existing row              -> INSERT              (status "inserted")
-- same provider + pipeline_ver -> CONTROLLED ENRICH: fill NULL spread_pct / basis /
-                                  data_quality only; never overwrite computed features
-                                  (status "enriched" if something changed, else "unchanged")
+- same provider + pipeline_ver -> fill a NULL data_quality only; NEVER overwrite computed
+                                  features (status "enriched" if it changed, else "unchanged")
 - different provider/version   -> persisted to snapshot_conflicts and reported
                                   (status "conflict"); never silently dropped / overwritten
 
@@ -23,29 +28,29 @@ def upsert_snapshot(dsn: str, packet: FeaturePacket) -> tuple[str, int | None]:
 
     features = Json(packet.features_json())
     news = Json(packet.news_digest) if packet.news_digest is not None else None
-    basis = Json(packet.basis_observed) if packet.basis_observed is not None else None
     dq = Json(packet.data_quality) if packet.data_quality is not None else None
     intervals = Json(packet.interval_list)
 
     with psycopg.connect(dsn) as conn:
         # 1. Concurrency-safe insert: the winner of a race inserts; everyone else falls through.
-        #    The snapshot is a pure OBSERVATION; eligibility is persisted separately
-        #    (snapshot_evaluations) so it never mutates the observation.
+        #    The snapshot is a pure OBSERVATION; eligibility (snapshot_evaluations) and the
+        #    contextual spread (spread_observations) are persisted separately so neither ever
+        #    mutates the observation.
         row = conn.execute(
             """
             INSERT INTO market_snapshots
-                (bar_close, symbol, regime, adx_h1, atr_pct_m15, spread_pct, features,
+                (bar_close, symbol, regime, adx_h1, atr_pct_m15, features,
                  news_digest, provider, provider_symbol, ingested_at, intervals,
-                 pipeline_version, data_quality, basis_observed)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 pipeline_version, data_quality)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (symbol, bar_close) DO NOTHING
             RETURNING id
             """,
             (
                 packet.bar_close, packet.symbol, packet.regime, packet.adx_h1,
-                packet.atr_pct_m15, packet.spread_pct, features, news, packet.provider,
+                packet.atr_pct_m15, features, news, packet.provider,
                 packet.provider_symbol, packet.ingested_at, intervals,
-                packet.pipeline_version, dq, basis,
+                packet.pipeline_version, dq,
             ),
         ).fetchone()
         if row is not None:
@@ -54,7 +59,7 @@ def upsert_snapshot(dsn: str, packet: FeaturePacket) -> tuple[str, int | None]:
 
         # 2. Existing row: lock it and decide enrich vs conflict.
         existing = conn.execute(
-            "SELECT id, provider, pipeline_version, spread_pct, basis_observed, data_quality "
+            "SELECT id, provider, pipeline_version, data_quality "
             "FROM market_snapshots WHERE symbol = %s AND bar_close = %s FOR UPDATE",
             (packet.symbol, packet.bar_close),
         ).fetchone()
@@ -62,7 +67,7 @@ def upsert_snapshot(dsn: str, packet: FeaturePacket) -> tuple[str, int | None]:
             conn.rollback()
             return "conflict", None
 
-        snap_id, provider, version, ex_spread, ex_basis, ex_dq = existing
+        snap_id, provider, version, ex_dq = existing
         if provider != packet.provider or version != packet.pipeline_version:
             conn.execute(
                 """
@@ -77,25 +82,44 @@ def upsert_snapshot(dsn: str, packet: FeaturePacket) -> tuple[str, int | None]:
             conn.commit()
             return "conflict", snap_id
 
-        # Controlled enrichment: fill a NULL column only when we now have a value for it.
-        fills: dict[str, object] = {}
-        if ex_spread is None and packet.spread_pct is not None:
-            fills["spread_pct"] = packet.spread_pct
-        if ex_basis is None and basis is not None:
-            fills["basis_observed"] = basis
-        if ex_dq is None and dq is not None:
-            fills["data_quality"] = dq
-        if not fills:
+        # Only data_quality may be back-filled (and only when it is still NULL). Features are
+        # never touched; the spread is not here at all any more.
+        if ex_dq is not None or dq is None:
             conn.rollback()
             return "unchanged", snap_id
-
-        set_clause = ", ".join(f"{col} = %s" for col in fills)  # fixed column names, no injection
-        conn.execute(
-            f"UPDATE market_snapshots SET {set_clause} WHERE id = %s",
-            (*fills.values(), snap_id),
-        )
+        conn.execute("UPDATE market_snapshots SET data_quality = %s WHERE id = %s", (dq, snap_id))
         conn.commit()
         return "enriched", snap_id
+
+
+def insert_spread_observation(dsn: str, *, snapshot_id: int, spread_pct: float, provenance: str,
+                              observed_at, quote_time=None, basis: dict | None = None) -> int:
+    """Append a CONTEXTUAL spread fact about a snapshot: 'at `observed_at`, with this provenance,
+    the spread was X'. Append-only and idempotent on (snapshot_id, provenance, observed_at) — the
+    snapshot itself is never mutated, so a replay decision can't inherit an online quote."""
+    import psycopg
+    from psycopg.types.json import Json
+
+    with psycopg.connect(dsn) as conn:
+        row = conn.execute(
+            """
+            INSERT INTO spread_observations
+                (snapshot_id, spread_pct, provenance, quote_time, observed_at, basis)
+            VALUES (%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (snapshot_id, provenance, observed_at) DO NOTHING
+            RETURNING id
+            """,
+            (snapshot_id, spread_pct, provenance, quote_time, observed_at,
+             Json(basis) if basis is not None else None),
+        ).fetchone()
+        if row is None:   # already recorded -> return the existing observation
+            row = conn.execute(
+                "SELECT id FROM spread_observations WHERE snapshot_id = %s AND provenance = %s "
+                "AND observed_at = %s",
+                (snapshot_id, provenance, observed_at),
+            ).fetchone()
+        conn.commit()
+    return row[0]
 
 
 def insert_evaluation(dsn: str, snapshot_id: int, result) -> int:
@@ -162,7 +186,8 @@ def evaluations_for(dsn: str, snapshot_id: int) -> list[dict]:
 def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, model: str,
                     record, ai_input: dict, ai_output: dict | None, mode: str,
                     data_provider: str, tokens: dict | None = None,
-                    run_id: str | None = None, input_fingerprint: str | None = None) -> int:
+                    run_id: str | None = None, input_fingerprint: str | None = None,
+                    spread_observation_id: int | None = None) -> int:
     """Persist a DecisionRecord (decision/pipeline.py) with its reproducibility manifest and
     the FK to the authorizing evaluation. Never fabricates an approved verdict — the
     risk_verdict comes straight from the record.
@@ -170,7 +195,11 @@ def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, mo
     When `run_id` + `input_fingerprint` are given (shadow experiments), the insert is ATOMIC and
     idempotent: ON CONFLICT (input_fingerprint, run_id) DO NOTHING, so two concurrent inserts
     cannot both create a row; on conflict the EXISTING decision id is returned. run_id=None
-    (app/decide, live) is unconstrained (partial index)."""
+    (app/decide, live) is unconstrained (partial index).
+
+    `spread_observation_id` records EXACTLY which contextual spread the decision consumed
+    (NULL = a modeled/replay constant, which `ai_input` records). The snapshot FK carries only
+    the immutable OHLCV observation, so the chain reproduces the frozen input without conflict."""
     import psycopg
     from psycopg.types.json import Json
 
@@ -188,8 +217,8 @@ def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, mo
                  risk_verdict, risk_reason, ai_input, ai_output, prompt_tokens, output_tokens,
                  latency_ms, cache_hit, mode, prompt_version, output_schema_version,
                  feature_pipeline_version, strategy_version, risk_config_version, data_provider,
-                 input_hash, as_of, run_id, input_fingerprint)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 input_hash, as_of, run_id, input_fingerprint, spread_observation_id)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (input_fingerprint, run_id)
                 WHERE run_id IS NOT NULL AND input_fingerprint IS NOT NULL DO NOTHING
             RETURNING id
@@ -207,6 +236,7 @@ def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, mo
                 manifest.get("feature_pipeline_version"), manifest.get("strategy_version"),
                 manifest.get("risk_config_version"), data_provider,
                 record.input_hash, record.as_of, run_id, input_fingerprint,
+                spread_observation_id,
             ),
         ).fetchone()
         if row is None:   # ON CONFLICT DO NOTHING -> the decision already exists for this run
@@ -366,21 +396,21 @@ def find_shadow_trade_by_input(dsn: str, *, input_hash: str, model: str, run_id:
     return row[0] if row else None
 
 
-def snapshot_enrichment_status(dsn: str, symbol: str, bar_close):
-    """(exists, needs_spread_or_basis) for a stored snapshot — lets the scheduler
-    retry XTB-spread enrichment only when it's actually missing."""
+def snapshot_spread_status(dsn: str, symbol: str, bar_close) -> tuple[bool, bool]:
+    """(snapshot_exists, has_no_spread_observation) — lets the ONLINE scheduler retry the XTB
+    quote only for a bar that still has no contextual spread recorded. The snapshot itself is
+    never mutated; a retry appends a new spread_observations row."""
     import psycopg
 
     with psycopg.connect(dsn) as conn:
         row = conn.execute(
-            "SELECT spread_pct, basis_observed FROM market_snapshots "
-            "WHERE symbol = %s AND bar_close = %s",
+            "SELECT s.id, EXISTS (SELECT 1 FROM spread_observations o WHERE o.snapshot_id = s.id) "
+            "FROM market_snapshots s WHERE s.symbol = %s AND s.bar_close = %s",
             (symbol, bar_close),
         ).fetchone()
     if row is None:
         return False, False
-    spread, basis = row
-    return True, (spread is None or basis is None)
+    return True, not row[1]
 
 
 def latest_snapshot_bar_close(dsn: str, symbol: str):

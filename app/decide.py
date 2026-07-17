@@ -26,7 +26,13 @@ from config.settings import load_settings
 from core.models import Direction
 from data_collector.providers.factory import build_provider
 from data_collector.session import calendar_for
-from database.repository import insert_decision, insert_evaluation, insert_llm_call, upsert_snapshot
+from database.repository import (
+    insert_decision,
+    insert_evaluation,
+    insert_llm_call,
+    insert_spread_observation,
+    upsert_snapshot,
+)
 from decision.pipeline import run_decision
 from decision.prefilter import PrefilterConfig
 from decision.schema import DecisionInput, DecisionOutput, build_decision_input
@@ -63,13 +69,17 @@ async def _run(settings, *, mode: str, use_fake: bool, all_regimes: bool = False
         windows, as_of, brain_symbol=brain_symbol, provider_name=provider_name,
         provider_symbol=provider_symbol, ingested_at=now,
     )
-    quote_time = None
+    quote_time = observed_at = None
+    basis = None
+    # A live quote describes NOW — only ONLINE may attach one. Replay never observes.
     if mode == "online":
         spread_pct, basis = await observe_xtb_spread(settings, packet.price, packet.bar_close)
         if basis is not None:
             packet = packet.model_copy(update={"spread_pct": spread_pct, "basis_observed": basis})
             if basis.get("quote_time"):
                 quote_time = datetime.fromisoformat(basis["quote_time"])
+            if basis.get("observed_at"):
+                observed_at = datetime.fromisoformat(basis["observed_at"])
 
     # Recapture the clock AFTER the quote (anti future-quote; see app/collect).
     now = datetime.now(timezone.utc)
@@ -79,6 +89,14 @@ async def _run(settings, *, mode: str, use_fake: bool, all_regimes: bool = False
     print(f"[db] {status} snapshot id={snap_id}  bar_close={packet.bar_close.isoformat()}")
     if snap_id is None or status == "conflict":
         raise SystemExit(f"snapshot not usable for a decision (status={status})")
+    # The spread is a separate, append-only fact ABOUT the snapshot (never part of it).
+    spread_obs_id = None
+    if basis is not None and packet.spread_pct is not None:
+        spread_obs_id = insert_spread_observation(
+            settings.db_dsn, snapshot_id=snap_id, spread_pct=packet.spread_pct,
+            provenance="observed_xtb", observed_at=observed_at or now,
+            quote_time=quote_time, basis=basis,
+        )
     eval_id = insert_evaluation(settings.db_dsn, snap_id, result)
     print(f"[db] evaluation id={eval_id} mode={result.mode} eligible={result.eligible} reasons={result.reasons}")
 
@@ -124,6 +142,7 @@ async def _run(settings, *, mode: str, use_fake: bool, all_regimes: bool = False
         settings.db_dsn, snapshot_id=snap_id, evaluation_id=eval_id, model=model_name,
         record=record, ai_input=inp.model_dump(mode="json"), ai_output=ai_output,
         mode="shadow", data_provider=provider_name, tokens=tokens,
+        spread_observation_id=spread_obs_id,
     )
     verdict = "approved" if (record.risk and record.risk.approved) else "rejected"
     print(f"[db] decision id={dec_id} verdict={verdict} -> evaluation_id={eval_id} (shadow, NOT executed)")

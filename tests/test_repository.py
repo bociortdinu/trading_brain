@@ -77,16 +77,48 @@ def test_insert_then_unchanged():
         _cleanup(sym)
 
 
-def test_spread_less_snapshot_is_enriched():
+def test_snapshot_is_immutable_and_carries_no_spread():
+    """A snapshot is an IMMUTABLE observation of a closed bar. A later quote must NEVER mutate it
+    (that enrichment is what let a snapshot assert a spread its decision never used). The spread
+    is not even a column any more — it lives in spread_observations."""
     from database.repository import upsert_snapshot
 
     sym = "TST_" + os.urandom(3).hex()
     try:
-        assert upsert_snapshot(DSN, _packet(sym, spread=None))[0] == "inserted"  # no spread yet
-        assert upsert_snapshot(DSN, _packet(sym, spread=0.05))[0] == "enriched"  # controlled fill
+        assert upsert_snapshot(DSN, _packet(sym, spread=None))[0] == "inserted"
+        # A packet that now carries a live quote does NOT rewrite the stored observation.
+        assert upsert_snapshot(DSN, _packet(sym, spread=0.05))[0] == "unchanged"
         with psycopg.connect(DSN) as c:
-            val = c.execute("SELECT spread_pct FROM market_snapshots WHERE symbol=%s", (sym,)).fetchone()[0]
-        assert float(val) == pytest.approx(0.05)
+            cols = [r[0] for r in c.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'market_snapshots'").fetchall()]
+        assert "spread_pct" not in cols and "basis_observed" not in cols
+    finally:
+        _cleanup(sym)
+
+
+def test_spread_observation_is_append_only_and_never_touches_the_snapshot():
+    """Contextual spreads accumulate as separate facts ABOUT one snapshot: the same bar can hold
+    an online observation and a modeled one without either overwriting the other."""
+    from database.repository import insert_spread_observation, upsert_snapshot
+
+    sym = "TST_" + os.urandom(3).hex()
+    t0 = datetime(2026, 7, 1, 11, 8, tzinfo=timezone.utc)
+    try:
+        _, snap_id = upsert_snapshot(DSN, _packet(sym, spread=None))
+        a = insert_spread_observation(DSN, snapshot_id=snap_id, spread_pct=0.0177,
+                                      provenance="observed_xtb", observed_at=t0,
+                                      basis={"xtb_spread_pct": 0.0177})
+        b = insert_spread_observation(DSN, snapshot_id=snap_id, spread_pct=0.02,
+                                      provenance="modeled", observed_at=t0)
+        assert a != b   # two distinct facts about the SAME bar; neither overwrote the other
+        # Idempotent: re-recording the same observation returns the same row.
+        assert insert_spread_observation(DSN, snapshot_id=snap_id, spread_pct=0.0177,
+                                         provenance="observed_xtb", observed_at=t0) == a
+        with psycopg.connect(DSN) as c:
+            n = c.execute("SELECT count(*) FROM spread_observations WHERE snapshot_id=%s",
+                          (snap_id,)).fetchone()[0]
+        assert n == 2
     finally:
         _cleanup(sym)
 
@@ -233,7 +265,43 @@ def test_upsert_shadow_trade_idempotent_open_then_closed():
         _cleanup(sym)
 
 
-def _seed_decision(sym, *, input_hash="h", model="fake", end=None):
+def test_online_and_replay_decisions_share_a_bar_without_contradiction():
+    """REGRESSION (reviewer's snapshot 392): an online decision (observed spread 0.0177, quote at
+    11:08 for the 11:00 bar) and a replay decision (modeled 0.02) on the SAME bar used to be
+    irreconcilable — the snapshot asserted ONE spread, so the other decision's FK pointed at a
+    record contradicting its own frozen input. The snapshot now asserts NO spread, and each
+    decision names the observation it consumed (NULL = a modeled constant, kept in ai_input)."""
+    from database.repository import insert_spread_observation, upsert_snapshot
+
+    sym = "TST_" + os.urandom(3).hex()
+    bar_close = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    quote_at = bar_close + timedelta(minutes=8)
+    try:
+        _, snap_id = upsert_snapshot(DSN, _packet(sym, spread=None))
+        obs_id = insert_spread_observation(DSN, snapshot_id=snap_id, spread_pct=0.0177,
+                                           provenance="observed_xtb", observed_at=quote_at)
+        online_dec = _seed_decision(sym, input_hash="online", model="m", snapshot_id=snap_id,
+                                    spread_pct=0.0177, provenance="observed_xtb",
+                                    spread_observation_id=obs_id)
+        replay_dec = _seed_decision(sym, input_hash="replay", model="m", snapshot_id=snap_id,
+                                    spread_pct=0.02, provenance="modeled",
+                                    spread_observation_id=None)
+        with psycopg.connect(DSN) as c:
+            rows = c.execute(
+                "SELECT id, ai_input->>'spread_pct', ai_input->>'spread_provenance', "
+                "spread_observation_id FROM decisions WHERE id = ANY(%s) ORDER BY id",
+                ([online_dec, replay_dec],),
+            ).fetchall()
+        by_id = {r[0]: r for r in rows}
+        # Each decision reproduces its OWN frozen input; neither is contradicted by the snapshot.
+        assert by_id[online_dec][1] == "0.0177" and by_id[online_dec][3] == obs_id
+        assert by_id[replay_dec][1] == "0.02" and by_id[replay_dec][3] is None
+    finally:
+        _cleanup(sym)
+
+
+def _seed_decision(sym, *, input_hash="h", model="fake", end=None, snapshot_id=None,
+                   spread_pct=None, provenance=None, spread_observation_id=None):
     """Snapshot -> evaluation -> decision; returns (dec_id). Shared by the idempotency tests."""
     from database.repository import insert_decision, insert_evaluation, upsert_snapshot
     from decision.pipeline import DecisionRecord
@@ -242,8 +310,9 @@ def _seed_decision(sym, *, input_hash="h", model="fake", end=None):
     from risk.engine import RiskVerdict
 
     end = end or datetime(2026, 7, 1, tzinfo=timezone.utc)
-    _, snap_id = upsert_snapshot(DSN, _packet(sym, spread=0.03))
-    eval_id = insert_evaluation(DSN, snap_id, _eval("replay", True, []))
+    if snapshot_id is None:
+        _, snapshot_id = upsert_snapshot(DSN, _packet(sym, spread=0.03))
+    eval_id = insert_evaluation(DSN, snapshot_id, _eval("replay", True, []))
     decision = DecisionOutput(direction="BUY", confidence=0.8, rationale="x")
     risk = RiskVerdict(approved=True, reason=None, direction="BUY", confidence=0.8,
                        sl_pct=0.3, tp_pct=0.6, risk_config_version="risk-mvp-2026.2")
@@ -253,9 +322,14 @@ def _seed_decision(sym, *, input_hash="h", model="fake", end=None):
                          manifest={"prompt_version": "p", "output_schema_version": "s",
                                    "feature_pipeline_version": "1.2.0", "strategy_version": "st",
                                    "risk_config_version": "risk-mvp-2026.2"})
-    return insert_decision(DSN, snapshot_id=snap_id, evaluation_id=eval_id, model=model,
-                           record=rec, ai_input={}, ai_output=decision.model_dump(mode="json"),
-                           mode="shadow", data_provider="csv")
+    ai_input = {}
+    if spread_pct is not None:
+        ai_input = {"spread_pct": spread_pct, "spread_provenance": provenance}
+    return insert_decision(DSN, snapshot_id=snapshot_id, evaluation_id=eval_id, model=model,
+                           record=rec, ai_input=ai_input,
+                           ai_output=decision.model_dump(mode="json"),
+                           mode="shadow", data_provider="csv",
+                           spread_observation_id=spread_observation_id)
 
 
 def test_upsert_shadow_trade_never_reopens_a_closed_trade():
@@ -452,15 +526,20 @@ def test_insert_llm_call_logs_success_and_failure():
         _cleanup(sym)
 
 
-def test_enrichment_status_tracks_missing_spread():
-    from database.repository import snapshot_enrichment_status, upsert_snapshot
+def test_spread_status_tracks_a_bar_with_no_observation_yet():
+    """The ONLINE scheduler retries the quote only for a bar that has no spread observation yet —
+    now answered from spread_observations, not from a (removed) snapshot column."""
+    from database.repository import (
+        insert_spread_observation, snapshot_spread_status, upsert_snapshot,
+    )
 
     sym = "TST_" + os.urandom(3).hex()
     bar_close = datetime(2026, 7, 1, tzinfo=timezone.utc)
     try:
-        upsert_snapshot(DSN, _packet(sym, spread=None))               # XTB was down
-        assert snapshot_enrichment_status(DSN, sym, bar_close) == (True, True)
-        upsert_snapshot(DSN, _packet(sym, spread=0.05))               # XTB recovered
-        assert snapshot_enrichment_status(DSN, sym, bar_close) == (True, False)
+        _, snap_id = upsert_snapshot(DSN, _packet(sym, spread=None))   # XTB was down
+        assert snapshot_spread_status(DSN, sym, bar_close) == (True, True)
+        insert_spread_observation(DSN, snapshot_id=snap_id, spread_pct=0.05,
+                                  provenance="observed_xtb", observed_at=bar_close)
+        assert snapshot_spread_status(DSN, sym, bar_close) == (True, False)  # XTB recovered
     finally:
         _cleanup(sym)

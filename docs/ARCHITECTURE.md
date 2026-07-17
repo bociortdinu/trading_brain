@@ -201,7 +201,8 @@ M15 CLOSE
 
 | Tabelă | Rol | Coloane fierbinți (indexate) | JSONB |
 |---|---|---|---|
-| `market_snapshots` | fotografia pieței trimisă la analiză | ts (ingestie), **bar_close** (cheie idempotență), symbol, regime, adx_h1, atr_pct_m15, spread_pct | features, news_digest |
+| `market_snapshots` | observație **IMUTABILĂ** a unei bare închise (OHLCV+features). NU poartă spread — un quote nu e proprietatea unei bare | ts (ingestie), **bar_close** (cheie idempotență), symbol, regime, adx_h1, atr_pct_m15 | features, news_digest, data_quality |
+| `spread_observations` | fapte **append-only** DESPRE un snapshot: „la `observed_at`, cu această provenance, spreadul era X". Zero (replay) sau mai multe per bară | snapshot_id, spread_pct, provenance, quote_time, observed_at | basis |
 | `decisions` | input + output LLM + guvernarea Risk Engine + manifest reproducere | ts, model, direction (**intern** BUY/SELL/NO_TRADE), confidence, sl_pct, tp_pct, risk_verdict, mode | ai_input, ai_output |
 | `trades` | tranzacția + rezultatul reconstruit | status, symbol, side, mode, external_id, r_multiple, pnl, exit_reason | — |
 | `system_versions` | manifest de versiuni pentru reproducere | component, version, ts | details |

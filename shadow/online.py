@@ -35,6 +35,7 @@ from database.repository import (
     insert_decision,
     insert_evaluation,
     insert_llm_call,
+    insert_spread_observation,
     open_shadow_trades,
     upsert_shadow_trade,
     upsert_snapshot,
@@ -133,6 +134,15 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     status, snap_id = upsert_snapshot(settings.db_dsn, packet)
     summary["snapshot"] = f"{status}:{snap_id}"
     if snap_id is not None and status != "conflict":
+        # The observed spread is a SEPARATE append-only fact about the snapshot; the decision
+        # below records exactly which observation it consumed.
+        spread_obs_id = None
+        if basis is not None and packet.spread_pct is not None:
+            spread_obs_id = insert_spread_observation(
+                settings.db_dsn, snapshot_id=snap_id, spread_pct=packet.spread_pct,
+                provenance="observed_xtb", observed_at=observed_at or eval_now,
+                quote_time=quote_time, basis=basis,
+            )
         eval_id = insert_evaluation(settings.db_dsn, snap_id, result)
         record = await run_decision(packet, result, decision_maker, mode="online",
                                     prefilter_config=PrefilterConfig(), risk_config=RiskConfig(),
@@ -151,7 +161,7 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
                 record=record, ai_input=inp.model_dump(mode="json"),
                 ai_output=record.decision.model_dump(mode="json") if record.decision else None,
                 mode="shadow", data_provider=provider_name, run_id=run_id,
-                input_fingerprint=fingerprint,
+                input_fingerprint=fingerprint, spread_observation_id=spread_obs_id,
             )
             summary["decision"] = f"{record.stage}:{record.decision.direction.value if record.decision else '-'}"
             if record.risk_approved:

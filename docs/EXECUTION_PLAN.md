@@ -58,12 +58,33 @@ Supraevaluări corectate (reviewer-ul a avut dreptate de fiecare dată):
    = primul apel LLM" (făcut). `.env.example` documentează costurile.
 8. Captura ipax: `chmodSync(0600)` (mode-ul de la creare nu acoperea un fișier existent 0644).
 
+**Reparat în runda 4 — separarea snapshot/spread (migrarea 0013):**
+
+Root-cause-ul contaminării: `market_snapshots` purta `spread_pct`/`basis_observed`, care **nu sunt
+proprietăți ale unei bare închise** — vin dintr-un quote live luat la un moment de observație. Cum
+rândul era **ENRICHED** cu quote-ul mai târziu, snapshotul unei bare ajungea să afirme un spread pe
+care decizia de pe aceeași bară nu-l folosise (snapshot 392: 0.0177 observat vs 0.02 modeled în input).
+
+Modelul acum:
+- `market_snapshots` = observație **imutabilă** OHLCV+features. NU mai are spread → **nu mai poate
+  contrazice** o decizie. `upsert` nu mai face enrich pe spread (doar `data_quality` NULL).
+- `spread_observations` = fapte **append-only** DESPRE un snapshot („la `observed_at`, cu această
+  provenance, spreadul era X"). O bară poate avea zero (replay) sau mai multe.
+- `decisions.spread_observation_id` = **exact** ce observație a consumat decizia (NULL = constantă
+  modelată, păstrată în `ai_input`).
+- **Guard-ul de contaminare**: `should_observe_spread(mode, is_latest)` — un quote descrie ACUM, deci
+  doar bara `latest` **și** doar în `online`. Replay nu observă nimic (fail-closed pe mod necunoscut).
+
+Dovada pe cazul reviewer-ului: aceeași bară (snapshot 392) găzduiește acum decizia online (0.0177,
+`observed_xtb`) și cea replay (0.02, `modeled`) **fără contradicție** — fiecare își reproduce inputul
+îngheţat. Teste: imutabilitatea snapshotului, append-only + idempotent, replay-never-observes,
+online-și-replay-pe-aceeași-bară. Cele 47 de observații istorice au fost migrate (nimic pierdut).
+
 **Datorii deschise (oneste, NEreparate):**
-- **Contaminare snapshot/replay** — schedulerul poate atașa quote live barei `latest` în replay, iar
-  snapshotul persistat poate diferi de inputul modelat al deciziei (ex. snapshot 392: spread observat
-  0.0177 vs input 0.02 modeled). Cere separarea observației OHLCV de spreadul contextual — **redesign**.
 - Swap real long/short + DST + triple-swap; reconcilierea folosește configul CURENT, nu cel salvat în
   `costs` la deschidere; ratele nu se reconstruiesc din `costs` pentru pozițiile deschise.
+- `decisions.spread_observation_id` e NULL pentru deciziile **istorice** (scrise înainte de coloană);
+  nu le-am inferat retroactiv legătura.
 - Perf backtest **O(n²)** (rebuild MTF per bară) — blochează ferestre foarte mari.
 - `llm_calls` agregat după retry (fără `retry_count`, fără FK direct la `decision_id`).
 - DoD prompt caching nevalidat (apelul real: cache 0/0). News live neconectat.
@@ -72,9 +93,9 @@ Supraevaluări corectate (reviewer-ul a avut dreptate de fiecare dată):
   `GetBalance` cu subscribe la 15s fără unsubscribe.
 - Faza 4 = **spike**. Edge real cu LLM = plătit, amânat de user.
 
-**Ordinea recomandată mai departe** (per reviewer): separarea snapshot/spread → mock WebSocket/
-reconnect → abia apoi pornirea monitorizată a Shadow Online. **Nu** porni serviciul și **nu** rula
-`--maker claude` pe mii de bare înainte de astea.
+**Ordinea recomandată mai departe** (per reviewer): ~~separarea snapshot/spread~~ (**făcută**, runda 4)
+→ mock WebSocket/reconnect → abia apoi pornirea monitorizată a Shadow Online. **Nu** porni serviciul și
+**nu** rula `--maker claude` pe mii de bare înainte de reconnect.
 
 ---
 

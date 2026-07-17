@@ -6,7 +6,14 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.jobs import WindowCache, floor_m15, next_m15, safe_catch_up, select_targets
+from app.jobs import (
+    WindowCache,
+    floor_m15,
+    next_m15,
+    safe_catch_up,
+    select_targets,
+    should_observe_spread,
+)
 from config.settings import Settings
 from data_collector.providers.base import Candle
 from data_collector.providers.polygon import ProviderError
@@ -23,6 +30,17 @@ def _closes(start: datetime, n: int) -> list[datetime]:
 def test_floor_and_next_m15():
     assert floor_m15(datetime(2026, 7, 10, 21, 7, 30, tzinfo=UTC)) == datetime(2026, 7, 10, 21, 0, tzinfo=UTC)
     assert next_m15(datetime(2026, 7, 10, 21, 7, tzinfo=UTC)) == datetime(2026, 7, 10, 21, 15, tzinfo=UTC)
+
+
+def test_replay_never_observes_a_live_quote():
+    """REGRESSION: the scheduler used to attach the wall-clock quote to the LATEST bar whatever
+    the mode, so a replayed bar could be recorded with a price from its own future. A quote
+    describes NOW: latest bar + online only. Fail-closed on anything else."""
+    assert should_observe_spread("online", True) is True       # the only case that may observe
+    assert should_observe_spread("replay", True) is False      # <- the contamination bug
+    assert should_observe_spread("online", False) is False     # backfilled bar: never
+    assert should_observe_spread("replay", False) is False
+    assert should_observe_spread("", True) is False            # unknown mode -> fail closed
 
 
 def test_first_run_takes_latest_only():
