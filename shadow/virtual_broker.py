@@ -34,6 +34,11 @@ class ShadowConfig(BaseModel):
     # swapLong/swapShort is read from the account; applied per rollover crossed.
     swap_pct_per_night: float = 0.0
     rollover_hour_utc: int = 22   # XTB daily rollover (22:00 UTC in summer)
+    # Online entries land MID-BAR (opened_at inside an M15 bar). We only have that bar's full
+    # OHLC, which mixes pre- and post-entry movement. Conservative policy: on the partial entry
+    # bar a STOP touch counts (pessimistic — the adverse move may be post-entry) but a TP touch
+    # does NOT (we can't confirm it happened after entry). Proper fix later = M1/tick reconcile.
+    conservative_partial_entry: bool = True
 
 
 class VirtualTrade(BaseModel):
@@ -57,11 +62,13 @@ def cost_manifest(trade: "VirtualTrade", config: ShadowConfig) -> dict:
     is actually non-zero. Commission/swap default to 0 (real XTB terms not wired), so they
     land in `not_modeled` — the R-multiple is NOT net of real financing, and the manifest must
     say so instead of claiming 'modeled' with a zero rate."""
+    # A component is 'modeled' when its rate is non-zero (the reconciler APPLIES it) — including
+    # a NEGATIVE swap (a credit). Only an exactly-zero rate is not_modeled.
     modeled = ["spread", "gap_through_stop", "latency"]
     not_modeled: list[str] = []
-    (modeled if trade.slippage_pct > 0 else not_modeled).append("slippage")
-    (modeled if config.commission_pct > 0 else not_modeled).append("commission")
-    (modeled if config.swap_pct_per_night > 0 else not_modeled).append("swap")
+    (modeled if trade.slippage_pct != 0 else not_modeled).append("slippage")
+    (modeled if config.commission_pct != 0 else not_modeled).append("commission")
+    (modeled if config.swap_pct_per_night != 0 else not_modeled).append("swap")
     manifest = {
         "spread_pct": trade.spread_pct, "spread_provenance": trade.spread_provenance,
         "slippage_pct": trade.slippage_pct,

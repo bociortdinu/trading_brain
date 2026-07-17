@@ -33,6 +33,32 @@ def _short(spread=0.03):
                               spread_pct=spread, spread_provenance="modeled", opened_at=_T0)
 
 
+def _long_midbar():
+    # Entry lands 5 min INTO bar n=0 (open_time _T0, close _T0+15): that bar is PARTIAL.
+    return open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6, spread_pct=0.0,
+                              spread_provenance="modeled", opened_at=_T0 + timedelta(minutes=5))
+
+
+def test_partial_entry_bar_does_not_credit_a_tp_touch():
+    """Conservative policy: a TP touch on the partial entry bar is NOT credited (its OHLC mixes
+    pre-/post-entry movement). The trade holds and only closes on a fully-post-entry TP bar."""
+    trade = _long_midbar()   # tp 4024
+    partial_tp = _bar(4000, 4030, 3995, 4010, n=0)   # touches tp 4024 but is the partial bar
+    assert reconcile(trade, [partial_tp]).status == "open"      # not credited -> still open
+    later_tp = _bar(4010, 4030, 4005, 4025, n=1)                # fully-post-entry TP -> credited
+    out = reconcile(trade, [partial_tp, later_tp])
+    assert out.status == "closed" and out.exit_reason == "tp_hit"
+
+
+def test_partial_entry_bar_still_honors_a_stop_touch():
+    """A STOP touch on the partial entry bar DOES close (pessimistic): the adverse move might be
+    post-entry, so we must not treat the position as immune until the next bar boundary."""
+    trade = _long_midbar()   # sl 3988
+    partial_sl = _bar(4000, 4005, 3980, 3990, n=0)   # touches sl 3988 on the partial bar
+    out = reconcile(trade, [partial_sl])
+    assert out.status == "closed" and out.exit_reason == "sl_hit"
+
+
 def test_open_sets_levels():
     t = _long()
     assert t.sl_price == 3988.0 and t.tp_price == 4024.0 and t.risk_per_unit == 12.0

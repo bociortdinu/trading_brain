@@ -128,10 +128,9 @@ trading_brain/
 ├── data_collector/  providers OHLCV (REST) + news (curățate, deduplicate)
 ├── features/        indicatori deterministi + agregare MTF (D1/H4/H1/M15)
 ├── brokers_bridge/  client HTTP tipizat pentru trading_hands (7 endpointuri)
-├── brain/           prompt builder (+ feedback), client LLM (Structured Outputs, caching), scheme Pydantic
-├── risk_manager/    validare rigidă: spread, SL obligatoriu, cooldown, fail-closed; SL/TP determinist mărginit
-├── execution/       router (shadow vs live) + reconciler (reconstruiește rezultatul)
-├── shadow/          broker virtual (bid/ask, online vs replay, benzi pesimist/optimist)
+├── decision/        schema I/O strictă, prefilter, client LLM (Structured Outputs), pipeline
+├── risk/            validare rigidă: spread, SL obligatoriu, cooldown, fail-closed; SL/TP determinist mărginit
+├── shadow/          broker virtual + reconciler + runner (backtest) + online (continuu) + metrics
 ├── database/        schema, repository, feedback (statistici + situații similare)
 └── app/             orchestrator (loop M15) + jobs (scheduler + reconciler)
 ```
@@ -141,9 +140,8 @@ trading_brain/
 | **data_collector** | OHLCV MTF dintr-un provider REST stabil (context tehnic); știri curățate/deduplicate cu `publication_time` + `ingestion_time`. Basis: contextul tehnic pe feed extern, **spread & trigger pe `/quote` XTB**. |
 | **features** | Clasificare regim (EMA stack + ADX + pantă, nu MA-cross simplu), ATR (volatilitate → SL), RSI, structură S/R (swing highs/lows), scor de confluență MTF. Output = ~15–20 numere/etichete, nu lumânări. |
 | **brokers_bridge** | Client async tipizat: `status`, `balance`, `positions`, `quote`, `instruments`, `purchase`, `close`. Rezolvă simbolul aur prin `/instruments`, verifică `tradeable`/`session_type`. |
-| **brain** | Construiește pachetul JSON (features + știri + feedback), injectează feedback din DB, apelează LLM cu **Structured Outputs** (schemă strictă) + **prompt caching**; întoarce `AIDecision` validat. |
-| **risk_manager** | Poartă rigidă înaintea execuției: spread ≤ max, SL obligatoriu, cooldown/frecvență, sesiune deschisă, `confidence ≥ prag` altfel `NO_TRADE`. Calculează **SL/TP determinist** (ATR-based). Fail-closed. |
-| **execution** | `router`: shadow vs live. `reconciler`: reconstruiește rezultatul (shadow = modelat; live = autoritativ din Faza 4), calculează R-multiple, populează `trades`. |
+| **decision** | Construiește pachetul JSON (features + știri + feedback), apelează LLM cu **Structured Outputs** (schemă strictă) + **prompt caching**; întoarce `DecisionOutput` validat. Prefiltrul taie apelul când nu e setup; `pipeline` compune eligibilitate→prefilter→LLM→risc. |
+| **risk** | Poartă rigidă înaintea execuției: spread ≤ max (obligatoriu), SL obligatoriu, sesiune deschisă **pe calendarul providerului**, `confidence ≥ prag` altfel `NO_TRADE`. Calculează **SL/TP determinist** (ATR-based). Fail-closed. Cooldown/poziții-existente: gate-uri STATEFUL încă nelivrate → `execution_ready=False`. |
 | **shadow** | Broker virtual: intrare la ASK (long)/BID (short), ieșire la BID/ASK (**un** spread per round-trip), verificare intrabar, benzi pesimist/optimist + rată de ambiguitate când SL și TP cad în același interval. |
 | **database** | PostgreSQL `trading_brain` (separat de trading_hands, același server). Coloane fierbinți promovate + JSONB rece. `feedback` extrage statistici agregate + ultimele K trades (+ pgvector opțional în Faza 5). |
 | **app** | Orchestrare: la fiecare **M15 închis** rulează pipeline-ul decizional; scheduler separat rulează reconciler-ul la interval. |
@@ -162,22 +160,22 @@ M15 CLOSE
 2. features: FeaturePacket compact (regim, ADX, ATR, structură, confluență)
    │
    ▼
-3. strategy.prefilter(features) ── FALSE ──► STOP (nu chemăm LLM ; log NO_SETUP)
+3. decision.prefilter(features) ── FALSE ──► STOP (nu chemăm LLM ; log NO_SETUP)
    │ TRUE
    ▼
-4. brain: prompt (features + știri + feedback din DB) ──► LLM (Structured Outputs)
-   │                                                        └─ AIDecision: {BUY|SELL|NO_TRADE, confidence, rationale, invalidation}
+4. decision.llm_client: prompt (features + știri + feedback din DB) ──► LLM (Structured Outputs)
+   │                                                        └─ DecisionOutput: {BUY|SELL|NO_TRADE, confidence, rationale, key_factors}
    ▼
-5. risk_manager:
+5. risk.engine:
      - validează output (invalid/sub prag → NO_TRADE, fail-closed)
-     - spread ≤ max ? SL obligatoriu ? cooldown ? sesiune deschisă ?
+     - spread ≤ max (obligatoriu) ? SL obligatoriu ? sesiune deschisă (calendarul PROVIDERULUI) ?
      - calculează SL%/TP% determinist (ATR) ; aplică semnul TP după direcție
-   │ approved
+     - cooldown / poziții existente = gate-uri STATEFUL nelivrate → execution_ready=False
+   │ approved (= shadow-eligible, NU execution-ready)
    ▼
-6. execution.router:
-     - SHADOW → shadow.virtual_broker.open(...)   (fără /purchase)
-     - LIVE   → brokers_bridge.purchase(...)       (preds_proba = sentinelă ≥0.5)
-                apoi /positions ca să capturezi SL/TP absolute
+6. rutare (în shadow/: runner=backtest, online=continuu; `execution/` NU există încă):
+     - SHADOW → shadow.virtual_broker.open(...)   (fără /purchase) + gate o singură poziție
+     - LIVE   → brokers_bridge.purchase(...)       (Faza 6, neînceput)
    │
    ▼
 7. database: scrie snapshot + decision (+ trade open) cu manifest de reproducere

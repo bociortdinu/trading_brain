@@ -22,37 +22,59 @@ Cross-cutting (în toate fazele): manifest de reproducere, teste, discipline ant
 
 ---
 
-## Status onest (2026-07-14, după runda 2 de review extern)
+## Status onest (2026-07-14, după runda 3 de review extern)
 
-Corectez supraevaluări din raportările anterioare (reviewer-ul a avut dreptate):
+Supraevaluări corectate (reviewer-ul a avut dreptate de fiecare dată):
 
 - **NU** „audit închis integral / Faza 3 completă". Faza 3 e funcțională dar are datorii (mai jos).
-- Backtest-ul determinist NU e un „no-edge robust pe 26 zile". Semnalele s-au concentrat într-un
-  singur regim intraday; înainte era un **event-study** cu poziții suprapuse. Acum există un
-  **position gate** (o poziție o dată) → rezultat executabil, dar tot pe o fereastră limitată.
-- Modelul de cost **nu** e „complet". Comision/swap sunt 0 (nemodelate), un singur swap (fără
-  long/short), rollover fix 22:00 UTC fără DST/triple-swap. Manifestul persistat spune acum onest
-  `not_modeled` când rata e 0.
-- Sistemul **nu acumulează track record**: `shadow.online`/`app.jobs` nu rulează ca serviciu; doar
-  serviciul XTB (trading_hands) e activ.
-- Număr real de commit-uri: **11 în trading_brain, 3 în trading_hands** (nu 15+4).
+- Backtest-ul determinist NU e un „no-edge robust pe 26 zile": semnalele s-au concentrat într-un
+  singur regim intraday, iar rularea veche era un **event-study** cu până la 23 poziții suprapuse.
+  Există acum un **position gate** (o poziție o dată) → executabil, dar fereastra rămâne limitată.
+- Modelul de cost **nu** e „complet": comision/swap = 0 (**nemodelate**), un singur swap (fără
+  long/short), rollover fix 22:00 UTC fără DST/triple-swap.
+- „Idempotency end-to-end" (runda 2) era de fapt doar un **lookup**. Acum e reală: dedupe ATOMIC
+  *înainte* de LLM + test care rulează backtestul de două ori.
+- Sistemul **nu acumulează track record**: `shadow.online`/`app.jobs` nu rulează ca serviciu.
+- Teste reale: **211 passed / 13 skipped** fără DB, **224** cu DB (raportasem greșit 207).
+- Commit-uri: **13 în trading_brain, 5 în trading_hands** (raportasem greșit 15+4, apoi 11+3).
 
-**Reparat în runda 2 (cu teste):**
-1. **Risk Engine folosea calendarul Polygon** (nu al providerului) → putea aproba cu XTB închis.
-   `run_decision` cere acum `calendar` (fără default) + test regresie XTB-vs-Polygon (duminică 21:30 UTC).
-2. Manifest de cost onest (`not_modeled` pentru rate 0) + comision/swap configurabile din Settings.
-3. **Position gate** (o poziție o dată) + cooldown opțional; `report()` separă `approved` /
-   `blocked_position_open` / `trades_opened`.
-4. **Idempotency end-to-end** pe `(input_hash, model, run_id)` (nu pe `decision_id`) + upsert
-   **monoton** (un trade închis nu se redeschide).
-5. Online: `opened_at` = timpul **observației** quote-ului (nu bar close).
-6. Maker selectabil (`--maker deterministic|claude`) în shadow-online și backtest.
-7. Captura ipax: fișier `0600` + redactare headere secrete.
+**Reparat în runda 3 (cu teste):**
+1. **Dedupe ÎNAINTE de LLM + atomic** (migrarea 0011): `decisions.run_id` + `input_fingerprint`
+   (input_hash ⊕ model ⊕ prompt/strategy/risk version ⊕ provider) cu UNIQUE parțial; `insert_decision`
+   face `ON CONFLICT DO NOTHING` → două procese concurente nu mai pot insera dublu (fără TOCTOU).
+   O re-rulare **face RESUME: zero apeluri plătite** (dovedit de test, nu doar de lookup).
+2. **Guardrails financiare pentru `--maker claude`**: `--max-llm-calls` (cap hard, oprire curată),
+   estimare worst-case de cost + confirmare explicită (`--yes`), `llm_calls` persistate și în
+   backtest, clientul Anthropic închis în `finally`.
+3. **Position gate + reconciliere-ÎNTÂI în Shadow Online** (înainte exista doar în backtest, iar
+   reconcilierea rula după o eventuală deschidere → poziții suprapuse).
+4. `opened_at` = `basis.observed_at` (timpul **local real** al observației, nu tickul brokerului).
+5. **Bara parțială de intrare**: reconcilierul o ignora complet (poziția era imună la SL/TP până la
+   următoarea graniță M15). Acum: politică **conservatoare** — stop-ul contează, TP-ul nu.
+6. `cost_manifest`: rată `!= 0` (un swap **negativ** e aplicat → e „modeled"); migrarea 0012
+   corectează manifestele FALSE ale celor 45 de trade-uri istorice (păstrate, dar cu afirmația reparată).
+7. Docs: eliminate module inexistente (`brain/`, `risk_manager/`, `execution/` → reale: `decision/`,
+   `risk/`, `shadow/`), „online blocat de feed plătit" (XTB e feed real-time gratuit), „următorul pas
+   = primul apel LLM" (făcut). `.env.example` documentează costurile.
+8. Captura ipax: `chmodSync(0600)` (mode-ul de la creare nu acoperea un fișier existent 0644).
 
-**Datorii deschise (oneste):** swap/comision reale (2 numere din xStation5); model de swap fin
-(long/short, DST, triple-swap); rularea shadow ca serviciu monitorizat; reconnect XTB testat cu
-mock WebSocket (acum doar keepalive dovedit); `llm_calls` per-attempt cu `retry_count`; news live;
-Faza 4 = **spike** (nu implementată). Măsurarea edge-ului real cu LLM = plătit, amânat.
+**Datorii deschise (oneste, NEreparate):**
+- **Contaminare snapshot/replay** — schedulerul poate atașa quote live barei `latest` în replay, iar
+  snapshotul persistat poate diferi de inputul modelat al deciziei (ex. snapshot 392: spread observat
+  0.0177 vs input 0.02 modeled). Cere separarea observației OHLCV de spreadul contextual — **redesign**.
+- Swap real long/short + DST + triple-swap; reconcilierea folosește configul CURENT, nu cel salvat în
+  `costs` la deschidere; ratele nu se reconstruiesc din `costs` pentru pozițiile deschise.
+- Perf backtest **O(n²)** (rebuild MTF per bară) — blochează ferestre foarte mari.
+- `llm_calls` agregat după retry (fără `retry_count`, fără FK direct la `decision_id`).
+- DoD prompt caching nevalidat (apelul real: cache 0/0). News live neconectat.
+  `max_clock_skew_seconds` nu intră în hash-ul policy-version.
+- Reconnect XTB dovedit doar prin keepalive (fără test cu mock WebSocket); heartbeat-ul face
+  `GetBalance` cu subscribe la 15s fără unsubscribe.
+- Faza 4 = **spike**. Edge real cu LLM = plătit, amânat de user.
+
+**Ordinea recomandată mai departe** (per reviewer): separarea snapshot/spread → mock WebSocket/
+reconnect → abia apoi pornirea monitorizată a Shadow Online. **Nu** porni serviciul și **nu** rula
+`--maker claude` pe mii de bare înainte de astea.
 
 ---
 
@@ -99,9 +121,12 @@ snapshot-uri scrise la M15 close; nicio bară în formare folosită (test anti l
 - Rol PostgreSQL dedicat aplicației (DML-only), separat de rolul admin.
 - Fix căutare instrumente trading_hands (match exact înainte de plafon) + teste Go.
 
-*B. Online readiness — ⛔ BLOCAT (dependent de feed real-time):*
-- Free-tier Polygon **întârzie** datele (ultima bară vineri) → snapshot-urile online sunt corect `stale`.
-- Shadow Online rămâne blocat până alegem un feed real-time (plătit). Free-tier = doar dev/replay.
+*B. Online readiness — ✅ DEBLOCAT (feed real-time gratuit via XTB):*
+- Free-tier Polygon **întârzie** datele → e bun doar pentru replay/backtest (snapshot-urile online
+  ar fi corect `stale`).
+- Rezolvat **fără abonament**: `BRAIN_MARKET_DATA_PROVIDER=xtb` ia bare real-time din trading_hands
+  (CoreAPI xStation5, sesiune auto-menținută). Shadow Online **nu mai e blocat de feed**.
+- Rămâne de rulat ca **serviciu monitorizat** ca să acumuleze track record (vezi „Status onest").
 
 *C. Amânate:*
 - **Știri LIVE** → primul subpas al Fazei 2 (interfața + `as_of` + provider static există).
@@ -116,12 +141,16 @@ snapshot-uri scrise la M15 close; nicio bară în formare folosită (test anti l
 
 - `brain/schemas.py`: `AIDecision` Pydantic (`direction: BUY|SELL|NO_TRADE`, `confidence`,
   `invalidation`, `rationale`, opțional `risk_preset: tight|normal|wide`).
-- `brain/prompt_builder.py`: pachet JSON (features + știri `as_of` + feedback placeholder);
-  partea statică (reguli + schemă + few-shot) separată pentru **prompt caching (TTL 1h)**.
-- `brain/llm_client.py`: Anthropic SDK, `messages.parse()` cu `output_config.format` (Structured
-  Outputs), `thinking: adaptive`. Model: `claude-sonnet-5` decizie; `claude-haiku-4-5` pre-clasificare/știri.
-- `strategy.prefilter(...)`: taie apelul LLM când nu e setup (regim/ADX/nivel/spread/sesiune).
-- `risk_manager/engine.py`: **SL/TP determinist** (ex. `SL = k·ATR`, `TP = R·SL`); validare
+> Notă de nume: modulele livrate sunt [decision/](../decision/) și [risk/](../risk/)
+> (planul iniţial le numea `brain/` / `risk_manager/` — acele foldere NU există).
+
+- [decision/schema.py](../decision/schema.py): pachet JSON (features + știri `as_of` + feedback
+  placeholder); partea statică (reguli + schemă) separată pentru **prompt caching (TTL 1h)**.
+- [decision/llm_client.py](../decision/llm_client.py): Anthropic SDK, `messages.parse()` cu
+  Structured Outputs. Model: `claude-sonnet-5` decizie (configurabil).
+- [decision/prefilter.py](../decision/prefilter.py): taie apelul LLM când nu e setup
+  (regim/ADX/nivel/spread/sesiune).
+- [risk/engine.py](../risk/engine.py): **SL/TP determinist** (`SL = k·ATR`, `TP = R·SL`); validare
   fail-closed (invalid/sub prag → NO_TRADE); spread ≤ max; SL obligatoriu; cooldown; sesiune.
   `confidence` logat separat; `preds_proba` = sentinelă ≥0.5.
 - Scrie `decisions` cu **manifest de reproducere** (vezi Cross-cutting).
@@ -147,10 +176,16 @@ la apeluri repetate; pre-filtrul reduce demonstrabil apelurile.
 4. **Subpas știri** — model bitemporal (identitate/dedup/revizii/publication+first-seen),
    `as_of_view` fără look-ahead; cerințe în [docs/NEWS_PROVIDER_REQUIREMENTS.md](NEWS_PROVIDER_REQUIREMENTS.md).
 
-Module decizie livrate (FĂRĂ execuție, FĂRĂ apel LLM real; DecisionMaker injectat, fake în teste):
+Module decizie livrate (FĂRĂ execuție; DecisionMaker injectat, fake în teste):
 [decision/schema.py](../decision/schema.py) · [decision/prefilter.py](../decision/prefilter.py) ·
-[risk/engine.py](../risk/engine.py) · [decision/pipeline.py](../decision/pipeline.py).
-Următorul pas: `decision/llm_client.py` (Anthropic SDK, Structured Outputs) — **primul apel LLM real**.
+[risk/engine.py](../risk/engine.py) · [decision/pipeline.py](../decision/pipeline.py) ·
+[decision/llm_client.py](../decision/llm_client.py).
+
+**Primul apel LLM real: FĂCUT** (Anthropic SDK, Structured Outputs, fail-closed; apelul e persistat
+în `llm_calls` cu cost/tokens/request_id). Maker-ul e selectabil: `--maker deterministic` (gratuit,
+default) sau `--maker claude` (plătit — cu cap `--max-llm-calls`, estimare de cost și confirmare).
+**Neîncă făcut:** măsurarea edge-ului real cu LLM pe o fereastră mare (cost real, amânat de user)
+și validarea DoD-ului de prompt caching (`cache_read_input_tokens > 0` — apelul real a raportat 0/0).
 
 ---
 
@@ -179,8 +214,10 @@ Nucleul Shadow Mode e gata (pur, determinist, testat):
 - [shadow/reconciler.py](../shadow/reconciler.py) — `reconcile` verificare **intrabar** SL/TP; când ambele cad în aceeași bară → **bandă pesimist (SL-first) / optimist (TP-first)** + flag `ambiguous` (nu se elimină cazul); R-multiple **net de spread**; timeout; open. Funcționează cu orice timeframe de bare (M15 acum, M1 mai târziu).
 - [shadow/metrics.py](../shadow/metrics.py) — `summarize`: win rate, expectancy R, **rată de ambiguitate**, bandă `avg_r_pessimistic..optimistic`, breakdown pe motiv de ieșire.
 - `database.repository.record_shadow_trade` → tabelul `trades` (`mode='shadow'`, benzi + ambiguitate).
-Teste: `tests/test_shadow.py` (20) + `tests/test_shadow_runner.py` (3, incl. position gate) +
-`test_repository` full-chain (snapshot→eval→decizie→trade shadow, idempotency, upsert monoton).
+Teste: `tests/test_shadow.py` (22, incl. politica conservatoare pe bara parțială) +
+`tests/test_shadow_runner.py` (4, incl. position gate + cap `--max-llm-calls`) +
+`tests/test_repository.py` (13, incl. lanțul complet snapshot→eval→decizie→trade, upsert monoton
+și **resume real**: backtestul rulat de două ori → 0 apeluri LLM repetate, 0 duplicate).
 
 **Livrat (post-audit):**
 - **Backtest replay** — [shadow/runner.py](../shadow/runner.py): `backtest_over_windows` + spread modelat (`replay_spread_pct`); metrici de edge (win rate, expectancy R, bandă ambiguitate); `--persist` scrie lanțul complet (snapshot→eval→decizie→trade) cu `run_id`. Rulat real pe XTB (strategia deterministă nu are edge — toate sl_hit).

@@ -321,6 +321,65 @@ def test_find_shadow_trade_by_input_dedupes_across_reruns():
         _cleanup(sym)
 
 
+class _CountingFake:
+    """Stand-in for the PAID maker: counts real decide() calls so a resume can be proven to make
+    ZERO of them."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def decide(self, inp):
+        from core.models import Direction
+        from decision.schema import DecisionOutput
+
+        self.calls += 1
+        if inp.confluence == "aligned_bull":
+            return DecisionOutput(direction=Direction.BUY, confidence=0.7, rationale="x")
+        return DecisionOutput(direction=Direction.NO_TRADE, confidence=0.5, rationale="x")
+
+
+def _counts(run_id):
+    with psycopg.connect(DSN) as c:
+        d = c.execute("SELECT count(*) FROM decisions WHERE run_id = %s", (run_id,)).fetchone()[0]
+        t = c.execute("SELECT count(*) FROM trades WHERE run_id = %s", (run_id,)).fetchone()[0]
+    return d, t
+
+
+def test_backtest_rerun_resumes_without_repeating_decisions_or_paid_calls():
+    """REAL end-to-end idempotency (not just a lookup): run the whole backtest TWICE with the
+    same run_id. The second run must make ZERO decide() calls (no re-paying the LLM) and add no
+    new decisions or trades — every bar resolves to `resumed`."""
+    from shadow.runner import backtest_over_windows
+    from tests.helpers import run as arun
+    from tests.synthetic import trend
+
+    sym = "TST_" + os.urandom(3).hex()
+    run_id = "e2e-" + os.urandom(3).hex()
+    end = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    windows = {name: trend(n=250, step=1.0, tf_min=m, start=end - timedelta(minutes=m * 250))
+               for name, m in (("1day", 1440), ("4h", 240), ("1h", 60), ("15min", 15))}
+    kw = dict(symbol=sym, provider_name="csv", modeled_spread_pct=0.02,
+              persist_dsn=DSN, run_id=run_id, model_name="fake")
+    try:
+        first = _CountingFake()
+        rows1 = arun(backtest_over_windows(windows, decision_maker=first, **kw))
+        decisions1, trades1 = _counts(run_id)
+        assert first.calls > 0 and decisions1 > 0 and trades1 > 0   # the run really happened
+        assert not any(r["stage"] == "resumed" for r in rows1)      # nothing to resume yet
+
+        second = _CountingFake()
+        rows2 = arun(backtest_over_windows(windows, decision_maker=second, **kw))
+        assert second.calls == 0                                    # NO repeated (paid) calls
+        assert _counts(run_id) == (decisions1, trades1)             # no duplicated chain
+        assert any(r["stage"] == "resumed" for r in rows2)
+    finally:
+        with psycopg.connect(DSN) as c:
+            c.execute("DELETE FROM trades WHERE run_id = %s", (run_id,))
+            c.execute("DELETE FROM decisions WHERE run_id = %s", (run_id,))
+            c.commit()
+        _cleanup(sym)
+
+
 def test_reconcile_open_trades_closes_hit_trades_idempotently():
     from core.models import Direction
     from data_collector.providers.base import Candle

@@ -161,10 +161,16 @@ def evaluations_for(dsn: str, snapshot_id: int) -> list[dict]:
 
 def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, model: str,
                     record, ai_input: dict, ai_output: dict | None, mode: str,
-                    data_provider: str, tokens: dict | None = None) -> int:
+                    data_provider: str, tokens: dict | None = None,
+                    run_id: str | None = None, input_fingerprint: str | None = None) -> int:
     """Persist a DecisionRecord (decision/pipeline.py) with its reproducibility manifest and
     the FK to the authorizing evaluation. Never fabricates an approved verdict — the
-    risk_verdict comes straight from the record."""
+    risk_verdict comes straight from the record.
+
+    When `run_id` + `input_fingerprint` are given (shadow experiments), the insert is ATOMIC and
+    idempotent: ON CONFLICT (input_fingerprint, run_id) DO NOTHING, so two concurrent inserts
+    cannot both create a row; on conflict the EXISTING decision id is returned. run_id=None
+    (app/decide, live) is unconstrained (partial index)."""
     import psycopg
     from psycopg.types.json import Json
 
@@ -182,8 +188,10 @@ def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, mo
                  risk_verdict, risk_reason, ai_input, ai_output, prompt_tokens, output_tokens,
                  latency_ms, cache_hit, mode, prompt_version, output_schema_version,
                  feature_pipeline_version, strategy_version, risk_config_version, data_provider,
-                 input_hash, as_of)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 input_hash, as_of, run_id, input_fingerprint)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (input_fingerprint, run_id)
+                WHERE run_id IS NOT NULL AND input_fingerprint IS NOT NULL DO NOTHING
             RETURNING id
             """,
             (
@@ -198,11 +206,29 @@ def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, mo
                 manifest.get("prompt_version"), manifest.get("output_schema_version"),
                 manifest.get("feature_pipeline_version"), manifest.get("strategy_version"),
                 manifest.get("risk_config_version"), data_provider,
-                record.input_hash, record.as_of,
+                record.input_hash, record.as_of, run_id, input_fingerprint,
             ),
         ).fetchone()
+        if row is None:   # ON CONFLICT DO NOTHING -> the decision already exists for this run
+            row = conn.execute(
+                "SELECT id FROM decisions WHERE input_fingerprint = %s AND run_id = %s",
+                (input_fingerprint, run_id),
+            ).fetchone()
         conn.commit()
     return row[0]
+
+
+def find_decision_by_fingerprint(dsn: str, *, input_fingerprint: str, run_id: str) -> int | None:
+    """Dedupe-BEFORE-the-LLM key: has this frozen input already been decided in this run? Lets a
+    re-run RESUME without re-calling (re-paying) the model. Returns the decision id or None."""
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        row = conn.execute(
+            "SELECT id FROM decisions WHERE input_fingerprint = %s AND run_id = %s LIMIT 1",
+            (input_fingerprint, run_id),
+        ).fetchone()
+    return row[0] if row else None
 
 
 def open_shadow_trades(dsn: str, run_id: str) -> list[dict]:
@@ -274,9 +300,9 @@ def upsert_shadow_trade(dsn: str, *, decision_id: int, run_id: str, symbol: str,
         "spread_pct": trade.spread_pct, "spread_provenance": trade.spread_provenance,
         "slippage_pct": trade.slippage_pct,
         "modeled": ["spread", "gap_through_stop", "latency"]
-        + (["slippage"] if trade.slippage_pct > 0 else []),
+        + (["slippage"] if trade.slippage_pct != 0 else []),
         "not_modeled": ["commission", "swap"]
-        + ([] if trade.slippage_pct > 0 else ["slippage"]),
+        + ([] if trade.slippage_pct != 0 else ["slippage"]),
         "note": "commission/swap rate unknown here (no config) -> NOT net of real financing",
     }
     with psycopg.connect(dsn) as conn:

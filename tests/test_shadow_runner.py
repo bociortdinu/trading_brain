@@ -54,6 +54,25 @@ def test_single_position_gate_blocks_overlapping_entries():
     assert study["trades_opened"] == study["approved"] > gated["trades_opened"]
 
 
+def test_max_llm_calls_caps_a_paid_run():
+    """Financial guardrail: a paid maker is wrapped in _CountingMaker and the runner STOPS at
+    --max-llm-calls instead of spending across every bar."""
+    from shadow.runner import _CountingMaker
+
+    maker = _CountingMaker(ConfluenceStrategy())
+    rows = run(backtest_over_windows(
+        _windows(step=1.0), symbol="GOLD", provider_name="csv",
+        decision_maker=maker, modeled_spread_pct=0.02, max_llm_calls=5))
+    assert maker.calls == 5                                    # never exceeds the budget
+    assert rows[-1]["stage"] == "llm_cap_reached"              # stopped cleanly at the cap
+
+    uncapped = _CountingMaker(ConfluenceStrategy())
+    run(backtest_over_windows(
+        _windows(step=1.0), symbol="GOLD", provider_name="csv",
+        decision_maker=uncapped, modeled_spread_pct=0.02))
+    assert uncapped.calls > 5                                  # cap is what stopped the first run
+
+
 def test_backtest_no_lookahead_reconciles_only_future_bars():
     # Every reconciled trade closes strictly AFTER its entry bar (guaranteed by the reconciler);
     # here we just assert the runner yields outcomes and the metrics are net-of-spread finite.

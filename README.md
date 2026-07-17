@@ -66,8 +66,11 @@ BRAIN_DB_DSN='postgresql://user:pw@127.0.0.1:5433/trading_brain' python -m pytes
 |---|---|
 | `config/` | typed settings (Pydantic) |
 | `brokers_bridge/` | async HTTP client for the 7 trading_hands endpoints |
-| `data_collector/` | `MarketDataProvider` (Polygon/Massive, CSV) + strict candle/series validation + news (`as_of`) |
-| `features/` | indicators (numpy), regime/S-R engineering, MTF `FeaturePacket` |
+| `data_collector/` | `MarketDataProvider` (XTB real-time, Polygon/Massive, CSV) + strict candle/series validation + session calendars + news (`as_of`) |
+| `features/` | indicators (numpy), regime/S-R engineering, MTF `FeaturePacket`, eligibility |
 | `database/` | versioned `migrations/` + `migrate.py` (app role) + `bootstrap.py` (admin role) + `repository.py` |
-| `app/` | `smoke`, `collect`, `jobs` (M15 scheduler) |
-| `core/`, `brain/`, `risk_manager/`, `execution/`, `shadow/` | filled in Phases 2–5 |
+| `app/` | `smoke`, `collect`, `decide`, `jobs` (M15 scheduler) |
+| `decision/` | `schema` (strict I/O contract), `prefilter`, `llm_client` (Anthropic, fail-closed), `pipeline` |
+| `risk/` | `engine.py` — rigid gate + deterministic ATR-based SL/TP (never the LLM's job) |
+| `shadow/` | `virtual_broker`, `reconciler`, `runner` (backtest), `online` (continuous), `metrics` |
+| `core/` | shared models/enums |

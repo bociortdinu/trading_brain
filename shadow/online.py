@@ -31,7 +31,7 @@ from data_collector.providers.base import Candle
 from data_collector.providers.factory import build_provider
 from data_collector.session import calendar_for
 from database.repository import (
-    find_shadow_trade_by_input,
+    find_decision_by_fingerprint,
     insert_decision,
     insert_evaluation,
     insert_llm_call,
@@ -41,7 +41,7 @@ from database.repository import (
 )
 from decision.pipeline import run_decision
 from decision.prefilter import PrefilterConfig
-from decision.schema import build_decision_input
+from decision.schema import build_decision_input, decision_fingerprint
 from features.mtf import TRIGGER_TF
 from risk.engine import RiskConfig
 from shadow.reconciler import reconcile
@@ -92,21 +92,44 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     if not closes:
         return {"status": "no_bars"}
     as_of = closes[-1]
+    summary: dict = {"as_of": as_of.isoformat()}
+
+    # 1) RECONCILE FIRST: close any open trade the new bars just hit, BEFORE considering a new
+    #    entry — so we never stack a new position on one the same bars should have closed.
+    summary["reconciled_closed"] = reconcile_open_trades(
+        settings.db_dsn, windows[TRIGGER_TF], run_id=run_id, shadow_config=shadow_config)
+
+    # 2) POSITION GATE (matches the backtest): one position per run at a time. If a trade is
+    #    still open after reconciliation, do NOT decide or open another (also saves an LLM call).
+    if open_shadow_trades(settings.db_dsn, run_id):
+        summary["decision"] = "skipped:position_open"
+        return summary
+
     packet = build_packet_from_windows(
         windows, as_of, brain_symbol=brain_symbol, provider_name=provider_name,
         provider_symbol=provider_symbol, ingested_at=now,
     )
     spread_pct, basis = await observe_xtb_spread(settings, packet.price, packet.bar_close)
-    quote_time = None
+    quote_time = observed_at = None
     if basis is not None:
         packet = packet.model_copy(update={"spread_pct": spread_pct, "basis_observed": basis})
         if basis.get("quote_time"):
             quote_time = datetime.fromisoformat(basis["quote_time"])
+        if basis.get("observed_at"):
+            observed_at = datetime.fromisoformat(basis["observed_at"])
     eval_now = datetime.now(timezone.utc)
     result = compute_eligibility(windows, as_of, settings, mode="online", now=eval_now,
                                  quote_time=quote_time, provider_name=provider_name)
 
-    summary: dict = {"as_of": as_of.isoformat()}
+    # DEDUPE BEFORE THE (paid) LLM: if this exact input was already decided in this run (same M15
+    # bar reprocessed after a restart), skip — don't re-call the model or duplicate the audit.
+    fingerprint = decision_fingerprint(
+        input_hash=build_decision_input(packet, mode="online").input_hash(),
+        model=model_name, provider=provider_name, risk_config_version=RiskConfig().version)
+    if find_decision_by_fingerprint(settings.db_dsn, input_fingerprint=fingerprint, run_id=run_id) is not None:
+        summary["decision"] = "skipped:already_decided"
+        return summary
+
     status, snap_id = upsert_snapshot(settings.db_dsn, packet)
     summary["snapshot"] = f"{status}:{snap_id}"
     if snap_id is not None and status != "conflict":
@@ -121,32 +144,30 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
             summary["decision"] = f"llm_failed:{record.llm_error}"
         else:
             inp = build_decision_input(packet, mode="online")
+            # ATOMIC + idempotent on (input_fingerprint, run_id): a concurrent/duplicate insert
+            # returns the existing decision id instead of creating a second row.
             dec_id = insert_decision(
                 settings.db_dsn, snapshot_id=snap_id, evaluation_id=eval_id, model=model_name,
                 record=record, ai_input=inp.model_dump(mode="json"),
                 ai_output=record.decision.model_dump(mode="json") if record.decision else None,
-                mode="shadow", data_provider=provider_name,
+                mode="shadow", data_provider=provider_name, run_id=run_id,
+                input_fingerprint=fingerprint,
             )
             summary["decision"] = f"{record.stage}:{record.decision.direction.value if record.decision else '-'}"
-            # Idempotency: if this frozen input already produced a trade in this run (e.g. the
-            # same M15 bar reprocessed after a restart), don't open a duplicate.
-            already = find_shadow_trade_by_input(
-                settings.db_dsn, input_hash=record.input_hash, model=model_name, run_id=run_id)
-            if record.risk_approved and already is not None:
-                summary["opened_trade"] = f"exists:{already}"
-            elif record.risk_approved:
+            if record.risk_approved:
                 # Online: fill at the OBSERVED quote mid (captures real latency), not the bar close.
                 observed_mid = None
                 if basis is not None and basis.get("xtb_bid") and basis.get("xtb_ask"):
                     observed_mid = (basis["xtb_bid"] + basis["xtb_ask"]) / 2
-                # opened_at is the OBSERVATION time (when the quote was seen), NOT the bar close:
-                # reconciliation must not count M15 movement that happened before the real entry.
+                # opened_at is the LOCAL OBSERVATION time (basis.observed_at — when the brain saw
+                # the quote), not the broker tick time nor the bar close. The reconciler must not
+                # count M15 movement that happened before the real entry.
                 trade = open_virtual_trade(
                     record.decision.direction, observed_mid or packet.price,
                     record.risk.sl_pct, record.risk.tp_pct,
                     spread_pct=packet.spread_pct or settings.replay_spread_pct,
                     spread_provenance="observed_xtb" if packet.spread_pct else "modeled",
-                    slippage_pct=settings.slippage_pct, opened_at=quote_time or eval_now,
+                    slippage_pct=settings.slippage_pct, opened_at=observed_at or eval_now,
                 )
                 tid, _ = upsert_shadow_trade(
                     settings.db_dsn, decision_id=dec_id, run_id=run_id, symbol=brain_symbol,
@@ -155,8 +176,6 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
                 )
                 summary["opened_trade"] = tid
 
-    summary["reconciled_closed"] = reconcile_open_trades(
-        settings.db_dsn, windows[TRIGGER_TF], run_id=run_id, shadow_config=shadow_config)
     return summary
 
 

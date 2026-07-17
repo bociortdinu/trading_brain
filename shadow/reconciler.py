@@ -90,10 +90,11 @@ def _hits(trade: VirtualTrade, bar: Candle) -> tuple[bool, bool]:
 
 
 def _post_entry_bars(trade: VirtualTrade, bars: list[Candle]) -> list[Candle]:
-    """Anti look-ahead: only bars that OPEN at/after the entry may resolve the trade. The
-    first eligible bar is the one whose open_time == opened_at (the bar that opens exactly at
-    the decision bar's close). Enforces strict time ordering and rejects duplicates."""
-    usable = [b for b in bars if b.open_time >= trade.opened_at]
+    """Anti look-ahead: only bars that extend PAST the entry may resolve the trade (close_time >
+    opened_at). This keeps the fully-post-entry bars AND the single PARTIAL bar the entry landed
+    inside (open_time < opened_at < close_time) — the caller handles that one conservatively. The
+    decision bar itself (close_time == opened_at) is excluded. Strictly increasing; no duplicates."""
+    usable = [b for b in bars if b.close_time > trade.opened_at]
     prev = None
     for b in usable:
         if prev is not None and b.open_time <= prev.open_time:
@@ -109,6 +110,22 @@ def reconcile(trade: VirtualTrade, bars: list[Candle], config: ShadowConfig | No
     for i, bar in enumerate(_post_entry_bars(trade, bars)):
         sl_hit, tp_hit = _hits(trade, bar)
         extra = _extra_cost(trade, config, bar.close_time)  # commission + swap for holding to here
+
+        # PARTIAL entry bar (entry landed mid-bar): its OHLC mixes pre-/post-entry movement. Be
+        # conservative — a stop touch still closes (pessimistic), but a TP-only touch is NOT
+        # credited (deferred to a fully-post-entry bar). Fully-post-entry bars fall through.
+        if config.conservative_partial_entry and bar.open_time < trade.opened_at:
+            if sl_hit:
+                fill = _exit_fill(trade, _stop_exit_ref(trade, bar))
+                r = _r_net(trade, fill, extra)
+                return Outcome(status="closed", exit_reason="sl_hit", exit_price=round(fill, 4),
+                               closed_at=bar.close_time, r_multiple=r, r_pessimistic=r, r_optimistic=r)
+            if i + 1 >= config.timeout_bars:
+                fill = _exit_fill(trade, bar.close)
+                r = _r_net(trade, fill, extra)
+                return Outcome(status="expired", exit_reason="timeout", exit_price=round(fill, 4),
+                               closed_at=bar.close_time, r_multiple=r, r_pessimistic=r, r_optimistic=r)
+            continue   # no stop on the partial bar -> hold; do not credit a partial-bar TP
 
         if sl_hit and tp_hit:
             sl_fill = _exit_fill(trade, _stop_exit_ref(trade, bar))   # gap-through + slippage

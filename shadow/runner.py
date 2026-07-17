@@ -24,7 +24,11 @@ from data_collector.providers.factory import build_provider
 from data_collector.session import calendar_for
 from decision.pipeline import run_decision
 from decision.prefilter import PrefilterConfig
-from decision.schema import DecisionOutput, build_decision_input
+from decision.schema import (
+    DecisionOutput,
+    build_decision_input,
+    decision_fingerprint,
+)
 from features.eligibility import EligibilityConfig, evaluate_eligibility
 from features.engineering import MIN_BARS
 from features.mtf import TRIGGER_TF, build_feature_packet
@@ -44,6 +48,24 @@ class ConfluenceStrategy:
         if inp.confluence == "aligned_bear":
             return DecisionOutput(direction=Direction.SELL, confidence=0.7, rationale="aligned_bear")
         return DecisionOutput(direction=Direction.NO_TRADE, confidence=0.5, rationale="not aligned")
+
+
+class _CountingMaker:
+    """Wraps a maker to COUNT real decide() calls — the guardrail the runner uses to enforce a
+    hard `--max-llm-calls` budget on paid runs (fail-closed: the loop stops before overspending).
+    Delegates last_result so llm_calls are still persisted."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.calls = 0
+
+    async def decide(self, inp):
+        self.calls += 1
+        return await self.inner.decide(inp)
+
+    @property
+    def last_result(self):
+        return getattr(self.inner, "last_result", None)
 
 
 def _slice(windows: dict[str, list[Candle]], as_of: datetime) -> dict[str, list[Candle]]:
@@ -72,6 +94,7 @@ async def backtest_over_windows(
     min_bars: int = MIN_BARS,
     single_position: bool = True,   # one position at a time (executable); False = event-study
     cooldown_bars: int = 0,         # extra bars to wait AFTER a trade closes before re-entry
+    max_llm_calls: int | None = None,  # hard cap on decide() calls (paid runs); None = unlimited
     persist_dsn: str | None = None,
     run_id: str | None = None,
     model_name: str = "deterministic-confluence",
@@ -95,6 +118,7 @@ async def backtest_over_windows(
     # new entries while a trade is open, plus an optional cooldown after it closes.
     busy_until = None  # datetime: no new entry strictly before this (open trade + cooldown)
     bar_seconds = _bar_seconds(m15)
+    counting = isinstance(decision_maker, _CountingMaker)
     for as_of in (c.close_time for c in m15):
         sliced = _slice(windows, as_of)
         if any(len(sliced.get(tf, [])) < min_bars for tf in windows):
@@ -105,12 +129,41 @@ async def backtest_over_windows(
         )
         elig = evaluate_eligibility(sliced, TRIGGER_TF, as_of, mode="replay", now=as_of,
                                     config=eligibility_config, calendar=calendar)
+
+        # DEDUPE BEFORE THE (paid) LLM: if this frozen input was already decided in this run,
+        # RESUME — reuse the persisted decision/trade and never re-call the model.
+        fingerprint = None
+        if persist_dsn and run_id:
+            from database.repository import find_decision_by_fingerprint
+            fingerprint = decision_fingerprint(
+                input_hash=build_decision_input(packet, mode="replay").input_hash(),
+                model=model_name, provider=provider_name, risk_config_version=risk_config.version)
+            if find_decision_by_fingerprint(persist_dsn, input_fingerprint=fingerprint,
+                                            run_id=run_id) is not None:
+                out.append({"as_of": as_of, "stage": "resumed", "direction": "NO_TRADE",
+                            "approved": False, "blocked": None, "outcome": None})
+                continue
+        # HARD LLM BUDGET: stop cleanly before exceeding the cap (fail-closed on paid runs).
+        if counting and max_llm_calls is not None and decision_maker.calls >= max_llm_calls:
+            out.append({"as_of": as_of, "stage": "llm_cap_reached", "direction": "NO_TRADE",
+                        "approved": False, "blocked": None, "outcome": None})
+            break
+
         rec = await run_decision(packet, elig, decision_maker, mode="replay",
                                  prefilter_config=prefilter_config, risk_config=risk_config,
                                  calendar=calendar)
+        llm_result = getattr(decision_maker, "last_result", None)
         row = {"as_of": as_of, "stage": rec.stage,
                "direction": rec.decision.direction.value if rec.decision else "NO_TRADE",
                "approved": rec.risk_approved, "blocked": None, "outcome": None}
+
+        # Persist EVERY decided bar (not only approved ones) so a paid re-run resumes past
+        # NO_TRADE/rejected bars too — the LLM was called for them, so they must be deduped.
+        dec_id = None
+        if persist_dsn and run_id and rec.stage == "decided":
+            dec_id = _persist_decision(persist_dsn, run_id, model_name, symbol, provider_name,
+                                       packet, elig, rec, fingerprint=fingerprint,
+                                       llm_result=llm_result)
         if rec.risk_approved:
             if single_position and busy_until is not None and as_of < busy_until:
                 row["blocked"] = "position_open"   # approved but not tradeable -> not a trade
@@ -128,39 +181,42 @@ async def backtest_over_windows(
             if single_position:
                 closed_at = o.closed_at or (future[-1].close_time if future else as_of)
                 busy_until = closed_at + timedelta(seconds=bar_seconds * cooldown_bars)
-            if persist_dsn and run_id:
-                _persist_chain(persist_dsn, run_id, model_name, symbol, provider_name,
-                               packet, elig, rec, trade, o, shadow_config)
+            if dec_id is not None:
+                _persist_trade(persist_dsn, run_id, symbol, dec_id, trade, o, shadow_config)
         out.append(row)
     return out
 
 
-def _persist_chain(dsn, run_id, model_name, symbol, provider_name, packet, elig, rec, trade,
-                   outcome, shadow_config) -> None:
-    """Write snapshot -> evaluation -> decision -> trade for one approved backtest trade."""
+def _persist_decision(dsn, run_id, model_name, symbol, provider_name, packet, elig, rec, *,
+                      fingerprint, llm_result) -> int | None:
+    """Write snapshot -> evaluation -> decision (+ the LLM call, if any) for one decided bar.
+    ATOMIC/idempotent on (input_fingerprint, run_id) via insert_decision's ON CONFLICT. Returns
+    the decision id, or None if the snapshot wasn't usable."""
     from database.repository import (
-        find_shadow_trade_by_input, insert_decision, insert_evaluation, upsert_shadow_trade,
-        upsert_snapshot,
+        insert_decision, insert_evaluation, insert_llm_call, upsert_snapshot,
     )
-    from shadow.virtual_broker import cost_manifest
 
-    # END-TO-END IDEMPOTENCY: re-running a backtest with the same run_id must NOT duplicate the
-    # chain. Each run mints a new decision_id, so UNIQUE(decision_id, run_id) can't dedupe — we
-    # dedupe on the frozen input (input_hash + model) within this run_id and skip if it exists.
-    if find_shadow_trade_by_input(dsn, input_hash=rec.input_hash, model=model_name,
-                                  run_id=run_id) is not None:
-        return
     status, snap_id = upsert_snapshot(dsn, packet)
     if snap_id is None or status == "conflict":
-        return
+        return None
+    if llm_result is not None:   # persist the paid API call (success or failure) for audit
+        insert_llm_call(dsn, llm_result, snapshot_id=snap_id)
     eval_id = insert_evaluation(dsn, snap_id, elig)
     inp = build_decision_input(packet, mode="replay")
-    dec_id = insert_decision(
+    return insert_decision(
         dsn, snapshot_id=snap_id, evaluation_id=eval_id, model=model_name, record=rec,
         ai_input=inp.model_dump(mode="json"),
         ai_output=rec.decision.model_dump(mode="json") if rec.decision else None,
-        mode="shadow", data_provider=provider_name,
+        mode="shadow", data_provider=provider_name, run_id=run_id, input_fingerprint=fingerprint,
     )
+
+
+def _persist_trade(dsn, run_id, symbol, dec_id, trade, outcome, shadow_config) -> None:
+    """Upsert the shadow trade for an approved, decided bar (idempotent on (decision_id, run_id),
+    monotone: a closed trade is never reopened)."""
+    from database.repository import upsert_shadow_trade
+    from shadow.virtual_broker import cost_manifest
+
     upsert_shadow_trade(
         dsn, decision_id=dec_id, run_id=run_id, symbol=symbol, trade=trade, outcome=outcome,
         timeframe=TRIGGER_TF, timeout_bars=shadow_config.timeout_bars,
@@ -187,20 +243,47 @@ def report(rows: list[dict]) -> dict:
 
 def _build_maker(settings, kind: str):
     """deterministic = free ConfluenceStrategy; claude = the real paid AnthropicDecisionMaker
-    (a full backtest is a BATCH of API calls — costs real money). Returns (maker, model_name)."""
+    (wrapped in _CountingMaker so the runner can enforce a hard call cap). Returns
+    (maker, model_name, is_paid)."""
     if kind == "deterministic":
-        return ConfluenceStrategy(), "deterministic-confluence"
+        return ConfluenceStrategy(), "deterministic-confluence", False
     if kind == "claude":
         if not settings.anthropic_api_key:
             raise SystemExit("--maker claude needs BRAIN_ANTHROPIC_API_KEY (real, paid API calls)")
         from decision.llm_client import AnthropicDecisionMaker
-        maker = AnthropicDecisionMaker(settings.anthropic_api_key, settings.decision_model,
+        inner = AnthropicDecisionMaker(settings.anthropic_api_key, settings.decision_model,
                                        max_tokens=settings.decision_max_tokens)
-        return maker, settings.decision_model
+        return _CountingMaker(inner), settings.decision_model, True
     raise SystemExit(f"unknown maker {kind!r} (expected deterministic|claude)")
 
 
-async def _run(settings, *, count: int, run_id: str | None, maker_kind: str = "deterministic") -> None:
+def _confirm_paid_run(model: str, max_calls: int, max_tokens: int, assume_yes: bool) -> None:
+    """Fail-closed cost gate for a paid backtest: print a WORST-CASE cost estimate and require an
+    explicit confirmation (interactive y/N, or --yes). Never spends money silently."""
+    from decision.llm_client import _PRICES
+
+    pin, pout = _PRICES.get(model, (5.0e-6, 25.0e-6))   # default to Opus-tier (conservative)
+    # worst case: every call sends a full prompt (~max_tokens in) and fills max_tokens out.
+    est = max_calls * (max_tokens * pin + max_tokens * pout)
+    print(f"[paid run] maker=claude model={model} max_llm_calls={max_calls} "
+          f"-> worst-case ~${est:.2f} (dedupe/resume + prefilter usually make it far less).")
+    if assume_yes:
+        print("[paid run] --yes given; proceeding.")
+        return
+    try:
+        reply = input("Proceed with PAID API calls? [y/N] ").strip().lower()
+    except EOFError:
+        reply = ""
+    if reply not in ("y", "yes"):
+        raise SystemExit("aborted (no confirmation).")
+
+
+async def _run(settings, *, count: int, run_id: str | None, maker_kind: str = "deterministic",
+               max_llm_calls: int = 50, assume_yes: bool = False) -> None:
+    maker, model_name, is_paid = _build_maker(settings, maker_kind)
+    if is_paid:
+        _confirm_paid_run(model_name, max_llm_calls, settings.decision_max_tokens, assume_yes)
+
     provider = build_provider(settings)
     symbol = settings.symbol_query
     provider_symbol = settings.provider_symbol(symbol)
@@ -211,20 +294,28 @@ async def _run(settings, *, count: int, run_id: str | None, maker_kind: str = "d
         aclose = getattr(provider, "aclose", None)
         if aclose:
             await aclose()
-    maker, model_name = _build_maker(settings, maker_kind)
-    rows = await backtest_over_windows(
-        windows, symbol=symbol, provider_name=settings.market_data_provider,
-        decision_maker=maker, modeled_spread_pct=settings.replay_spread_pct,
-        slippage_pct=settings.slippage_pct, model_name=model_name,
-        shadow_config=ShadowConfig(commission_pct=settings.commission_pct,
-                                   swap_pct_per_night=settings.swap_pct_per_night),
-        persist_dsn=settings.db_dsn if run_id else None, run_id=run_id,
-    )
+    try:
+        rows = await backtest_over_windows(
+            windows, symbol=symbol, provider_name=settings.market_data_provider,
+            decision_maker=maker, modeled_spread_pct=settings.replay_spread_pct,
+            slippage_pct=settings.slippage_pct, model_name=model_name,
+            max_llm_calls=max_llm_calls if is_paid else None,
+            shadow_config=ShadowConfig(commission_pct=settings.commission_pct,
+                                       swap_pct_per_night=settings.swap_pct_per_night),
+            persist_dsn=settings.db_dsn if run_id else None, run_id=run_id,
+        )
+    finally:
+        # ALWAYS close the Anthropic client (even on error/cap) so we don't leak the connection.
+        maker_aclose = getattr(getattr(maker, "inner", None), "aclose", None)
+        if maker_aclose:
+            await maker_aclose()
     rep = report(rows)
+    calls = getattr(maker, "calls", 0)
     print(f"[backtest] provider={settings.market_data_provider} symbol={symbol} "
           f"bars_evaluated={rep['bars_evaluated']} prefiltered_out={rep['prefiltered_out']} "
           f"approved={rep['approved']} blocked_position_open={rep['blocked_position_open']} "
-          f"trades_opened={rep['trades_opened']}" + (f" persisted run_id={run_id}" if run_id else ""))
+          f"trades_opened={rep['trades_opened']} llm_calls={calls}"
+          + (f" persisted run_id={run_id}" if run_id else ""))
     print(f"[metrics] {rep['metrics']}")
 
 
@@ -239,11 +330,15 @@ def main() -> int:
     parser.add_argument("--run-id", help="experiment id for persisted trades (default: timestamped)")
     parser.add_argument("--maker", choices=["deterministic", "claude"], default="deterministic",
                         help="decision maker: deterministic (free) or claude (paid API batch)")
+    parser.add_argument("--max-llm-calls", type=int, default=50,
+                        help="hard cap on paid decide() calls (--maker claude); stops cleanly at it")
+    parser.add_argument("--yes", action="store_true", help="skip the paid-run confirmation prompt")
     args = parser.parse_args()
     run_id = None
     if args.persist:
         run_id = args.run_id or f"backtest-{args.maker}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
-    asyncio.run(_run(load_settings(), count=args.count, run_id=run_id, maker_kind=args.maker))
+    asyncio.run(_run(load_settings(), count=args.count, run_id=run_id, maker_kind=args.maker,
+                     max_llm_calls=args.max_llm_calls, assume_yes=args.yes))
     return 0
 
 

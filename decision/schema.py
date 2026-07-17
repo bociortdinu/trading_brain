@@ -87,6 +87,18 @@ class DecisionInput(BaseModel):
         return hashlib.sha256(self.canonical().encode()).hexdigest()
 
 
+def decision_fingerprint(*, input_hash: str, model: str, provider: str,
+                         prompt_version: str = DECISION_PROMPT_VERSION,
+                         strategy_version: str = STRATEGY_VERSION,
+                         risk_config_version: str) -> str:
+    """Run-scoped decision identity for idempotency: the SAME frozen input decided by the SAME
+    model + prompt + strategy + risk config + data provider is the SAME decision. Changing any
+    of these (a new prompt, a different provider) is a DIFFERENT decision and must NOT be
+    deduped against the old one. Hashed so it fits a single indexed column."""
+    parts = [input_hash, model, provider, prompt_version, strategy_version, risk_config_version]
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+
 class DecisionOutput(BaseModel):
     """The LLM's structured decision. STRICT: only BUY/SELL/NO_TRADE, confidence in [0,1]
     (ORDINAL), non-empty rationale. Extra fields rejected (no smuggled SL/TP/size)."""
