@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel
 
 from core.models import Direction
-from data_collector.providers.base import Candle
+from data_collector.providers.base import Candle, timeframe_minutes
 from shadow.virtual_broker import ShadowConfig, VirtualTrade, swap_rate_for
 
 
@@ -42,6 +42,8 @@ def _rollovers(opened_at: datetime, closed_at: datetime, rollover_hour: int,
     - DST-aware: a boundary is `rollover_hour` o'clock in `tz` (default UTC == literal 22:00 UTC,
       the legacy behaviour). With a real IANA tz the wall-clock hour is fixed and the UTC instant
       shifts across DST, so we iterate one LOCAL calendar day at a time.
+    - Weekend: gold trades ~Sun->Fri, so no swap is charged on a Saturday or Sunday rollover — the
+      weekend carry is folded into the triple-swap day (double-counting Sat AND Sun was a bug).
     - Triple-swap: a boundary whose local date's weekday equals `triple_weekday` (0=Mon..6=Sun)
       counts 3x — the standard weekend value-date roll (typically Wednesday). Off when None.
     """
@@ -61,7 +63,14 @@ def _rollovers(opened_at: datetime, closed_at: datetime, rollover_hour: int,
         b = boundary_on(day)
     total = 0.0
     while b < close_local:
-        total += 3.0 if (triple_weekday is not None and b.weekday() == triple_weekday) else 1.0
+        wd = b.weekday()
+        if wd >= 5:                          # Sat (5) / Sun (6): market closed, no swap charged
+            weight = 0.0
+        elif triple_weekday is not None and wd == triple_weekday:
+            weight = 3.0
+        else:
+            weight = 1.0
+        total += weight
         day += timedelta(days=1)
         b = boundary_on(day)
     return total
@@ -126,21 +135,44 @@ def _post_entry_bars(trade: VirtualTrade, bars: list[Candle]) -> list[Candle]:
     return usable
 
 
-def choose_reconcile_bars(fine: list[Candle], coarse: list[Candle], *, want_tf: str,
-                          trigger_tf: str) -> tuple[list[Candle], str, bool]:
-    """Pick the bars to reconcile against. Prefer the FINER bars (e.g. M1) for intrabar SL/TP
-    ordering when they are actually available; otherwise fall back to the trigger-timeframe bars
-    and flag it, so the stored outcome records the granularity that ACTUALLY produced the R.
+def _finer_covers(fine: list[Candle], coarse: list[Candle], opened_at: datetime,
+                  recon_minutes: int) -> bool:
+    """True iff the finer bars CONTINUOUSLY cover a trade's window: starting at/before entry, with
+    no gaps, and reaching at least as far as the coarse bars. If they don't, an SL/TP touch could
+    hide in a gap while the coarse bar would have shown it — so the finer feed must NOT be used."""
+    fpost = [b for b in fine if b.close_time > opened_at]
+    if not fpost:
+        return False
+    if fpost[0].open_time > opened_at:                     # gap between entry and the first finer bar
+        return False
+    step = timedelta(minutes=recon_minutes)
+    for a, b in zip(fpost, fpost[1:]):
+        if b.open_time - a.open_time > step:               # gap in the middle
+            return False
+    cpost = [b for b in coarse if b.close_time > opened_at]
+    if cpost and fpost[-1].close_time < cpost[-1].close_time:   # finer ends before coarse -> misses the tail
+        return False
+    return True
 
-    Returns (bars, timeframe_used, fell_back)."""
-    if want_tf != trigger_tf and fine:
+
+def select_reconcile_bars_for_trade(fine: list[Candle], coarse: list[Candle], *, opened_at: datetime,
+                                    want_tf: str, trigger_tf: str) -> tuple[list[Candle], str, bool]:
+    """Choose the bars to reconcile ONE trade against. Use the finer bars only when they actually,
+    continuously cover this trade's window (see `_finer_covers`); otherwise fall back to the
+    trigger timeframe and flag it. Returns (bars, timeframe_used, fell_back)."""
+    if (want_tf != trigger_tf and fine
+            and _finer_covers(fine, coarse, opened_at, timeframe_minutes(want_tf))):
         return fine, want_tf, False
-    fell_back = want_tf != trigger_tf     # wanted finer resolution, didn't get it
-    return coarse, trigger_tf, fell_back
+    return coarse, trigger_tf, (want_tf != trigger_tf)
 
 
 def reconcile(trade: VirtualTrade, bars: list[Candle], config: ShadowConfig | None = None) -> Outcome:
     config = config or ShadowConfig()
+    # `timeout_bars` is a horizon in the TRIGGER timeframe (a fixed DURATION). Convert it to a
+    # threshold in the CURRENT bar stream so the hold horizon is invariant to reconcile granularity
+    # — otherwise 96 bars is ~24h on M15 but only 96 minutes on M1.
+    timeout_threshold = config.timeout_bars * (
+        timeframe_minutes(config.trigger_timeframe) / timeframe_minutes(config.reconcile_timeframe))
     for i, bar in enumerate(_post_entry_bars(trade, bars)):
         sl_hit, tp_hit = _hits(trade, bar)
         extra = _extra_cost(trade, config, bar.close_time)  # commission + swap for holding to here
@@ -159,7 +191,7 @@ def reconcile(trade: VirtualTrade, bars: list[Candle], config: ShadowConfig | No
                 r = _r_net(trade, fill, extra)
                 return Outcome(status="closed", exit_reason="sl_hit", exit_price=round(fill, 4),
                                closed_at=bar.close_time, r_multiple=r, r_pessimistic=r, r_optimistic=r)
-            if i + 1 >= config.timeout_bars:
+            if i + 1 >= timeout_threshold:
                 fill = _exit_fill(trade, bar.close)
                 r = _r_net(trade, fill, extra)
                 return Outcome(status="expired", exit_reason="timeout", exit_price=round(fill, 4),
@@ -186,7 +218,7 @@ def reconcile(trade: VirtualTrade, bars: list[Candle], config: ShadowConfig | No
             return Outcome(status="closed", exit_reason="sl_hit", exit_price=round(fill, 4),
                            closed_at=bar.close_time, r_multiple=r, r_pessimistic=r, r_optimistic=r)
 
-        if i + 1 >= config.timeout_bars:  # no touch within the horizon -> time-based exit
+        if i + 1 >= timeout_threshold:  # no touch within the horizon -> time-based exit
             fill = _exit_fill(trade, bar.close)
             r = _r_net(trade, fill, extra)
             return Outcome(status="expired", exit_reason="timeout", exit_price=round(fill, 4),

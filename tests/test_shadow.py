@@ -186,12 +186,15 @@ def test_gap_through_stop_fills_worse_than_the_stop():
 # --------------------------------------------------------------------------- #
 # commission + overnight swap
 # --------------------------------------------------------------------------- #
-def test_rollovers_counts_nights_held():
+def test_rollovers_counts_weekday_nights_and_skips_weekends():
     from shadow.reconciler import _rollovers
-    o = datetime(2026, 7, 10, 20, tzinfo=UTC)
-    assert _rollovers(o, datetime(2026, 7, 10, 21, tzinfo=UTC), 22) == 0   # before 22:00
-    assert _rollovers(o, datetime(2026, 7, 10, 23, tzinfo=UTC), 22) == 1   # crossed 22:00
-    assert _rollovers(o, datetime(2026, 7, 12, 23, tzinfo=UTC), 22) == 3   # three nights
+    mon = datetime(2026, 7, 13, 20, tzinfo=UTC)                            # Monday
+    assert _rollovers(mon, datetime(2026, 7, 13, 21, tzinfo=UTC), 22) == 0   # before 22:00
+    assert _rollovers(mon, datetime(2026, 7, 13, 23, tzinfo=UTC), 22) == 1   # crossed Mon 22:00
+    assert _rollovers(mon, datetime(2026, 7, 15, 23, tzinfo=UTC), 22) == 3   # Mon+Tue+Wed nights
+    # Held across a weekend: no swap is charged on Sat/Sun (the weekend carry is the triple day).
+    fri = datetime(2026, 7, 10, 20, tzinfo=UTC)                            # Friday
+    assert _rollovers(fri, datetime(2026, 7, 13, 12, tzinfo=UTC), 22) == 1   # only Fri; Sat+Sun skipped
 
 
 def test_commission_reduces_r():
@@ -336,12 +339,37 @@ def test_reconcile_timeframe_is_part_of_the_execution_fingerprint():
     assert h15 != h1
 
 
-def test_choose_reconcile_bars_prefers_fine_else_falls_back():
-    from shadow.reconciler import choose_reconcile_bars
-    fine, coarse = ["m1"], ["m15"]
-    assert choose_reconcile_bars(fine, coarse, want_tf="1min", trigger_tf="15min") == (fine, "1min", False)
-    assert choose_reconcile_bars([], coarse, want_tf="1min", trigger_tf="15min") == (coarse, "15min", True)
-    assert choose_reconcile_bars(fine, coarse, want_tf="15min", trigger_tf="15min") == (coarse, "15min", False)
+def test_finer_bars_used_only_with_continuous_coverage_else_fall_back():
+    """An M1 series that does not cover the trade from entry (a gap where an SL could hide) must
+    NOT be used — fall back to M15. Full contiguous coverage is used."""
+    from shadow.reconciler import select_reconcile_bars_for_trade
+    opened = datetime(2026, 7, 10, 20, 0, tzinfo=UTC)
+    m15 = [_c(4000, 4030, 3980, 4020, opened, 15)]
+    late_m1 = [_c(4000, 4001, 3999, 4000, opened + timedelta(minutes=5), 1)]   # starts AFTER entry
+    bars, tf, fell = select_reconcile_bars_for_trade(late_m1, m15, opened_at=opened,
+                                                     want_tf="1min", trigger_tf="15min")
+    assert (tf, fell) == ("15min", True)                          # gap at start -> fall back
+    good_m1 = [_c(4000, 4001, 3999, 4000, opened + timedelta(minutes=i), 1) for i in range(15)]
+    bars, tf, fell = select_reconcile_bars_for_trade(good_m1, m15, opened_at=opened,
+                                                     want_tf="1min", trigger_tf="15min")
+    assert (bars, tf, fell) == (good_m1, "1min", False)           # full coverage -> use M1
+    # not wanting finer -> coarse, no fallback
+    assert select_reconcile_bars_for_trade([], m15, opened_at=opened,
+                                           want_tf="15min", trigger_tf="15min") == (m15, "15min", False)
+
+
+def test_timeout_is_a_fixed_duration_across_reconcile_granularity():
+    """timeout_bars is a TRIGGER-timeframe horizon (~24h at 96 M15 bars). Reconciling at M1 must
+    NOT expire the trade after 96 M1 bars (=96 min) — the horizon scales to 1440 M1 bars."""
+    opened = datetime(2026, 7, 10, 20, 0, tzinfo=UTC)
+    trade = open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6, spread_pct=0.0,
+                               spread_provenance="modeled", opened_at=opened)
+    flat_m1 = [_c(4000, 4001, 3999, 4000, opened + timedelta(minutes=i), 1) for i in range(200)]
+    o = reconcile(trade, flat_m1, ShadowConfig(reconcile_timeframe="1min", trigger_timeframe="15min"))
+    assert o.status == "open"                                     # 200 min < 24h horizon
+    flat_m15 = [_c(4000, 4001, 3999, 4000, opened + timedelta(minutes=15 * i), 15) for i in range(100)]
+    o15 = reconcile(trade, flat_m15, ShadowConfig())
+    assert o15.status == "expired" and o15.exit_reason == "timeout"   # M15 behaviour unchanged
 
 
 def test_reconcile_timeframe_survives_recovery():

@@ -55,6 +55,9 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+    # The dashboard probes trading_hands (`/status`) on the host, so it needs host-gateway too.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - 127.0.0.1:${BRAIN_DASHBOARD_PORT:-8080}:8080
     restart: unless-stopped

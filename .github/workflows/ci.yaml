@@ -121,6 +121,12 @@ jobs:
       - name: Create + migrate the source runtime DB
         run: python -m database.bootstrap && python -m database.migrate
 
+      - name: Insert a sentinel row (real data incl. a JSONB payload) into the source
+        run: |
+          psql "$SRC_DSN" -v ON_ERROR_STOP=1 -c \
+            "INSERT INTO run_manifests (run_id, manifest_hash, manifest) \
+             VALUES ('ci-sentinel', 'deadbeef', '{\"sentinel\": true, \"n\": 42}'::jsonb)"
+
       - name: Back up the source DB
         run: BACKUP_DIR="$RUNNER_TEMP/backups" scripts/db_backup.sh "$SRC_DSN"
 
@@ -132,9 +138,13 @@ jobs:
           dump="$(ls -1t "$RUNNER_TEMP"/backups/trading_brain_*.dump | head -1)"
           scripts/db_restore.sh "$DST_DSN" "$dump"
 
-      - name: Verify the restore (applied-migration count matches, and is non-zero)
+      - name: Verify the restore (migrations match, and the sentinel data round-trips)
         run: |
           src="$(psql "$SRC_DSN" -tAc 'SELECT count(*) FROM schema_migrations')"
           dst="$(psql "$DST_DSN" -tAc 'SELECT count(*) FROM schema_migrations')"
           echo "migrations: source=$src restored=$dst"
           test "$src" = "$dst" && test "$src" -gt 0
+          # the JSONB payload survived
+          n="$(psql "$DST_DSN" -tAc "SELECT manifest->>'n' FROM run_manifests WHERE run_id='ci-sentinel'")"
+          echo "sentinel manifest.n=$n"
+          test "$n" = "42"

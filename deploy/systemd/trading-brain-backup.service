@@ -5,12 +5,16 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-# Adjust to your install. Keep the DSN in the EnvironmentFile (chmod 0600), never on the cmdline.
+# Run as a dedicated non-root user (create it: `useradd --system --no-create-home trading_brain`).
+# It must OWN /etc/trading_brain/backup.env (chmod 0600) and /var/backups/trading_brain.
+User=trading_brain
+Group=trading_brain
 WorkingDirectory=/opt/trading_brain
 EnvironmentFile=/etc/trading_brain/backup.env
 ExecStart=/opt/trading_brain/scripts/db_backup.sh
 # Least privilege for a backup job.
 NoNewPrivileges=true
 ProtectSystem=strict
+ProtectHome=true
 ReadWritePaths=/var/backups/trading_brain
 PrivateTmp=true

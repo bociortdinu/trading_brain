@@ -105,20 +105,25 @@ iar testele nu mai scriu în baza operațională.
 
 ### P0 — realismul măsurării
 
-1. **Costuri reale GOLD.** **Modelul e livrat** ([shadow/virtual_broker.py](../shadow/virtual_broker.py)
+1. **Costuri reale GOLD.** **Structura e livrată** ([shadow/virtual_broker.py](../shadow/virtual_broker.py)
    + [shadow/reconciler.py](../shadow/reconciler.py)): swap **long/short** separat, **ziua de
-   triple-swap** (×3), rollover **DST-aware** (oră locală într-un IANA tz), **valuta** și **versiunea
-   termenilor** persistate, totul **înghețat la deschiderea trade-ului** (`cost_manifest` →
-   `shadow_config_from_costs`, parte din execution hash; test dedicat). **Rămâne** doar să se
-   *citească specificația reală a contului* și să se seteze ratele (default 0/`unset` → manifestul
-   spune onest că R nu e net de finanțare până când sunt cablate).
-2. **Reconciliere M1 sau ticks.** **Suportat:** `reconcile_timeframe` în `ShadowConfig` (default
-   `15min`, setabil `1min`) — reconciliatorul ordonează atingerile SL/TP la M1 și **rezolvă banda
-   de ambiguitate** când există bare M1 (test dedicat). Bucla online cere M1 doar pentru
-   reconciliere, cu **fallback onest** la M15 (marcat pe trade) dacă providerul nu-l servește;
-   granularitatea reală și `reconcile_fallback` sunt persistate, iar `reconcile_timeframe` intră în
-   fingerprint. **Rămâne:** un provider care servește M1 **continuu** (și *ticks* pentru latență/
-   slippage — încă viitor); backtest-ul rulează încă pe M15 (volumul M1 istoric nu e cablat).
+   triple-swap** (×3), **weekend-urile sărite** (fără swap Sâmbătă/Duminică), rollover **DST-aware**
+   (oră locală într-un IANA tz), **valuta** și **versiunea termenilor** persistate, totul **înghețat
+   la deschiderea trade-ului** (`cost_manifest` → `shadow_config_from_costs`, parte din execution
+   hash; teste dedicate). **Rămâne / de validat:** (a) *citirea specificației reale a contului* și
+   setarea ratelor (default 0/`unset` → manifestul spune onest că R nu e net de finanțare); (b)
+   **normalizarea unității/semnului** — modelul presupune **% din notional/preț**, dar XTB poate cota
+   swap-ul în **puncte/valută de cont** (de convertit înainte de a te încrede în expectancy);
+   `swap_currency` e doar informativ, nu există import automat din specificație.
+2. **Reconciliere M1 sau ticks.** **Suportat end-to-end:** `reconcile_timeframe` în `ShadowConfig`
+   (default `15min`, setabil `1min`) — reconciliatorul ordonează atingerile SL/TP la M1 și **rezolvă
+   banda de ambiguitate**; timeout-ul e o **durată** (invariant la granularitate, nu 96 minute pe M1);
+   M1 se folosește doar dacă **acoperă continuu** trade-ul de la intrare (altfel un SL din gol ar fi
+   ratat → fallback la M15, marcat per trade). **Limitare reală:** **XTB nu servește M1 azi**
+   ([xtb.py](../data_collector/providers/xtb.py) + trading_hands acceptă doar M15/H1/H4/D1), deci pe
+   calea online XTB **cade mereu pe M15** — funcțional doar cu un provider care servește M1 (ex.
+   Polygon) sau după ce se adaugă M1 în trading_hands. Backtest-ul rulează pe M15; *ticks* pentru
+   latență/slippage rămân viitor.
 3. **Track record shadow verificat.** Rulează continuu pe date XTB, cu manifest curat, în mai multe
    regimuri de piață. Raportează număr de trade-uri, expectancy și drawdown cu intervale de
    încredere; nu promova pe baza unui singur punct estimat.
@@ -188,7 +193,10 @@ existe. Codul verde demonstrează consistență software, nu profitabilitate.
 2. Adaugă CI cu PostgreSQL (**făcut** — `.github/workflows/ci.yaml`, pending prima rulare) și
    backup/restore testat (**făcut** — scripturi + systemd + job CI `backup-restore`).
 3. Livrează un stack operabil printr-o singură comandă, cu supervisor și runbook de reauth XTB.
-   (**făcut** — `make up` + [RUNBOOK.md](RUNBOOK.md), pending prima rulare live pe mașina operatorului).
+   (**livrat parțial** — `make up` pornește DB + migrate + dashboard cu healthchecks/restart +
+   [RUNBOOK.md](RUNBOOK.md); `trading_hands` și login-ul din browser rămân externe/manuale,
+   collector/online n-au healthcheck Docker, iar **rularea live Compose nu a fost efectuată** —
+   config validat doar cu `docker compose config`).
 4. Rulează Shadow MVP continuu; folosește dashboardul pentru heartbeat și audit.
 5. Adaugă M1/ticks și termenii reali GOLD; repetă măsurarea.
 6. Decide providerul de știri sau scoate știrile din DoD-ul v1.

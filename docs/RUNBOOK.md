@@ -76,8 +76,10 @@ make restore FILE=backups/<nume>.dump    # restore în baza runtime (--clean --i
 
 ```bash
 # systemd timer (zilnic 02:30, cu retenție):
-sudo install -Dm644 deploy/systemd/backup.env.example /etc/trading_brain/backup.env   # editează DSN-ul, chmod 0600
+sudo useradd --system --no-create-home trading_brain 2>/dev/null || true       # dedicated non-root user
+sudo install -Dm600 -o trading_brain -g trading_brain deploy/systemd/backup.env.example /etc/trading_brain/backup.env   # editează DSN-ul (0600, owned by trading_brain)
 sudo install -Dm755 scripts/db_backup.sh /opt/trading_brain/scripts/db_backup.sh
+sudo install -d -o trading_brain -g trading_brain /var/backups/trading_brain
 sudo cp deploy/systemd/trading-brain-backup.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now trading-brain-backup.timer
 # sau cron:

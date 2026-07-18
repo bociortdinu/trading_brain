@@ -55,10 +55,16 @@ backup: ## pg_dump the runtime DB to backups/ (custom format; keeps newest $(BAC
 	@ls -1t backups/$(BRAIN_DB_NAME)_*.dump 2>/dev/null | tail -n +$$(($(BACKUP_KEEP)+1)) | xargs -r rm -f
 	@echo "wrote backups/ (kept newest $(BACKUP_KEEP); restore with: make restore FILE=backups/<name>.dump)"
 
-restore: ## Restore a dump into the runtime DB: make restore FILE=backups/<name>.dump
-	@test -n "$(FILE)" || { echo "usage: make restore FILE=backups/<name>.dump"; exit 2; }
+restore: ## Restore a dump into the runtime DB (DESTRUCTIVE): make restore FILE=backups/<name>.dump CONFIRM=yes
+	@test -n "$(FILE)" || { echo "usage: make restore FILE=backups/<name>.dump CONFIRM=yes"; exit 2; }
+	@test "$(CONFIRM)" = "yes" || { \
+	  echo "REFUSING: 'make restore' OVERWRITES the operational database '$(BRAIN_DB_NAME)' (pg_restore --clean)."; \
+	  echo "Stop the app services first (make down keeps the volume; or stop collector/online/dashboard),"; \
+	  echo "then re-run with CONFIRM=yes. For a SAFE verification restore into a _test DB use scripts/db_restore.sh."; \
+	  exit 3; }
 	$(COMPOSE) exec -T db pg_restore -U $(POSTGRES_USER) -d $(BRAIN_DB_NAME) \
 	  --clean --if-exists < $(FILE)
+	@echo "restored $(FILE) -> $(BRAIN_DB_NAME)"
 
 test: | .env.compose ## Run the full suite against an isolated _test DB inside the stack
 	$(COMPOSE) run --rm \
