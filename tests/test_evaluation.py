@@ -13,6 +13,7 @@ from shadow.evaluation import (
     bootstrap_expectancy_ci,
     confidence_discrimination,
     evaluate_over_windows,
+    format_report,
     max_drawdown_r,
     regime_coverage,
     temporal_folds,
@@ -111,6 +112,18 @@ def test_all_baselines_actually_trade():
         _windows(n=320), symbol="GOLD", provider_name="csv", modeled_spread_pct=0.02,
         makers={"flat": FlatMaker()}))
     assert flat["makers"]["flat"]["overall"]["trades_closed"] == 0       # flat legitimately never trades
+
+
+def test_cost_caption_is_per_component_never_a_false_full_cost_claim():
+    """R2-9: with commission SET but swap absent, the caption must not claim swap is modelled."""
+    from shadow.virtual_broker import ShadowConfig
+    report = run(evaluate_over_windows(_windows(), symbol="GOLD", provider_name="csv",
+                 modeled_spread_pct=0.02, slippage_pct=0.005,
+                 shadow_config=ShadowConfig(commission_pct=0.02)))   # commission on, swap off
+    caption = format_report(report)
+    before_missing = caption.split("NOT modelled")[0]
+    assert "commission" in before_missing and "+swap" not in before_missing   # swap NOT claimed
+    assert "NOT modelled: swap" in caption
 
 
 def test_eval_reports_per_component_costs_and_uses_full_financing_config():

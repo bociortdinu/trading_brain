@@ -253,8 +253,15 @@ def format_report(report: dict) -> str:
             f"{(m.get('win_rate') or 0) * 100:>5.1f}% {m.get('expectancy_r', 0):>7} "
             f"{ci_s:>18} {m.get('max_drawdown_r', 0):>8} {spread if spread is not None else '—':>6}")
     lines.append("")
-    fin = "net of spread+slippage+commission+swap" if report.get("financing_modeled") else \
-        "net of spread+slippage ONLY (commission/swap = 0, NOT modelled)"
+    # Build the cost caption from the PER-COMPONENT flags — never an aggregate that would claim
+    # swap is modelled just because commission is set (or vice versa).
+    comps = report.get("cost_components", {})
+    order = ("spread", "slippage", "commission", "swap")
+    modeled = [k for k in order if comps.get(k)]
+    missing = [k for k in order if k in comps and not comps.get(k)]
+    fin = "net of " + ("+".join(modeled) if modeled else "NOTHING")
+    if missing:
+        fin += f" (NOT modelled: {', '.join(missing)})"
     lines.append(f"Beat these baselines ({fin}): a real edge > confluence(no-LLM), > random, > flat(0).")
     lines.append("`discr` = win-rate spread across confidence buckets (ordinal); NOT ECE — confidence is")
     lines.append("ordinal, so probabilistic calibration (ECE) needs a train fit first.")
