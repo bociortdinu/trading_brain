@@ -144,6 +144,11 @@ async def _backtest_over_windows(
     risk_config = risk_config or RiskConfig()
     eligibility_config = eligibility_config or EligibilityConfig()
     shadow_config = shadow_config or ShadowConfig()
+    # The backtest only feeds M15 bars to reconcile(); it does NOT load historical M1. Force the
+    # reconcile/trigger timeframe to M15 so the manifest is HONEST (not mislabelled M1) and the
+    # timeout is computed for the bars actually used (a "1min" config would scale it 15x).
+    shadow_config = shadow_config.model_copy(
+        update={"reconcile_timeframe": TRIGGER_TF, "trigger_timeframe": TRIGGER_TF})
 
     m15 = windows[TRIGGER_TF]
     out: list[dict] = []

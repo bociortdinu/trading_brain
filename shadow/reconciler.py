@@ -144,7 +144,10 @@ def covers_window(bars: list[Candle], opened_at: datetime, now: datetime, timefr
     older than the fetched window): a touch could hide there, so the trade must not be reconciled."""
     step = timedelta(minutes=timeframe_minutes(timeframe))
     have = {b.open_time for b in bars if b.close_time > opened_at}
-    t = floor_to_grid(opened_at, timeframe) + step   # first bar fully after the entry bar
+    # Start at the bar CONTAINING opened_at (the partial entry bar): an SL/TP can be hit between
+    # opened_at and that bar's close, so if it is missing while the market was open the window is
+    # NOT covered. (Starting one bar later silently accepted a missing entry bar.)
+    t = floor_to_grid(opened_at, timeframe)
     while t + step <= now:                            # only bars that have fully closed are expected
         if calendar.is_open(t) and t not in have:
             return False

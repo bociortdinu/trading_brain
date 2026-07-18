@@ -50,6 +50,19 @@ def _windows(step=1.0, n=250):
     return {"1day": w(1440), "4h": w(240), "1h": w(60), "15min": w(15)}
 
 
+def test_backtest_forces_m15_reconcile_and_ignores_a_1min_config():
+    """Regression (10c6684): the backtest only feeds M15 bars to reconcile(). A reconcile_timeframe
+    of '1min' would mislabel the touch ordering AND scale the timeout 15x (trades that should expire
+    at 96 bars would stay open). The backtest must force M15, so a 1min config is identical to 15min."""
+    from shadow.virtual_broker import ShadowConfig
+    w = _windows(step=1.0, n=250)
+    common = dict(symbol="GOLD", provider_name="csv", decision_maker=ConfluenceStrategy(),
+                  modeled_spread_pct=0.02)
+    a = run(backtest_over_windows(w, shadow_config=ShadowConfig(reconcile_timeframe="15min"), **common))
+    b = run(backtest_over_windows(w, shadow_config=ShadowConfig(reconcile_timeframe="1min"), **common))
+    assert a == b and a, "backtest must force M15 -> a 1min config changes nothing"
+
+
 def test_backtest_uptrend_produces_approved_buys_and_closed_trades():
     rows = run(backtest_over_windows(
         _windows(step=1.0), symbol="GOLD", provider_name="csv",

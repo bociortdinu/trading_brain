@@ -345,6 +345,22 @@ def test_covers_window_fails_when_trade_is_older_than_the_bar_window():
     assert covers_window(full, opened, now, "15min", cal) is True
 
 
+def test_covers_window_requires_the_partial_entry_bar():
+    """P0-2 completion: a trade opened MID-bar can have its SL/TP hit inside the entry bar, so if
+    the bar CONTAINING opened_at is missing (market open) the window is NOT covered. Starting one
+    bar later silently accepted a missing entry bar."""
+    from data_collector.session import calendar_for
+    from shadow.reconciler import covers_window
+    cal = calendar_for("csv")
+    opened = datetime(2026, 7, 6, 14, 7, tzinfo=UTC)   # mid the 14:00-14:15 bar
+    now = datetime(2026, 7, 6, 14, 30, tzinfo=UTC)
+    missing_entry = [_c(4000, 4001, 3999, 4000, datetime(2026, 7, 6, 14, 15, tzinfo=UTC), 15)]
+    assert covers_window(missing_entry, opened, now, "15min", cal) is False
+    with_entry = [_c(4000, 4001, 3999, 4000, datetime(2026, 7, 6, 14, 0, tzinfo=UTC), 15),
+                  _c(4000, 4001, 3999, 4000, datetime(2026, 7, 6, 14, 15, tzinfo=UTC), 15)]
+    assert covers_window(with_entry, opened, now, "15min", cal) is True
+
+
 def test_covers_window_treats_a_session_break_as_expected_not_a_hole():
     """P0-3: a valid series crossing the daily market break (21:00-22:00 UTC / 17:00-18:00 ET) is
     still fully covered — a closed-market gap is NOT a coverage hole."""
