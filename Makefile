@@ -11,6 +11,12 @@ BRAIN_DB_NAME   ?= trading_brain
 BRAIN_APP_USER  ?= trading_brain_app
 BACKUP_KEEP     ?= 14
 
+# Git provenance injected into the image at build time (the .git tree is not copied in). `export`
+# above makes these visible to `docker compose` for the build args.
+BRAIN_GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+BRAIN_GIT_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+BRAIN_GIT_DIRTY  ?= $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo true || echo false)
+
 COMPOSE := docker compose --env-file .env.compose
 
 .DEFAULT_GOAL := help

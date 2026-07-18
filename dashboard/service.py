@@ -9,6 +9,7 @@ credentials, API keys, or raw broker tickets.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 import time
@@ -124,12 +125,22 @@ class DashboardService:
             status = run("status", "--porcelain")
             commit = run("rev-parse", "--short", "HEAD")
             branch = run("branch", "--show-current")
+            dirty = bool(status)
             return {
-                "ok": True, "commit": commit, "branch": branch,
-                "dirty": bool(status), "changed_files": len(status.splitlines()) if status else 0,
+                "ok": True, "commit": commit, "branch": branch, "dirty": dirty,
+                "state": "dirty" if dirty else "clean",
+                "changed_files": len(status.splitlines()) if status else 0,
             }
-        except Exception as exc:  # noqa: BLE001 - displayed as a health fact
-            return {"ok": False, "error": type(exc).__name__}
+        except Exception as exc:  # noqa: BLE001 - no .git (container): use build-injected provenance
+            commit = os.environ.get("BRAIN_GIT_COMMIT")
+            if commit:
+                d = os.environ.get("BRAIN_GIT_DIRTY", "").strip().lower()
+                dirty = {"true": True, "false": False}.get(d)   # None = unknown, NEVER 'clean'
+                state = "dirty" if dirty else ("clean" if dirty is False else "unknown")
+                return {"ok": True, "commit": commit, "branch": os.environ.get("BRAIN_GIT_BRANCH"),
+                        "dirty": dirty, "state": state, "provenance": "build"}
+            # No git AND no injected provenance -> unknown (must not read as clean anywhere).
+            return {"ok": False, "state": "unknown", "error": type(exc).__name__}
 
     def _db_state(self, *, symbol: str, run_id: str | None, limit: int) -> dict[str, Any]:
         started = time.perf_counter()
@@ -539,6 +550,10 @@ class DashboardService:
         if git.get("dirty"):
             add("warning", "REPO_DIRTY",
                 f"Codul are {git.get('changed_files')} fișiere necomise; rezultatul nu este reproductibil.")
+        elif git.get("state") == "unknown":
+            add("warning", "REPO_PROVENANCE_UNKNOWN",
+                "Proveniența codului este necunoscută (fără .git sau build args): nu se poate "
+                "dovedi clean/dirty — NU tratați run-ul ca reproductibil.")
         if not db["health"].get("ok"):
             add("critical", "DATABASE_DOWN", f"PostgreSQL indisponibil: {db['health'].get('error','eroare')}")
         elif not db["health"].get("schema_current"):

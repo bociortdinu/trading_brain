@@ -38,6 +38,20 @@ def git_metadata(repo_root: Path | None = None) -> dict[str, Any]:
     stores that content, and ignored secret files (for example .env) are excluded by Git.
     """
     root = repo_root or Path(__file__).resolve().parents[1]
+    # In a container the .git tree is absent (.dockerignore excludes it); the image build injects
+    # provenance via env so a Compose run can still prove its commit. dirty is True/False/UNKNOWN
+    # (None) — never silently 'clean'.
+    env_commit = os.environ.get("BRAIN_GIT_COMMIT")
+    if env_commit:
+        d = os.environ.get("BRAIN_GIT_DIRTY", "").strip().lower()
+        return {
+            "git_commit": env_commit,
+            "git_branch": os.environ.get("BRAIN_GIT_BRANCH"),
+            "git_dirty": {"true": True, "false": False}.get(d),   # None = unknown
+            "git_changed_files": None,
+            "git_worktree_fingerprint": None,
+            "git_provenance": "build",
+        }
     try:
         commit = git_commit(root)
         status = subprocess.run(

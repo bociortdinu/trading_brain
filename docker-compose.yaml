@@ -17,7 +17,12 @@ x-brain-env: &brain-env
   BRAIN_CSV_DIR: ${BRAIN_CSV_DIR:-}
 
 x-brain-service: &brain-service
-  build: .
+  build:
+    context: .
+    args:
+      BRAIN_GIT_COMMIT: ${BRAIN_GIT_COMMIT:-unknown}
+      BRAIN_GIT_BRANCH: ${BRAIN_GIT_BRANCH:-unknown}
+      BRAIN_GIT_DIRTY: ${BRAIN_GIT_DIRTY:-unknown}
   image: trading_brain:local
   environment: *brain-env
 

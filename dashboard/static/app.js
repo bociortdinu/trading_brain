@@ -120,7 +120,9 @@ function render(data) {
   renderRuns(data.runs || [], data.selection.run_id);
   renderLlm(data.llm_calls || []);
 
-  $("#footer-meta").textContent = `${git.branch || "—"}@${git.commit || "—"}${git.dirty ? " · DIRTY" : " · clean"} · DB ${db.schema_version || "—"}`;
+  const gitState = git.state || (git.ok ? (git.dirty ? "dirty" : "clean") : "unknown");
+  const gitLabel = { dirty: " · DIRTY", clean: " · clean", unknown: " · provenance UNKNOWN" }[gitState] || " · unknown";
+  $("#footer-meta").textContent = `${git.branch || "—"}@${git.commit || "—"}${gitLabel} · DB ${db.schema_version || "—"}`;
   $("#show-latest-json").disabled = !latest.snapshot_id;
   populateRunFilter(data.runs || [], data.selection.run_id);
 }
