@@ -87,6 +87,28 @@ def cost_manifest(trade: "VirtualTrade", config: ShadowConfig) -> dict:
     return manifest
 
 
+def execution_manifest(*, modeled_spread_pct: float, slippage_pct: float,
+                       config: ShadowConfig) -> dict:
+    """The execution parameters a shadow trade is built from — everything a crash-recovery would
+    need to REBUILD the exact same trade from a persisted decision. Folded into the decision
+    fingerprint so a config change is a different decision (not a false recovery)."""
+    return {
+        "modeled_spread_pct": modeled_spread_pct,
+        "slippage_pct": slippage_pct,
+        "commission_pct": config.commission_pct,
+        "swap_pct_per_night": config.swap_pct_per_night,
+        "rollover_hour_utc": config.rollover_hour_utc,
+        "conservative_partial_entry": config.conservative_partial_entry,
+    }
+
+
+def execution_hash(manifest: dict) -> str:
+    import hashlib
+    import json
+
+    return hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()[:16]
+
+
 def shadow_config_from_costs(costs: dict | None, *, timeout_bars: int,
                              fallback: "ShadowConfig | None" = None) -> ShadowConfig:
     """Rebuild the ShadowConfig a trade was OPENED with, from its persisted cost manifest, so a

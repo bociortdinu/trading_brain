@@ -1079,6 +1079,52 @@ def test_insert_llm_call_logs_success_and_failure():
         _cleanup(sym)
 
 
+def test_llm_audit_is_atomic_with_the_decision():
+    """A paid call must never become invisible: the decision and its llm_calls audit are one
+    transaction. If the audit insert fails, the decision rolls back too — never a committed
+    decision with a lost paid call (which the separate-transaction version did leave behind)."""
+    import database.repository as repo
+    from database.repository import insert_decision, insert_evaluation, upsert_snapshot
+    from decision.llm_client import LlmCallResult
+    from decision.pipeline import DecisionRecord
+    from decision.prefilter import PrefilterResult
+    from decision.schema import DecisionOutput
+    from risk.engine import RiskVerdict
+
+    sym, run_id = "TST_" + os.urandom(3).hex(), "atomic-" + os.urandom(3).hex()
+    end = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    real = repo._llm_call_row
+    try:
+        _, snap_id = upsert_snapshot(DSN, _packet(sym, spread=0.02))
+        eval_id = insert_evaluation(DSN, snap_id, _eval("replay", True, []))
+        decision = DecisionOutput(direction="BUY", confidence=0.8, rationale="x")
+        risk = RiskVerdict(approved=True, reason=None, direction="BUY", confidence=0.8,
+                           sl_pct=0.3, tp_pct=0.6, risk_config_version="v")
+        rec = DecisionRecord(stage="decided", symbol=sym, as_of=end, mode="replay",
+                             prefilter=PrefilterResult(passed=True, reasons=[], config_version="pf"),
+                             decision=decision, risk=risk, input_hash="h",
+                             manifest={"prompt_version": "p", "output_schema_version": "s",
+                                       "feature_pipeline_version": "1.2.0", "strategy_version": "st",
+                                       "risk_config_version": "v"})
+        result = LlmCallResult(ok=True, requested_model="m", input_hash="h")
+
+        repo._llm_call_row = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("audit boom"))
+        with pytest.raises(RuntimeError):
+            insert_decision(DSN, snapshot_id=snap_id, evaluation_id=eval_id, model="m", record=rec,
+                            ai_input={}, ai_output={}, mode="shadow", data_provider="csv",
+                            run_id=run_id, input_fingerprint="atomfp", llm_result=result)
+        with psycopg.connect(DSN) as c:
+            d = c.execute("SELECT count(*) FROM decisions WHERE run_id=%s", (run_id,)).fetchone()[0]
+            l = c.execute("SELECT count(*) FROM llm_calls WHERE snapshot_id=%s", (snap_id,)).fetchone()[0]
+        assert (d, l) == (0, 0), "audit failure must roll the decision back too, not leave it committed"
+    finally:
+        repo._llm_call_row = real
+        with psycopg.connect(DSN) as c:
+            c.execute("DELETE FROM decisions WHERE run_id=%s", (run_id,))
+            c.commit()
+        _cleanup(sym)
+
+
 def test_llm_call_records_retry_count_and_links_the_decision():
     """Pay-per-token audit: a call that RETRIED before succeeding records how many retries, and a
     successful call is tied to the decision it produced; a failed call is logged unlinked."""

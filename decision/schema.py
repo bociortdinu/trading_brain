@@ -98,12 +98,18 @@ class DecisionInput(BaseModel):
 def decision_fingerprint(*, input_hash: str, model: str, provider: str,
                          prompt_version: str = DECISION_PROMPT_VERSION,
                          strategy_version: str = STRATEGY_VERSION,
-                         risk_config_version: str) -> str:
+                         risk_config_version: str, execution_hash: str = "") -> str:
     """Run-scoped decision identity for idempotency: the SAME frozen input decided by the SAME
     model + prompt + strategy + risk config + data provider is the SAME decision. Changing any
     of these (a new prompt, a different provider) is a DIFFERENT decision and must NOT be
-    deduped against the old one. Hashed so it fits a single indexed column."""
-    parts = [input_hash, model, provider, prompt_version, strategy_version, risk_config_version]
+    deduped against the old one. Hashed so it fits a single indexed column.
+
+    `execution_hash` folds in the EXECUTION config (modeled spread, slippage, commission, swap,
+    rollover, partial-entry policy) — the parameters a crash-recovery uses to REBUILD the trade.
+    Including it means a config change is a different fingerprint, so recovery can only ever reuse
+    a decision produced under the IDENTICAL config; it can't silently rebuild a different trade."""
+    parts = [input_hash, model, provider, prompt_version, strategy_version, risk_config_version,
+             execution_hash]
     return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
 

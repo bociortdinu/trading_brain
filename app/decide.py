@@ -138,14 +138,12 @@ async def _run(settings, *, mode: str, use_fake: bool, all_regimes: bool = False
                   "latency_ms": last.latency_ms,
                   "cache_hit": bool(last.cache_read_input_tokens)}
     ai_output = record.decision.model_dump(mode="json") if record.decision else None
-    dec_id, _ = insert_decision(
+    dec_id, _ = insert_decision(   # decision + paid-call audit in ONE transaction (atomic)
         settings.db_dsn, snapshot_id=snap_id, evaluation_id=eval_id, model=model_name,
         record=record, ai_input=inp.model_dump(mode="json"), ai_output=ai_output,
         mode="shadow", data_provider=provider_name, tokens=tokens,
-        spread_observation_id=spread_obs_id,
+        spread_observation_id=spread_obs_id, llm_result=last,
     )
-    if last is not None:   # audit the paid call, LINKED to the decision it produced
-        insert_llm_call(settings.db_dsn, last, snapshot_id=snap_id, decision_id=dec_id)
     verdict = "approved" if (record.risk and record.risk.approved) else "rejected"
     print(f"[db] decision id={dec_id} verdict={verdict} -> evaluation_id={eval_id} (shadow, NOT executed)")
 

@@ -246,3 +246,23 @@ def test_pipeline_llm_failure_is_captured_not_crashed():
     rec = _pipe(_packet(atr=0.2, spread=0.05), _elig(True), _FailingLLM())
     assert rec.stage == "llm_failed" and rec.llm_error == "RuntimeError"
     assert rec.decision is None and rec.risk is None and not rec.risk_approved
+
+
+def test_execution_config_is_part_of_the_decision_fingerprint():
+    """A crash-recovery rebuilds a trade from the persisted decision using the CURRENT execution
+    config. Folding that config into the fingerprint makes a config change a DIFFERENT decision,
+    so recovery can only ever reuse a decision produced under the IDENTICAL config."""
+    from decision.schema import decision_fingerprint
+    from shadow.virtual_broker import ShadowConfig, execution_hash, execution_manifest
+
+    base = dict(input_hash="h", model="m", provider="csv", risk_config_version="v")
+    h_a = execution_hash(execution_manifest(modeled_spread_pct=0.02, slippage_pct=0.005,
+                                            config=ShadowConfig()))
+    h_b = execution_hash(execution_manifest(modeled_spread_pct=0.02, slippage_pct=0.010,   # diff slip
+                                            config=ShadowConfig()))
+    h_c = execution_hash(execution_manifest(modeled_spread_pct=0.02, slippage_pct=0.005,
+                                            config=ShadowConfig(commission_pct=0.01)))       # diff comm
+    assert len({h_a, h_b, h_c}) == 3                                   # every knob moves the hash
+    fp = lambda h: decision_fingerprint(**base, execution_hash=h)      # noqa: E731
+    assert len({fp(h_a), fp(h_b), fp(h_c)}) == 3                       # -> three distinct decisions
+    assert fp(h_a) == fp(h_a)                                          # deterministic

@@ -11,11 +11,11 @@
 | Fază | Titlu | Livrează | Stadiu (2026-07-18) |
 |---|---|---|---|
 | 0 | Fundație | schelet, config, client trading_hands, health-check | ✅ livrat |
-| 1 | Colectare + Features | snapshots MTF reale în DB (fără AI) | ✅ livrat |
-| 2 | Brain + Risk Engine | decizii validate (fără execuție) | ✅ livrat |
-| 3 | Shadow Mode | execuție fantomă + reconciliere modelată | ✅ livrat (motor complet) |
+| 1 | Colectare + Features | snapshots MTF reale în DB (fără AI) | ✅ replay validat; știri LIVE + paritate TradingView neverificate |
+| 2 | Brain + Risk Engine | decizii validate (fără execuție) | ✅ livrat; DoD prompt caching nevalidat |
+| 3 | Shadow Mode | execuție fantomă + reconciliere modelată | ✅ motor livrat; swap/comision reale + M1 + rulare continuă neverificate |
 | 4 | Istoric autoritativ (ipax) | rezultat live autoritativ (subproiect) | 🔬 SPIKE (cere trade-uri live) |
-| 5 | Feedback loop + evaluare | walk-forward cu baseline/costuri/calibrare | ◑ framework livrat; verdict LLM = plătit, amânat |
+| 5 | Feedback loop + evaluare | temporal-fold report + baseline-uri + feedback wired | ◑ parțial; verdict LLM = rulare plătită, amânat |
 | 6 | Go-live controlat | live cu volum minim + kill-switch | ⛔ neînceput (bani reali; porțile 4+5) |
 
 Cross-cutting (în toate fazele): manifest de reproducere, teste, discipline anti look-ahead.
@@ -31,7 +31,9 @@ Instantaneu exact al proiectului. (Secțiunile „Status onest / Runda N" de mai
 - **Colectare + features**: providere OHLCV (XTB real-time via trading_hands, Polygon/Massive,
   CSV), doar bare închise, calendar de sesiune DST-aware, snapshot **imutabil** (OHLCV+features)
   separat de spreadul contextual (`spread_observations`, append-only) și de eligibilitate
-  (`snapshot_evaluations`, per mode+policy). Backtest **O(n)** (precompute per-timeframe).
+  (`snapshot_evaluations`, per mode+policy). Backtest mult accelerat (indicatorii precalculați,
+  ~12× pe termenul dominant) — **NU O(n) strict**: `_slice`/`validate_series`/filtrarea pivoților
+  rămân O(n)/bară → O(n²) cu constantă mult mai mică.
 - **Decizie + risc**: contract I/O strict (Structured Outputs), prefiltru, `AnthropicDecisionMaker`
   fail-closed (primul apel LLM real făcut), Risk Engine determinist (SL/TP din ATR, spread
   obligatoriu, sesiune pe **calendarul providerului**, fail-closed). Maker selectabil
@@ -42,8 +44,9 @@ Instantaneu exact al proiectului. (Secțiunile „Status onest / Runda N" de mai
   înainte de apelul plătit + **recovery după crash** (refolosește decizia persistată, nu
   reapelează maker-ul), lock exclusiv pe `run_id`.
 - **Feedback loop + evaluare (Faza 5, deterministic)**: track record `as_of`-safe injectat în
-  `DecisionInput`; protocol walk-forward cu baseline-uri (confluence/random/flat), bootstrap CI,
-  drawdown, calibrare confidence (ECE), acoperire pe regimuri.
+  `DecisionInput` (și în backtest via `--feedback`); **temporal-fold report** cu baseline-uri care
+  chiar tranzacționează (confluence/random/flat), bootstrap CI, drawdown, **discriminare** confidence
+  (ordinal, NU ECE), acoperire pe regimuri.
 - **Persistență + audit**: `decisions`/`trades`/`snapshot_evaluations`/`spread_observations`/
   `llm_calls`/`decision_reservations`; tabele de fapte **UPDATE-protected**; `schema_migrations`
   read-only pentru app-role.
@@ -52,7 +55,8 @@ Instantaneu exact al proiectului. (Secțiunile „Status onest / Runda N" de mai
 
 **Cifre reale:** **257 teste** (227 fără DB + 30 DB-gated), Go `-race`/`vet`/`gofmt` curate.
 **19 migrări** (0001–0019). Versiuni: features `1.2.0`, decision-schema `2026.3`, prompt `2026.1`,
-strategy `2026.1`, risk `2026.2`. Commit-uri feature: **23 în trading_brain, 7 în trading_hands**.
+strategy `2026.1`, risk `2026.2`. **20 migrări** (0001–0020). Commit-uri feature:
+**25 în trading_brain, 7 în trading_hands**.
 
 **NU e făcut / deferit (onest):**
 - **Măsurarea edge-ului real cu LLM** — cere o rulare **plătită** `--maker claude` (amânată de user).
@@ -367,7 +371,37 @@ Online (doar maker determinist). Rămâne valabil: **nu** rula `--maker claude` 
 
 ---
 
-## Runda 12 — perf backtest O(n²) → O(n)
+## Runda 13 — Faza 5 nu era încă validă + fixuri de corectitudine
+
+Reviewul a arătat că Faza 5 nu era un protocol valid și a găsit două bug-uri de corectitudine.
+Reproduse local înainte de fix; „framework livrat" era prea tare.
+
+- **Baseline-ul random nu tranzacționa** (confidence 0.5 < prag 0.60) → „bate random" era fals.
+  Fix: `RandomMaker` emite confidence peste prag; test care **dovedește** trades > 0.
+- **„Walk-forward" nu era walk-forward**: tăia istoricul per fold (pierdea warm-up + poziția, folduri
+  < MIN_BARS → goale). Redesign: **o singură rulare continuă**, apoi partiționez **rândurile** pe
+  segmente temporale (`temporal_folds`). Redenumit onest **temporal fold report** — un walk-forward
+  real (train→OOS) cere un maker antrenabil (LLM, amânat).
+- **Feedback-ul nu ajungea la LLM în backtest**: acum `backtest_over_windows(use_feedback=...)` +
+  `shadow.runner --feedback` injectează track record-ul; comparația cu-feedback vs fără devine
+  rulabilă sub `--maker claude`. Feedback-ul intră în `input_hash`.
+- **Recovery nereproductibil la schimbarea configului**: rebuild-ul folosea configul rulării de
+  resume. Fix: **execution config-ul (spread/slippage/comision/swap/rollover) intră în fingerprint**
+  → o schimbare de config = decizie diferită, nu un recovery fals. Test.
+- **Auditul llm_calls putea pierde un apel plătit** (INSERT în tranzacție separată). Fix: decizia +
+  `llm_calls` într-**o singură tranzacție** (`insert_decision(llm_result=...)`); un eșec de audit
+  face rollback la decizie. Test injectează eroarea → ambele 0.
+- **Feedback look-ahead**: filtra pe `closed_at`. Adăugat `outcome_observed_at` (migrarea 0020) —
+  când s-a **observat** rezultatul (online = timpul de reconciliere), nu când s-a atins prețul.
+- **ECE pe confidence ordinal** → înlocuit cu **discriminare** (win rate per bucket + monotonicitate +
+  spread), cu notă că ECE cere calibrare probabilistică pe train.
+- **apiKey în excepții** (HttpNewsProvider) → redactat; nu mai apare URL-ul cu cheia.
+- **Docs**: `O(n)` → onest O(n²) cu constantă mică; „full cost model" → „comision/swap doar dacă
+  ratele sunt setate"; README migrări = **admin-role**; faze 1–3 cu gaps notate; commit count corect.
+
+---
+
+## Runda 12 — perf backtest O(n²) → O(n) *(vezi runda 13: „O(n)" era prea tare)*
 
 `timeframe_features` era **87% din timpul unui backtest** (profilat): recalcula toți indicatorii
 peste tot prefixul la fiecare bară (buclele Python din `_rma`/`ema`) → O(n²).
@@ -604,20 +638,22 @@ LLM-ul bate baseline-ul fără-LLM și varianta fără-feedback net de costuri (
 
 - **Feedback loop** — [database/feedback.py](../database/feedback.py): nivel 1 (statistici pe regim:
   win rate + expectancy) + nivel 2 (ultimele K trade-uri închise, verbatim-ish). **STRICT
-  anti-look-ahead**: o decizie la `as_of` vede DOAR trade-uri **închise înainte** de `as_of` (test
-  dedicat: un trade închis după `as_of` e exclus). `FeedbackContext` e injectat în `DecisionInput`
-  (parte din input hash — schema bumped la `2026.3`) și în calea online (fingerprint-ul îl include).
-- **Protocol de evaluare** — [shadow/evaluation.py](../shadow/evaluation.py): **baseline-uri**
-  deterministe (confluence = fără-LLM, random seeded, flat=0); **bootstrap CI** pentru expectancy;
-  **max drawdown** în R; **calibrare confidence** (bins de fiabilitate + **ECE**); **acoperire pe
-  regimuri**; **walk-forward** (folds OOS contiguue, per-fold + overall). CLI: `python -m
-  shadow.evaluation --count N --folds K` → tabel comparativ. Teste: `tests/test_evaluation.py`
-  (funcții pure pe valori cunoscute + integrare pe baseline-uri).
-- **Nivel 3 kNN/pgvector**: amânat (opțional în plan).
+  anti-look-ahead**: o decizie la `as_of` vede DOAR trade-uri al căror rezultat a fost **observat
+  înainte** de `as_of` (`outcome_observed_at`, nu `closed_at` — anti-injecție după downtime; test
+  dedicat). `FeedbackContext` e injectat în `DecisionInput` (parte din input hash), în calea online
+  ȘI în backtest (`--feedback`), ca să fie rulabilă comparația cu-feedback vs fără sub `--maker claude`.
+- **Temporal-fold report** — [shadow/evaluation.py](../shadow/evaluation.py): **baseline-uri** care
+  chiar tranzacționează (confluence = fără-LLM; random seeded, confidence peste prag; flat=0);
+  **bootstrap CI** pentru expectancy; **max drawdown** în R; **discriminare confidence** (win rate
+  per bucket + monotonicitate + spread — NU ECE, fiindcă confidence e ordinal); **acoperire pe
+  regimuri**; **folduri temporale** (o singură rulare continuă, output partiționat pe timp — NU
+  walk-forward real). CLI: `python -m shadow.evaluation --count N --folds K`. Teste:
+  `tests/test_evaluation.py` (funcții pure pe valori cunoscute + baseline-urile chiar deschid trade-uri).
+- **Nivel 3 kNN/pgvector** + walk-forward real (train→OOS, calibrare probabilistică): amânate.
 
 **Neîncă făcut (onest):** verdictul „LLM bate baseline-ul fără-LLM și fără-feedback, net de costuri"
 cere o rulare **plătită** cu `--maker claude` (amânată de user). Framework-ul + baseline-urile
-deterministe + toate metricile există; lipsește doar rularea LLM ca să tragem concluzia.
+deterministe + wiring-ul de feedback + toate metricile există; lipsește doar rularea LLM.
 
 ---
 

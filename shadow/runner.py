@@ -131,7 +131,8 @@ async def _backtest_over_windows(
     run_id: str | None = None,
     model_name: str = "deterministic-confluence",
     worker_id: str | None = None,      # identifies this worker's reservations (default: host:pid)
-    fast_features: bool = True,        # O(n) precompute; False forces the per-slice path (tests)
+    fast_features: bool = True,        # precompute the indicator arrays (default); False = per-slice
+    use_feedback: bool = False,        # inject the as_of-safe track record (needs persist_dsn)
 ) -> list[dict]:
     """Backtest over provided windows. Returns per-bar dicts:
     {as_of, stage, direction, approved, outcome(dict|None)}. When `persist_dsn`+`run_id` are
@@ -153,6 +154,11 @@ async def _backtest_over_windows(
     series_by_tf = {tf: TimeframeSeries(bars) for tf, bars in windows.items()
                     if fast_features and len(bars) >= MIN_BARS}
     precomputed = series_by_tf if len(series_by_tf) == len(windows) else None
+    # The execution config is constant across the run; its hash goes into every fingerprint so a
+    # config change makes each bar a DIFFERENT decision (recovery can't rebuild a different trade).
+    from shadow.virtual_broker import execution_hash, execution_manifest
+    exec_hash = execution_hash(execution_manifest(
+        modeled_spread_pct=modeled_spread_pct, slippage_pct=slippage_pct, config=shadow_config))
     # Position policy: a single account holds ONE position at a time. Without this gate the
     # backtest opens a new trade on every approved bar (the reviewer saw 23 concurrent
     # positions), which is NOT an executable strategy — the summed R is meaningless. We block
@@ -189,11 +195,19 @@ async def _backtest_over_windows(
         # free, so a bar it rejects costs nothing, is recomputed identically on a resume, and must
         # not leave an unfinished reservation behind.
         fingerprint = claim_token = None
+        feedback = None
         if persist_dsn and run_id and prefilter(packet, elig, prefilter_config).passed:
             from database.repository import reserve_decision
+            if use_feedback:
+                from database.feedback import build_feedback
+                from decision.schema import FeedbackContext
+                _fb = build_feedback(persist_dsn, run_id=run_id, before=as_of)
+                feedback = FeedbackContext(regime_performance=_fb["regime_performance"],
+                                           recent_trades=_fb["recent_trades"])
             fingerprint = decision_fingerprint(
-                input_hash=build_decision_input(packet, mode="replay").input_hash(),
-                model=model_name, provider=provider_name, risk_config_version=risk_config.version)
+                input_hash=build_decision_input(packet, mode="replay", feedback=feedback).input_hash(),
+                model=model_name, provider=provider_name, risk_config_version=risk_config.version,
+                execution_hash=exec_hash)
             claim, claim_token = reserve_decision(
                 persist_dsn, input_fingerprint=fingerprint, run_id=run_id, worker=worker_id)
             if claim == "held":
@@ -225,7 +239,7 @@ async def _backtest_over_windows(
 
         rec = await run_decision(packet, elig, decision_maker, mode="replay",
                                  prefilter_config=prefilter_config, risk_config=risk_config,
-                                 calendar=calendar)
+                                 calendar=calendar, feedback=feedback)
         llm_result = getattr(decision_maker, "last_result", None)
         # Decide the BLOCKED disposition before persisting, so the decision row records it and a
         # resume can tell "approved and traded" from "approved but a position was already open".
@@ -244,7 +258,8 @@ async def _backtest_over_windows(
         if persist_dsn and run_id and rec.stage == "decided":
             dec_id = _persist_decision(persist_dsn, run_id, model_name, symbol, provider_name,
                                        packet, elig, rec, fingerprint=fingerprint,
-                                       llm_result=llm_result, blocked_reason=blocked)
+                                       llm_result=llm_result, blocked_reason=blocked,
+                                       feedback=feedback)
         if rec.risk_approved and not blocked:
             o = _open_reconcile_persist(
                 persist_dsn, run_id, symbol, dec_id, rec.decision.direction, rec.risk.sl_pct,
@@ -356,25 +371,25 @@ def _resume_row(dsn, as_of, run_id, fingerprint, claim) -> dict:
 
 
 def _persist_decision(dsn, run_id, model_name, symbol, provider_name, packet, elig, rec, *,
-                      fingerprint, llm_result, blocked_reason=None) -> int | None:
+                      fingerprint, llm_result, blocked_reason=None, feedback=None) -> int | None:
     """Write snapshot -> evaluation -> decision (+ the LLM call, if any) for one decided bar.
     ATOMIC/idempotent on (input_fingerprint, run_id) via insert_decision's ON CONFLICT. Returns
     the decision id, or None if the snapshot wasn't usable."""
-    from database.repository import (
-        insert_decision, insert_evaluation, insert_llm_call, upsert_snapshot,
-    )
+    from database.repository import insert_decision, insert_evaluation, upsert_snapshot
 
     status, snap_id = upsert_snapshot(dsn, packet)
     if snap_id is None or status == "conflict":
         return None
     eval_id = insert_evaluation(dsn, snap_id, elig)
-    inp = build_decision_input(packet, mode="replay")
+    inp = build_decision_input(packet, mode="replay", feedback=feedback)
+    # The decision AND its paid-call audit are inserted in ONE transaction (llm_result), so an
+    # audit failure can never leave a committed decision with a lost paid call.
     dec_id, inserted = insert_decision(
         dsn, snapshot_id=snap_id, evaluation_id=eval_id, model=model_name, record=rec,
         ai_input=inp.model_dump(mode="json"),
         ai_output=rec.decision.model_dump(mode="json") if rec.decision else None,
         mode="shadow", data_provider=provider_name, run_id=run_id, input_fingerprint=fingerprint,
-        blocked_reason=blocked_reason,
+        blocked_reason=blocked_reason, llm_result=llm_result,
     )
     # The fresh path only reaches here after confirming no decision existed AND under the
     # exclusive run lock, so this insert must be genuinely new. A conflict would mean `rec` (a
@@ -384,8 +399,6 @@ def _persist_decision(dsn, run_id, model_name, symbol, provider_name, packet, el
         raise RuntimeError(
             f"insert_decision hit an unexpected conflict for {fingerprint[:12]}… in run {run_id!r}"
             " — a recovery path should have handled the pre-existing decision")
-    if llm_result is not None:   # audit the paid API call, LINKED to the decision it produced
-        insert_llm_call(dsn, llm_result, snapshot_id=snap_id, decision_id=dec_id)
     return dec_id
 
 
@@ -457,8 +470,10 @@ def _confirm_paid_run(model: str, max_calls: int, max_tokens: int, assume_yes: b
 
 
 async def _run(settings, *, count: int, run_id: str | None, maker_kind: str = "deterministic",
-               max_llm_calls: int = 50, assume_yes: bool = False) -> None:
+               max_llm_calls: int = 50, assume_yes: bool = False, use_feedback: bool = False) -> None:
     maker, model_name, is_paid = _build_maker(settings, maker_kind)
+    if use_feedback and not run_id:
+        raise SystemExit("--feedback needs --persist (feedback is read from the run's persisted trades)")
     if is_paid:
         _confirm_paid_run(model_name, max_llm_calls, settings.decision_max_tokens, assume_yes)
 
@@ -481,6 +496,7 @@ async def _run(settings, *, count: int, run_id: str | None, maker_kind: str = "d
             shadow_config=ShadowConfig(commission_pct=settings.commission_pct,
                                        swap_pct_per_night=settings.swap_pct_per_night),
             persist_dsn=settings.db_dsn if run_id else None, run_id=run_id,
+            use_feedback=use_feedback,
         )
     finally:
         # ALWAYS close the Anthropic client (even on error/cap) so we don't leak the connection.
@@ -511,12 +527,15 @@ def main() -> int:
     parser.add_argument("--max-llm-calls", type=int, default=50,
                         help="hard cap on paid decide() calls (--maker claude); stops cleanly at it")
     parser.add_argument("--yes", action="store_true", help="skip the paid-run confirmation prompt")
+    parser.add_argument("--feedback", action="store_true",
+                        help="inject the as_of-safe track record into the input (needs --persist; "
+                             "for the with-feedback vs without comparison under --maker claude)")
     args = parser.parse_args()
     run_id = None
     if args.persist:
         run_id = args.run_id or f"backtest-{args.maker}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
     asyncio.run(_run(load_settings(), count=args.count, run_id=run_id, maker_kind=args.maker,
-                     max_llm_calls=args.max_llm_calls, assume_yes=args.yes))
+                     max_llm_calls=args.max_llm_calls, assume_yes=args.yes, use_feedback=args.feedback))
     return 0
 
 

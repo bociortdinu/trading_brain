@@ -45,6 +45,9 @@ class HttpNewsProvider(NewsProvider):
         self._key = api_key
         self._path = path
 
+    def _redact(self, text: str) -> str:
+        return text.replace(self._key, "[REDACTED]") if self._key else text
+
     async def __aenter__(self) -> "HttpNewsProvider":
         return self
 
@@ -90,9 +93,13 @@ class HttpNewsProvider(NewsProvider):
             resp.raise_for_status()
             payload = resp.json()
         except httpx.HTTPError as exc:
-            raise NewsProviderError(f"news request failed: {exc}") from exc
+            # httpx errors stringify the request URL, which carries apiKey= in the query — never
+            # let the secret reach a log/exception. Report only the type (+ status if any).
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            detail = f"HTTP {status}" if status is not None else type(exc).__name__
+            raise NewsProviderError(f"news request failed: {detail}") from None
         except ValueError as exc:
-            raise NewsProviderError(f"invalid news JSON: {exc}") from exc
+            raise NewsProviderError(f"invalid news JSON: {self._redact(str(exc))}") from None
 
         rows = payload.get("results") if isinstance(payload, dict) else payload
         if not isinstance(rows, list):

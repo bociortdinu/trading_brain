@@ -185,12 +185,37 @@ def evaluations_for(dsn: str, snapshot_id: int) -> list[dict]:
     ]
 
 
+def _llm_call_row(conn, result, *, snapshot_id: int | None, decision_id: int | None):
+    """INSERT one llm_calls row on an EXISTING connection (no commit). Shared by insert_llm_call
+    (standalone) and insert_decision (atomic with the decision), so a paid call is never persisted
+    in a transaction separate from the decision it produced — an audit-insert failure would
+    otherwise leave the decision committed and the paid call invisible."""
+    conn.execute(
+        """
+        INSERT INTO llm_calls
+            (snapshot_id, ok, error, requested_model, effective_model, request_id,
+             stop_reason, input_tokens, output_tokens, cache_read_tokens,
+             cache_creation_tokens, estimated_cost_usd, latency_ms, prompt_version,
+             schema_version, input_hash, retry_count, decision_id)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """,
+        (
+            snapshot_id, result.ok, result.error, result.requested_model,
+            result.effective_model, result.request_id, result.stop_reason,
+            result.input_tokens, result.output_tokens, result.cache_read_input_tokens,
+            result.cache_creation_input_tokens, result.estimated_cost_usd, result.latency_ms,
+            result.prompt_version, result.schema_version, result.input_hash,
+            result.retry_count, decision_id,
+        ),
+    )
+
+
 def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, model: str,
                     record, ai_input: dict, ai_output: dict | None, mode: str,
                     data_provider: str, tokens: dict | None = None,
                     run_id: str | None = None, input_fingerprint: str | None = None,
                     spread_observation_id: int | None = None,
-                    blocked_reason: str | None = None) -> tuple[int, bool]:
+                    blocked_reason: str | None = None, llm_result=None) -> tuple[int, bool]:
     """Persist a DecisionRecord (decision/pipeline.py) with its reproducibility manifest and
     the FK to the authorizing evaluation. Never fabricates an approved verdict — the
     risk_verdict comes straight from the record. Returns (decision_id, inserted): `inserted` is
@@ -251,6 +276,12 @@ def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, mo
                 "SELECT id FROM decisions WHERE input_fingerprint = %s AND run_id = %s",
                 (input_fingerprint, run_id),
             ).fetchone()
+        # ATOMIC audit: the paid call is logged in the SAME transaction as the decision it
+        # produced, only when we actually inserted (a conflict means an earlier attempt already
+        # logged it). If this raises, the whole transaction rolls back — decision and audit stay
+        # consistent, never a committed decision with a lost paid call.
+        if llm_result is not None and inserted:
+            _llm_call_row(conn, llm_result, snapshot_id=snapshot_id, decision_id=row[0])
         conn.commit()
     # (id, inserted): a caller that hit a conflict must NOT proceed as if it produced this
     # decision — the row belongs to an earlier attempt and any fresh `rec` would be discarded.
@@ -483,7 +514,8 @@ def insert_llm_call(dsn: str, result, *, snapshot_id: int | None = None,
 
 
 def upsert_shadow_trade(dsn: str, *, decision_id: int, run_id: str, symbol: str, trade, outcome,
-                        timeframe: str, timeout_bars: int, costs: dict | None = None) -> tuple[int, str]:
+                        timeframe: str, timeout_bars: int, costs: dict | None = None,
+                        observed_at=None) -> tuple[int, str]:
     """Idempotently persist/refresh a shadow trade for (decision_id, run_id).
 
     A re-run UPSERTs the SAME row — an open trade is closed IN PLACE (entry/SL/TP stay
@@ -498,6 +530,9 @@ def upsert_shadow_trade(dsn: str, *, decision_id: int, run_id: str, symbol: str,
     from core.models import Direction
 
     side = "buy" if trade.direction == Direction.BUY else "sell"
+    # WHEN the outcome became known: caller-supplied (online = reconcile wall-clock) or, for a
+    # deterministic backtest, the close time itself (no observation lag). NULL while still open.
+    observed = None if outcome.status == "open" else (observed_at or outcome.closed_at)
     # Prefer an explicit manifest from the caller (shadow.virtual_broker.cost_manifest, which
     # partitions modeled/not_modeled by ACTUAL non-zero rates). The fallback here is honest too:
     # with no config in scope, commission/swap rates are unknown -> not_modeled, never claimed.
@@ -515,28 +550,29 @@ def upsert_shadow_trade(dsn: str, *, decision_id: int, run_id: str, symbol: str,
             """
             INSERT INTO trades
                 (decision_id, run_id, symbol, side, mode, entry_price, sl_price, tp_price,
-                 opened_at, status, exit_price, exit_reason, closed_at, r_multiple,
-                 r_pessimistic, r_optimistic, ambiguous, timeframe, timeout_bars,
+                 opened_at, status, exit_price, exit_reason, closed_at, outcome_observed_at,
+                 r_multiple, r_pessimistic, r_optimistic, ambiguous, timeframe, timeout_bars,
                  spread_pct, spread_provenance, slippage_pct, costs)
-            VALUES (%s,%s,%s,%s,'shadow',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,'shadow',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (decision_id, run_id) DO UPDATE SET
-                status        = EXCLUDED.status,
-                exit_price    = EXCLUDED.exit_price,
-                exit_reason   = EXCLUDED.exit_reason,
-                closed_at     = EXCLUDED.closed_at,
-                r_multiple    = EXCLUDED.r_multiple,
-                r_pessimistic = EXCLUDED.r_pessimistic,
-                r_optimistic  = EXCLUDED.r_optimistic,
-                ambiguous     = EXCLUDED.ambiguous,
-                costs         = EXCLUDED.costs
+                status              = EXCLUDED.status,
+                exit_price          = EXCLUDED.exit_price,
+                exit_reason         = EXCLUDED.exit_reason,
+                closed_at           = EXCLUDED.closed_at,
+                outcome_observed_at = EXCLUDED.outcome_observed_at,
+                r_multiple          = EXCLUDED.r_multiple,
+                r_pessimistic       = EXCLUDED.r_pessimistic,
+                r_optimistic        = EXCLUDED.r_optimistic,
+                ambiguous           = EXCLUDED.ambiguous,
+                costs               = EXCLUDED.costs
             WHERE trades.status = 'open'
             RETURNING id, (xmax = 0) AS inserted
             """,
             (
                 decision_id, run_id, symbol, side, trade.entry_mid, trade.sl_price, trade.tp_price,
                 trade.opened_at, outcome.status, outcome.exit_price, outcome.exit_reason,
-                outcome.closed_at, outcome.r_multiple, outcome.r_pessimistic, outcome.r_optimistic,
-                outcome.ambiguous, timeframe, timeout_bars, trade.spread_pct,
+                outcome.closed_at, observed, outcome.r_multiple, outcome.r_pessimistic,
+                outcome.r_optimistic, outcome.ambiguous, timeframe, timeout_bars, trade.spread_pct,
                 trade.spread_provenance, trade.slippage_pct, Json(cost_model),
             ),
         ).fetchone()

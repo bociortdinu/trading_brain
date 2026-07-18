@@ -1,21 +1,21 @@
-"""Faza 5 evaluation protocol: bootstrap CI, drawdown, calibration/ECE, coverage, walk-forward,
-and the deterministic baselines. Pure functions asserted on known values; the baseline runner is
-an integration smoke over synthetic windows (no DB, no LLM)."""
+"""Faza 5 report: bootstrap CI, drawdown, confidence DISCRIMINATION (ordinal, not ECE), regime
+coverage, temporal folds, and the deterministic baselines (which must actually trade). Pure
+functions asserted on known values; the baseline runner is an integration smoke over synthetic
+windows (no DB, no LLM)."""
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from features.mtf import TRIGGER_TF
 from shadow.evaluation import (
     FlatMaker,
     RandomMaker,
     bootstrap_expectancy_ci,
-    calibration,
+    confidence_discrimination,
     evaluate_over_windows,
     max_drawdown_r,
     regime_coverage,
-    walk_forward_windows,
+    temporal_folds,
 )
 from tests.helpers import run
 from tests.synthetic import trend
@@ -49,16 +49,18 @@ def test_bootstrap_ci_is_deterministic_and_brackets_the_mean():
     assert bootstrap_expectancy_ci([])["mean"] is None
 
 
-# ---- calibration / ECE ---- #
-def test_calibration_ece_known_values():
-    # constant 0.7 confidence, 50% win rate -> one bin, ECE = |0.7 - 0.5| = 0.2.
-    c = calibration([(0.7, True), (0.7, False)])
-    assert c["n"] == 2 and c["ece"] == 0.2 and len(c["bins"]) == 1
-    assert c["bins"][0]["avg_confidence"] == 0.7 and c["bins"][0]["win_rate"] == 0.5
-    # perfectly calibrated -> ECE 0.
-    perfect = calibration([(0.9, True)] * 9 + [(0.9, False)], bins=10)
-    assert perfect["ece"] == 0.0
-    assert calibration([])["ece"] is None
+# ---- confidence discrimination (ordinal, NOT ECE) ---- #
+def test_confidence_discrimination_ordinal():
+    # higher confidence -> higher win rate is MONOTONE and shows a positive spread.
+    pairs = [(0.6, False), (0.6, False), (0.9, True), (0.9, True)]
+    d = confidence_discrimination(pairs)
+    buckets = {b["lo"]: b["win_rate"] for b in d["buckets"]}
+    assert buckets[0.6] == 0.0 and buckets[0.9] == 1.0
+    assert d["monotonic"] is True and d["spread"] == 1.0
+    # a single confidence level -> no ordering to judge (monotonic/spread undefined).
+    flat = confidence_discrimination([(0.7, True), (0.7, False)])
+    assert flat["monotonic"] is None and flat["spread"] is None and len(flat["buckets"]) == 1
+    assert confidence_discrimination([])["n"] == 0
 
 
 # ---- regime coverage ---- #
@@ -73,47 +75,48 @@ def test_regime_coverage_counts_only_closed():
     assert regime_coverage(rows) == {"bull_trend": 2, "range": 1, "unknown": 1}
 
 
-# ---- walk-forward split ---- #
-def test_walk_forward_splits_m15_contiguously_without_overlap():
-    windows = _windows(n=260)
-    folds = walk_forward_windows(windows, folds=2)
+# ---- temporal folds (slice the OUTPUT of one continuous run, not the input) ---- #
+def test_temporal_folds_partition_rows_by_time():
+    rows = [{"as_of": _END + timedelta(minutes=15 * i)} for i in range(10)]
+    folds = temporal_folds(rows, folds=2)
     assert len(folds) == 2
-    m15_total = windows[TRIGGER_TF]
-    seg0, seg1 = folds[0][TRIGGER_TF], folds[1][TRIGGER_TF]
-    assert len(seg0) + len(seg1) == len(m15_total)              # partition, no loss
-    assert seg0[-1].close_time < seg1[0].close_time             # contiguous, non-overlapping
-    # higher-TF context is kept up to each fold's end, never beyond it.
-    for fold in folds:
-        end = fold[TRIGGER_TF][-1].close_time
-        assert all(c.close_time <= end for c in fold["1day"])
-    assert folds[0]["_meta"]["fold"] == 0
+    assert folds[0]["meta"]["bars"] == 5 and folds[1]["meta"]["bars"] == 5
+    assert [r["as_of"] for r in folds[0]["rows"]] == [rows[i]["as_of"] for i in range(5)]
+    assert folds[0]["rows"][-1]["as_of"] < folds[1]["rows"][0]["as_of"]   # contiguous
+    assert temporal_folds([], folds=2) == []
 
 
 # ---- baselines ---- #
-def test_flat_baseline_never_trades():
+def test_all_baselines_actually_trade():
+    """The point of a baseline is to trade so it can be beaten. RandomMaker's trade confidence now
+    clears the risk gate — an earlier 0.5 was below min_confidence (0.60) and produced ZERO
+    trades, making the whole 'beat random' comparison meaningless. On the same trending window the
+    prefilter passes, random opens BUY/SELL and they resolve."""
     report = run(evaluate_over_windows(
-        _windows(), symbol="GOLD", provider_name="csv", modeled_spread_pct=0.02,
+        _windows(n=320), symbol="GOLD", provider_name="csv", modeled_spread_pct=0.02,
+        makers={"random": RandomMaker(p_trade=1.0)}))   # always trade -> exercises the gate
+    assert report["makers"]["random"]["overall"]["trades_closed"] > 0    # <- the bug: was 0
+
+    flat = run(evaluate_over_windows(
+        _windows(n=320), symbol="GOLD", provider_name="csv", modeled_spread_pct=0.02,
         makers={"flat": FlatMaker()}))
-    flat = report["makers"]["flat"]["overall"]
-    assert flat["trades_closed"] == 0                          # flat opens nothing -> expectancy N/A
+    assert flat["makers"]["flat"]["overall"]["trades_closed"] == 0       # flat legitimately never trades
 
 
 def test_evaluate_reports_all_baselines_with_full_metrics():
     report = run(evaluate_over_windows(
-        _windows(), symbol="GOLD", provider_name="csv", modeled_spread_pct=0.02,
-        makers={"confluence": None, "random": RandomMaker(), "flat": FlatMaker()}
-        if False else None))   # default -> confluence + random + flat
+        _windows(), symbol="GOLD", provider_name="csv", modeled_spread_pct=0.02))
     assert set(report["makers"]) == {"confluence", "random", "flat"}
     for name in ("confluence", "random", "flat"):
         m = report["makers"][name]["overall"]
-        for key in ("expectancy_ci", "max_drawdown_r", "regime_coverage", "confidence_calibration"):
+        for key in ("expectancy_ci", "max_drawdown_r", "regime_coverage", "confidence_discrimination"):
             assert key in m
 
 
-def test_walk_forward_reports_per_fold():
+def test_temporal_fold_report_has_per_fold_metrics():
     report = run(evaluate_over_windows(
         _windows(), symbol="GOLD", provider_name="csv", modeled_spread_pct=0.02,
-        makers={"confluence": None} if False else {"random": RandomMaker()}, folds=2))
+        makers={"random": RandomMaker()}, folds=2))
     entry = report["makers"]["random"]
     assert "folds" in entry and len(entry["folds"]) == 2
     assert entry["folds"][0]["meta"]["fold"] == 0

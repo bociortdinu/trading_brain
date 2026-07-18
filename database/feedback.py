@@ -1,8 +1,10 @@
 """Feedback loop (Faza 5): what the shadow track record says, fed back into a later decision.
 
-STRICT anti look-ahead: a decision at `as_of` may only see trades that CLOSED strictly before
-`as_of` — their outcome was actually known by then. A trade opened before `as_of` but still open
-(or closing after it) contributes NOTHING; using it would leak the future into the decision.
+STRICT anti look-ahead: a decision at `as_of` may only see trades whose outcome was OBSERVED
+before `as_of` — actually known by then. We gate on `outcome_observed_at` (when reconciliation
+recorded the close), NOT `closed_at` (the bar the price hit): after a downtime a trade can close
+at T but only be observed at T+downtime, and a decision in between must not see it. `closed_at`
+is the fallback only for legacy rows written before `outcome_observed_at` existed.
 
 Two levels (level 3 kNN/pgvector is deferred):
 - level 1: aggregate performance per market regime (small, cheap, always safe to include);
@@ -35,8 +37,8 @@ def regime_performance(dsn: str, *, run_id: str, before: datetime) -> list[dict]
             WHERE t.run_id = %s
               AND t.status <> 'open'
               AND t.r_multiple IS NOT NULL
-              AND t.closed_at IS NOT NULL
-              AND t.closed_at < %s
+              AND COALESCE(t.outcome_observed_at, t.closed_at) IS NOT NULL
+              AND COALESCE(t.outcome_observed_at, t.closed_at) < %s
             GROUP BY s.regime
             ORDER BY trades DESC, regime
             """,
@@ -61,9 +63,9 @@ def recent_closed_trades(dsn: str, *, run_id: str, before: datetime, k: int = 5)
             WHERE t.run_id = %s
               AND t.status <> 'open'
               AND t.r_multiple IS NOT NULL
-              AND t.closed_at IS NOT NULL
-              AND t.closed_at < %s
-            ORDER BY t.closed_at DESC
+              AND COALESCE(t.outcome_observed_at, t.closed_at) IS NOT NULL
+              AND COALESCE(t.outcome_observed_at, t.closed_at) < %s
+            ORDER BY COALESCE(t.outcome_observed_at, t.closed_at) DESC
             LIMIT %s
             """,
             (run_id, before, k),

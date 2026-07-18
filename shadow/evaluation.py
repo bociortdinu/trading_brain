@@ -1,17 +1,19 @@
-"""Faza 5 — walk-forward evaluation protocol (deterministic parts).
+"""Faza 5 — temporal fold report + deterministic baselines.
 
 Replaces the naive "50-100 trades" threshold with an honest report:
-- BASELINES a strategy must beat: the deterministic confluence rule (no-LLM), random, and flat.
+- BASELINES a strategy must beat NET OF COSTS: the confluence rule (no-LLM), random, flat(0). All
+  three actually TRADE (their trade confidence clears the Risk Engine's min_confidence).
 - Expectancy with a BOOTSTRAP confidence interval, not a point estimate.
 - Max drawdown in R.
-- Confidence CALIBRATION (reliability bins + ECE) — meaningful once a maker emits varied
-  confidence (the LLM); constant-confidence makers collapse to one bin, honestly.
+- Confidence DISCRIMINATION (win rate per confidence bucket) — NOT ECE: confidence is ordinal, so
+  ECE would need a probabilistic calibration fit on train first.
 - Regime COVERAGE (trades per regime) — you cannot trust a stratum with too few trades.
-- WALK-FORWARD: contiguous out-of-sample segments, each reported separately.
+- TEMPORAL FOLDS: one continuous run (full warm-up + position state), OUTPUT sliced by time. This
+  is NOT a walk-forward (no train→OOS split); a real one needs a trainable maker (the LLM).
 
-What is NOT here (honest): the "LLM beats no-LLM / no-feedback net of costs" verdict needs an
-actual paid LLM run (deferred by the user); the no-feedback-vs-feedback baseline is an LLM-only
-comparison. This module provides the framework + the deterministic baselines + all the metrics.
+HONEST GAPS: the "LLM beats no-LLM / with-feedback vs without net of costs" verdict needs a PAID
+`--maker claude` run (deferred). `--feedback` wires the as_of-safe track record into a persisted
+backtest, so that comparison becomes runnable once a paid run is authorised.
 """
 
 from __future__ import annotations
@@ -20,9 +22,7 @@ import random as _random
 from statistics import mean
 
 from core.models import Direction
-from data_collector.providers.base import Candle
 from decision.schema import DecisionOutput
-from features.mtf import TRIGGER_TF
 from shadow.metrics import summarize
 
 
@@ -57,33 +57,33 @@ def max_drawdown_r(r_multiples: list[float]) -> float:
     return round(worst, 4)
 
 
-def calibration(pairs: list[tuple[float, bool]], *, bins: int = 10) -> dict:
-    """Reliability bins + Expected Calibration Error for (confidence, won) pairs.
+def confidence_discrimination(pairs: list[tuple[float, bool]], *, bins: int = 10) -> dict:
+    """Does a HIGHER confidence go with a HIGHER win rate? — the only honest question for an
+    ORDINAL confidence (schema.py declares confidence ordinal, NOT a probability). We report win
+    rate per confidence bucket + `monotonic` (win rate non-decreasing across occupied buckets) +
+    `spread` (top bucket win rate − bottom).
 
-    Each bin: mean confidence, empirical win rate (accuracy), count. ECE = sum over bins of
-    (count/N) * |confidence - accuracy|. A well-calibrated maker has confidence ~= win rate; a
-    constant-confidence maker collapses to a single occupied bin (reported honestly, not hidden).
-    """
+    We deliberately do NOT compute ECE: Expected Calibration Error assumes confidence is a
+    probability, which requires a probabilistic calibration fit on train and evaluated OOS. On raw
+    ordinal confidence ECE is meaningless. Discrimination is what's measurable now."""
     pts = [(float(c), bool(w)) for c, w in pairs]
     n = len(pts)
     if n == 0:
-        return {"n": 0, "ece": None, "bins": []}
+        return {"n": 0, "monotonic": None, "spread": None, "buckets": []}
     edges = [i / bins for i in range(bins + 1)]
-    out_bins = []
-    ece = 0.0
+    buckets = []
     for b in range(bins):
         lo, hi = edges[b], edges[b + 1]
-        # last bin is closed on the right so confidence == 1.0 lands somewhere.
         in_bin = [(c, w) for c, w in pts if (lo <= c < hi) or (b == bins - 1 and c == 1.0)]
         if not in_bin:
             continue
-        cnt = len(in_bin)
-        conf = mean(c for c, _ in in_bin)
-        acc = mean(1.0 if w else 0.0 for _, w in in_bin)
-        ece += (cnt / n) * abs(conf - acc)
-        out_bins.append({"lo": round(lo, 2), "hi": round(hi, 2), "count": cnt,
-                         "avg_confidence": round(conf, 3), "win_rate": round(acc, 3)})
-    return {"n": n, "ece": round(ece, 4), "bins": out_bins}
+        buckets.append({"lo": round(lo, 2), "hi": round(hi, 2), "count": len(in_bin),
+                        "avg_confidence": round(mean(c for c, _ in in_bin), 3),
+                        "win_rate": round(mean(1.0 if w else 0.0 for _, w in in_bin), 3)})
+    wrs = [b["win_rate"] for b in buckets]
+    monotonic = all(wrs[i] <= wrs[i + 1] for i in range(len(wrs) - 1)) if len(wrs) > 1 else None
+    spread = round(wrs[-1] - wrs[0], 3) if len(wrs) > 1 else None
+    return {"n": n, "monotonic": monotonic, "spread": spread, "buckets": buckets}
 
 
 def regime_coverage(rows: list[dict]) -> dict:
@@ -97,33 +97,29 @@ def regime_coverage(rows: list[dict]) -> dict:
     return dict(sorted(cov.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
-def walk_forward_windows(windows: dict[str, list[Candle]], *, folds: int) -> list[dict[str, list[Candle]]]:
-    """Split into `folds` CONTIGUOUS out-of-sample segments by M15 time. Each fold keeps the FULL
-    higher-timeframe history up to that fold's end (higher-TF context must not be truncated), but
-    only the fold's own slice of M15 bars is 'the test window'. Folds are non-overlapping in M15."""
-    m15 = windows[TRIGGER_TF]
-    n = len(m15)
+def temporal_folds(rows: list[dict], *, folds: int) -> list[dict]:
+    """Partition ONE continuous run's rows into `folds` contiguous time segments (by as_of).
+
+    This is a TEMPORAL FOLD REPORT, NOT a walk-forward: there is no train→OOS split because the
+    deterministic baselines don't train. The whole run is executed ONCE — full indicator warm-up,
+    position state (busy_until) carried across the whole window — and only the OUTPUT is sliced by
+    time. (An earlier version sliced the WINDOWS per fold, which discarded warm-up, reset the open
+    position at each boundary and left folds below MIN_BARS empty — all wrong.) A real
+    walk-forward with a train/calibrate stage needs a trainable maker (the LLM, deferred)."""
+    ordered = sorted(rows, key=lambda r: r["as_of"])
+    n = len(ordered)
     if folds < 1 or n < folds:
-        return [windows]
+        return [{"meta": {"fold": 0}, "rows": ordered}] if ordered else []
     size = n // folds
     out = []
     for f in range(folds):
         start = f * size
         end = n if f == folds - 1 else (f + 1) * size
-        seg_m15 = m15[start:end]
-        if not seg_m15:
+        seg = ordered[start:end]
+        if not seg:
             continue
-        fold_end = seg_m15[-1].close_time
-        seg_start = seg_m15[0].open_time
-        fold = {}
-        for tf, bars in windows.items():
-            if tf == TRIGGER_TF:
-                fold[tf] = seg_m15
-            else:
-                # keep higher-TF bars up to the fold end (context), from the start (warm-up).
-                fold[tf] = [c for c in bars if c.close_time <= fold_end]
-        fold["_meta"] = {"fold": f, "m15_from": seg_start.isoformat(), "m15_to": fold_end.isoformat()}
-        out.append(fold)
+        out.append({"meta": {"fold": f, "from": seg[0]["as_of"].isoformat(),
+                             "to": seg[-1]["as_of"].isoformat(), "bars": len(seg)}, "rows": seg})
     return out
 
 
@@ -140,17 +136,22 @@ class FlatMaker:
 
 class RandomMaker:
     """Seeded coin-flip BUY/SELL/NO_TRADE. Beating RANDOM net of costs is the floor for 'signal'.
-    Deterministic given the seed so a run is reproducible."""
+    Deterministic given the seed so a run is reproducible.
 
-    def __init__(self, seed: int = 7, p_trade: float = 0.5):
+    `trade_confidence` must clear the Risk Engine's min_confidence (0.60) or the baseline would
+    never actually open a trade — an earlier version used 0.5 and produced ZERO trades, making
+    the 'beat random' comparison meaningless."""
+
+    def __init__(self, seed: int = 7, p_trade: float = 0.5, trade_confidence: float = 0.7):
         self._rng = _random.Random(seed)
         self._p = p_trade
+        self._conf = trade_confidence
 
     async def decide(self, inp) -> DecisionOutput:
         if self._rng.random() >= self._p:
             return DecisionOutput(direction=Direction.NO_TRADE, confidence=0.5, rationale="rnd-flat")
         d = self._rng.choice([Direction.BUY, Direction.SELL])
-        return DecisionOutput(direction=d, confidence=0.5, rationale="rnd")
+        return DecisionOutput(direction=d, confidence=self._conf, rationale="rnd")
 
 
 def _metrics_for(rows: list[dict]) -> dict:
@@ -172,60 +173,56 @@ def _metrics_for(rows: list[dict]) -> dict:
     m["expectancy_ci"] = bootstrap_expectancy_ci(rs)
     m["max_drawdown_r"] = max_drawdown_r(rs)
     m["regime_coverage"] = regime_coverage(cov_rows)
-    m["confidence_calibration"] = calibration(cal_pairs)
+    m["confidence_discrimination"] = confidence_discrimination(cal_pairs)
     return m
 
 
 async def evaluate_over_windows(windows, *, symbol, provider_name, modeled_spread_pct,
                                 slippage_pct=0.0, makers=None, folds=1) -> dict:
-    """Run each baseline maker over the walk-forward folds (in memory, NOTHING persisted) and
-    return a comparison report: per maker, overall + per fold, the full metric bundle.
+    """Run each baseline maker over the FULL window ONCE (in memory, NOTHING persisted), then
+    report the full metric bundle overall + per temporal fold. One continuous run preserves
+    indicator warm-up and the single-position state; folds are a slice of the OUTPUT, not of the
+    input (see temporal_folds).
 
     `makers` is {name: maker}; defaults to the three baselines. The LLM maker can be passed too,
     but the honest 'LLM beats baseline net of costs' verdict is only meaningful on a paid run."""
     from shadow.runner import ConfluenceStrategy, backtest_over_windows
 
     makers = makers or {"confluence": ConfluenceStrategy(), "random": RandomMaker(), "flat": FlatMaker()}
-    fold_windows = walk_forward_windows(windows, folds=folds)
 
     report: dict = {"symbol": symbol, "folds": folds, "makers": {}}
     for name, maker in makers.items():
-        overall_rows: list[dict] = []
-        per_fold = []
-        for fw in fold_windows:
-            meta = fw.get("_meta", {})
-            w = {k: v for k, v in fw.items() if k != "_meta"}
-            rows = await backtest_over_windows(
-                w, symbol=symbol, provider_name=provider_name, modeled_spread_pct=modeled_spread_pct,
-                slippage_pct=slippage_pct, decision_maker=maker)
-            overall_rows.extend(rows)
-            if folds > 1:
-                per_fold.append({"meta": meta, "metrics": _metrics_for(rows)})
-        entry = {"overall": _metrics_for(overall_rows)}
+        rows = await backtest_over_windows(
+            windows, symbol=symbol, provider_name=provider_name, modeled_spread_pct=modeled_spread_pct,
+            slippage_pct=slippage_pct, decision_maker=maker)
+        entry = {"overall": _metrics_for(rows)}
         if folds > 1:
-            entry["folds"] = per_fold
+            entry["folds"] = [{"meta": fold["meta"], "metrics": _metrics_for(fold["rows"])}
+                              for fold in temporal_folds(rows, folds=folds)]
         report["makers"][name] = entry
     return report
 
 
 def format_report(report: dict) -> str:
     """Human-readable one-screen summary of an evaluate_over_windows result."""
-    lines = [f"Walk-forward evaluation — {report['symbol']} ({report['folds']} fold(s))", ""]
-    header = f"{'maker':<12} {'trades':>7} {'win%':>6} {'exp_R':>7} {'CI(exp_R)':>18} {'maxDD_R':>8} {'ECE':>6}"
+    lines = [f"Temporal fold report — {report['symbol']} ({report['folds']} fold(s), ONE continuous run)", ""]
+    header = f"{'maker':<12} {'trades':>7} {'win%':>6} {'exp_R':>7} {'CI(exp_R)':>18} {'maxDD_R':>8} {'discr':>6}"
     lines.append(header)
     lines.append("-" * len(header))
     for name, entry in report["makers"].items():
         m = entry["overall"]
         ci = m.get("expectancy_ci") or {}
         ci_s = f"[{ci.get('lo')}, {ci.get('hi')}]" if ci.get("lo") is not None else "—"
-        ece = (m.get("confidence_calibration") or {}).get("ece")
+        spread = (m.get("confidence_discrimination") or {}).get("spread")
         lines.append(
             f"{name:<12} {m.get('trades_closed', 0):>7} "
             f"{(m.get('win_rate') or 0) * 100:>5.1f}% {m.get('expectancy_r', 0):>7} "
-            f"{ci_s:>18} {m.get('max_drawdown_r', 0):>8} {ece if ece is not None else '—':>6}")
+            f"{ci_s:>18} {m.get('max_drawdown_r', 0):>8} {spread if spread is not None else '—':>6}")
     lines.append("")
     lines.append("Baselines to beat NET OF COSTS: a real edge > confluence(no-LLM), > random, > flat(0).")
-    lines.append("NOTE: LLM-vs-baseline needs a paid --maker claude run (deferred); this run is deterministic.")
+    lines.append("`discr` = win-rate spread across confidence buckets (ordinal); NOT ECE — confidence is")
+    lines.append("ordinal, so probabilistic calibration (ECE) needs a train fit first.")
+    lines.append("NOT a walk-forward (no train→OOS split); the LLM-vs-baseline verdict needs a paid run.")
     return "\n".join(lines)
 
 
@@ -236,9 +233,9 @@ def main() -> int:
     from config.settings import load_settings
     from data_collector.providers.factory import build_provider
 
-    parser = argparse.ArgumentParser(description="Faza 5 walk-forward evaluation (deterministic baselines).")
+    parser = argparse.ArgumentParser(description="Faza 5 temporal fold report (deterministic baselines).")
     parser.add_argument("--count", type=int, default=1500, help="M15 bars to fetch")
-    parser.add_argument("--folds", type=int, default=2, help="walk-forward out-of-sample folds")
+    parser.add_argument("--folds", type=int, default=2, help="contiguous temporal folds (report only)")
     args = parser.parse_args()
     settings = load_settings()
 

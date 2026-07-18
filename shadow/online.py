@@ -90,7 +90,10 @@ def reconcile_open_trades(dsn: str, m15_bars: list[Candle], *, run_id: str,
             upsert_shadow_trade(dsn, decision_id=row["decision_id"], run_id=run_id,
                                 symbol=row["symbol"], trade=trade, outcome=outcome,
                                 timeframe=TRIGGER_TF, timeout_bars=cfg.timeout_bars,
-                                costs=cost_manifest(trade, cfg))
+                                costs=cost_manifest(trade, cfg),
+                                # WHEN we observed the close (now), not the bar's close_time — so
+                                # a downtime-delayed observation can't be injected retroactively.
+                                observed_at=datetime.now(timezone.utc))
             closed += 1
     return closed
 
@@ -179,15 +182,15 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
             inp = build_decision_input(packet, mode="online", feedback=feedback)
             # ATOMIC + idempotent on (input_fingerprint, run_id): a concurrent/duplicate insert
             # returns the existing decision id instead of creating a second row.
+            # ATOMIC: the decision AND its paid-call audit in one transaction (llm_result), so an
+            # audit failure can't leave a committed decision with a lost paid call.
             dec_id, _ = insert_decision(
                 settings.db_dsn, snapshot_id=snap_id, evaluation_id=eval_id, model=model_name,
                 record=record, ai_input=inp.model_dump(mode="json"),
                 ai_output=record.decision.model_dump(mode="json") if record.decision else None,
                 mode="shadow", data_provider=provider_name, run_id=run_id,
-                input_fingerprint=fingerprint, spread_observation_id=spread_obs_id,
+                input_fingerprint=fingerprint, spread_observation_id=spread_obs_id, llm_result=last,
             )
-            if last is not None:   # audit the paid call, LINKED to the decision it produced
-                insert_llm_call(settings.db_dsn, last, snapshot_id=snap_id, decision_id=dec_id)
             summary["decision"] = f"{record.stage}:{record.decision.direction.value if record.decision else '-'}"
             if record.risk_approved:
                 # Online: fill at the OBSERVED quote mid (captures real latency), not the bar close.

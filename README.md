@@ -24,8 +24,9 @@ python -m app.smoke
 pip install 'psycopg[binary]'
 # 2a. create the DB with a PRIVILEGED role (once):
 BRAIN_ADMIN_DB_DSN='postgresql://<admin>:<pw>@127.0.0.1:5433/postgres' python -m database.bootstrap
-# 2b. apply versioned migrations with the APP role (idempotent):
-python -m database.migrate
+# 2b. apply versioned migrations — DDL runs as ADMIN, then least-privilege DML is granted to the
+#     app role (BRAIN_ADMIN_DB_DSN required; the app role cannot run DDL):
+BRAIN_ADMIN_DB_DSN='postgresql://<admin>:<pw>@127.0.0.1:5433/postgres' python -m database.migrate
 ```
 
 `app.smoke` places no orders — it only reads `/status`, `/instruments`, `/quote`.
@@ -59,22 +60,25 @@ No real money, no execution. The deterministic maker (`ConfluenceStrategy`) is f
 claude` is the real paid model, guarded by a hard call cap + explicit confirmation.
 
 ```bash
-# Backtest over historical bars (single position at a time, full cost model):
+# Backtest over historical bars (single position at a time; cost model = spread + slippage +
+# gap-through-stop + commission/swap IF their rates are configured, else NOT modelled):
 python -m shadow.runner --count 2500                      # deterministic, free
 python -m shadow.runner --count 2500 --persist --run-id my-exp   # write the auditable chain
 python -m shadow.runner --maker claude --max-llm-calls 50 --yes  # PAID, capped + confirmed
+python -m shadow.runner --persist --run-id fb --feedback         # inject the as_of-safe track record
 
 # Continuous shadow-online (decide on each M15 close, reconcile open trades):
 python -m shadow.online --once            # one tick   (deterministic maker only online)
 python -m shadow.online                   # loop, waking at each M15 close
 
-# Walk-forward evaluation: baselines (confluence / random / flat), bootstrap CI, drawdown,
-# confidence calibration (ECE), regime coverage, per-fold + overall:
+# Temporal fold report: baselines (confluence / random / flat, all trading), bootstrap CI,
+# drawdown, confidence discrimination (ordinal, not ECE), regime coverage, per-fold + overall:
 python -m shadow.evaluation --count 2500 --folds 2
 ```
 
-Backtests take an exclusive lock on `run_id` (a stateful run must be serial); a crashed run
-resumes without re-calling the model or duplicating trades.
+Backtests take an exclusive lock on `run_id` (a stateful run must be serial). A crashed run
+resumes **when the config is unchanged** (the execution config is part of the decision
+fingerprint), without re-calling the model or duplicating trades.
 
 ## Tests
 

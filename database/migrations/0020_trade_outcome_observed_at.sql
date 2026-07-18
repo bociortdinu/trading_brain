@@ -1,0 +1,11 @@
+-- 0020: record WHEN a trade's outcome became KNOWN, distinct from when the price closed it.
+--
+-- The feedback loop must only show a decision outcomes that were actually known by its as_of.
+-- Using closed_at (the bar time the SL/TP was hit) is a look-ahead leak online: after a downtime,
+-- a trade whose price closed at T may only be RECONCILED (observed) at T+downtime. A decision made
+-- between T and T+downtime must NOT see that result — it wasn't known yet.
+--
+-- outcome_observed_at = when reconciliation recorded the close. In a deterministic backtest this
+-- equals closed_at (no downtime); online it is the wall-clock reconcile time. Feedback filters on
+-- this, falling back to closed_at for legacy rows written before this column.
+ALTER TABLE trades ADD COLUMN outcome_observed_at TIMESTAMPTZ;
