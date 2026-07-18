@@ -265,11 +265,15 @@ teste de acoperire weekend/iarnă/early-close (`a86d161`); run_id derivat din co
 trade-urilor deschise din run-ul anterior (`93babb2`).
 
 **Rămâne (trading_brain, necesită sesiune dedicată):** identitatea snapshotului per
-provider/dataset (migrare + cheie de observație); impunerea reală append-only în DB (rol de
-retenție separat, granturi per tabel, revocare DELETE de la app-role); politica de catch-up după
-downtime (gap operațional persistat, nu doar ultima bară); lock de dependențe cu hash-uri; fixtures
-live de calendar pentru iarnă/DST/early-close; wiring știri live sau scoaterea din DoD-ul v1; rate
-reale GOLD din specificația contului.
+**dependency lock** (`requirements.lock`, wired în CI/Docker — versiuni; hash-urile rămân
+follow-up, `349fd37`) și **detecția gap-ului de downtime** (calendar-aware, logat + în summary,
+`6c21fd0`) sunt FĂCUTE. Rămân două **migrări dedicate** (risc de regresie dacă sunt grăbite):
+**(a) identitatea snapshotului** per provider/dataset (schimbare de cheie + backfill;
+`latest_snapshot_bar_close` devine provider-specific); **(b) append-only real** — revocarea DELETE
+de la app-role pe cele 4 tabele de fapte (niciun cod de producție nu le șterge, dar ~8 curățări de
+test folosesc app-role DELETE → cer rol de retenție/curățare pe admin + verificarea FK CASCADE).
+Plus: persistarea DURABILĂ a gap-ului (tabel dedicat), fixtures live de calendar iarnă/DST,
+wiring știri live sau scoaterea din DoD-ul v1, rate reale GOLD din specificația contului.
 
 **Blocat (NU în acest repo / neconstruit):** execuția demo (idempotency `/purchase`, state machine
 de ordine, atomicitate order↔DB, garduri, close/PnL autoritativ, client ipax) și testele/keepalive
