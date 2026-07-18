@@ -83,17 +83,18 @@ def _to_trade(row: dict) -> VirtualTrade:
     )
 
 
-def reconcile_open_trades(dsn: str, coarse_bars: list[Candle], *, run_id: str, provider_name: str,
+def reconcile_open_trades(dsn: str, coarse_bars: list[Candle], *, symbol: str, provider_name: str,
                           now: datetime | None = None,
                           shadow_config: ShadowConfig | None = None,
                           fine_bars: list[Candle] | None = None) -> int:
-    """Reconcile OPEN shadow trades against `coarse_bars` (the trigger timeframe), optionally using
-    the finer `fine_bars` (e.g. M1) PER TRADE when they calendar-cover that trade's window from
-    entry. Update (close) those hit in place; returns how many left 'open'.
+    """Reconcile OPEN shadow trades for `symbol` ACROSS ALL RUNS against `coarse_bars` (the trigger
+    timeframe), optionally using the finer `fine_bars` (e.g. M1) PER TRADE when they calendar-cover
+    that trade's window from entry. Update (close) those hit in place; returns how many closed.
 
-    Each trade is reconciled with the ShadowConfig it was OPENED with (rebuilt from its stored cost
-    manifest), NOT the current one — a live config change must never silently re-price an already-
-    open position's R. That frozen config also decides the reconcile granularity per trade.
+    Across-runs matters: a new run_id (after a config/release change) must still drain positions
+    left open by a PREVIOUS run — each trade is closed under ITS OWN run_id, reconciled with the
+    ShadowConfig it was OPENED with (rebuilt from its stored cost manifest, incl. its frozen
+    reconcile granularity), NEVER the current live config.
 
     FAIL-CLOSED coverage: if neither timeframe calendar-covers [opened_at, now] (e.g. the trade is
     older than the fetched window), the trade is left UNMODIFIED and a warning is logged — never
@@ -103,8 +104,9 @@ def reconcile_open_trades(dsn: str, coarse_bars: list[Candle], *, run_id: str, p
     fallback = shadow_config or ShadowConfig()
     fine_bars = fine_bars or []
     closed = 0
-    for row in open_shadow_trades(dsn, run_id):
+    for row in open_shadow_trades(dsn, symbol=symbol):     # ACROSS runs, not just the current one
         trade = _to_trade(row)
+        trade_run_id = row["run_id"]                       # close under the trade's OWN run
         cfg = shadow_config_from_costs(row.get("costs"), timeout_bars=row.get("timeout_bars"),
                                        fallback=fallback)
         # Per-trade FROZEN granularity — not the current settings' reconcile_timeframe.
@@ -115,7 +117,7 @@ def reconcile_open_trades(dsn: str, coarse_bars: list[Candle], *, run_id: str, p
             # The window from entry is not fully covered by open-market bars — cannot trust any
             # conclusion (a touch could hide in the gap). Leave the trade open and alert.
             log.warning("reconcile skipped (uncovered window) run=%s decision=%s opened_at=%s",
-                        run_id, row.get("decision_id"), trade.opened_at.isoformat())
+                        trade_run_id, row.get("decision_id"), trade.opened_at.isoformat())
             continue
         # Record the granularity that ACTUALLY produced this R (per trade; may be a fallback).
         cfg = cfg.model_copy(update={"reconcile_timeframe": tf_used})
@@ -124,7 +126,7 @@ def reconcile_open_trades(dsn: str, coarse_bars: list[Candle], *, run_id: str, p
             costs = cost_manifest(trade, cfg)
             if fell_back:
                 costs["reconcile_fallback"] = True   # wanted finer bars, reconciled at the trigger TF
-            upsert_shadow_trade(dsn, decision_id=row["decision_id"], run_id=run_id,
+            upsert_shadow_trade(dsn, decision_id=row["decision_id"], run_id=trade_run_id,
                                 symbol=row["symbol"], trade=trade, outcome=outcome,
                                 timeframe=TRIGGER_TF, timeout_bars=cfg.timeout_bars,
                                 costs=costs,
@@ -198,12 +200,13 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
                                             shadow_config.reconcile_timeframe,
                                             shadow_config.timeout_bars, now)
     summary["reconciled_closed"] = reconcile_open_trades(
-        settings.db_dsn, windows[TRIGGER_TF], run_id=run_id, provider_name=provider_name,
+        settings.db_dsn, windows[TRIGGER_TF], symbol=brain_symbol, provider_name=provider_name,
         now=now, shadow_config=shadow_config, fine_bars=fine_bars)
 
-    # 2) POSITION GATE (matches the backtest): one position per run at a time. If a trade is
-    #    still open after reconciliation, do NOT decide or open another (also saves an LLM call).
-    if open_shadow_trades(settings.db_dsn, run_id):
+    # 2) POSITION GATE: one position per SYMBOL at a time, across ALL runs. If a trade for this
+    #    symbol is still open anywhere (incl. a previous run), do NOT decide or open another — this
+    #    both matches single-position and blocks stacking a new run on a not-yet-drained old one.
+    if open_shadow_trades(settings.db_dsn, symbol=brain_symbol):
         summary["decision"] = "skipped:position_open"
         return summary
 
@@ -454,17 +457,41 @@ async def _loop(settings: Settings, run_id: str, maker, model_name: str,
                 await aclose()
 
 
+def config_digest(settings: Settings) -> str:
+    """Short, stable hash of the config that determines a shadow run's OUTCOMES — cost/financing
+    config, eligibility policy, risk/prefilter config, calendar (provider) and strategy version.
+    A change to ANY of these yields a new default run_id, so an incompatible config never silently
+    lands in an old run (RunConfigMismatch)."""
+    import hashlib
+    import json
+
+    from app.collect import _eligibility_config
+    from decision.prefilter import PrefilterConfig
+    from risk.engine import RiskConfig
+    blob = {
+        "shadow": shadow_config_from_settings(settings).model_dump(mode="json"),
+        "risk": RiskConfig().model_dump(mode="json"),
+        "prefilter": PrefilterConfig().model_dump(mode="json"),
+        "eligibility": _eligibility_config(settings).as_policy(),
+        "provider": settings.market_data_provider,   # picks the market calendar
+        "strategy": STRATEGY_VERSION,
+    }
+    return hashlib.sha256(json.dumps(blob, sort_keys=True).encode()).hexdigest()[:10]
+
+
 def resolve_run_id(cli_run_id: str | None, settings: Settings) -> str:
     """Explicit --run-id wins; else BRAIN_RUN_ID (settings.run_id); else a default that embeds the
-    strategy version so a strategy change forces a new run rather than a silent RunConfigMismatch."""
+    strategy version AND a config digest — so changing costs/RiskConfig/eligibility/calendar forces
+    a NEW run rather than a silent RunConfigMismatch against an incompatible old run."""
     if cli_run_id:
         return cli_run_id
     if settings.run_id:
         return settings.run_id
-    log.warning("no --run-id / BRAIN_RUN_ID set; using the strategy-versioned default. Set "
-                "BRAIN_RUN_ID to a release/build id when the config changes, to avoid mixing "
-                "an upgraded config into the old run (RunConfigMismatch).")
-    return f"shadow-online-{STRATEGY_VERSION}"
+    digest = config_digest(settings)
+    log.warning("no --run-id / BRAIN_RUN_ID set; using the config-derived default "
+                "shadow-online-%s-%s. Set BRAIN_RUN_ID to a release/build id for a stable "
+                "experiment identity across code changes.", STRATEGY_VERSION, digest)
+    return f"shadow-online-{STRATEGY_VERSION}-{digest}"
 
 
 def main() -> int:

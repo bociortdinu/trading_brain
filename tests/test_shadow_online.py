@@ -48,16 +48,18 @@ def test_shadow_tick_does_not_retry_programming_error(monkeypatch):
 
 
 # --- finer-bar (M1) reconciliation fetch: best-effort, degrades to the trigger TF --------------
-def test_resolve_run_id_prefers_cli_then_env_then_strategy_versioned_default():
-    """P0-7: a static default run_id makes a legitimate config upgrade hit RunConfigMismatch. The
-    CLI wins, else BRAIN_RUN_ID, else a default that embeds the strategy version."""
+def test_resolve_run_id_prefers_cli_then_env_then_config_digest_default():
+    """R2-5/P0-7: CLI wins, else BRAIN_RUN_ID, else a default that embeds the strategy version AND
+    a CONFIG DIGEST — so a cost/RiskConfig/eligibility/calendar change forces a new run."""
     from config.settings import Settings
     from decision.schema import STRATEGY_VERSION
     from shadow.online import resolve_run_id
     assert resolve_run_id("cli-x", Settings(run_id="env-y")) == "cli-x"
     assert resolve_run_id(None, Settings(run_id="env-y")) == "env-y"
     default = resolve_run_id(None, Settings(run_id=None))
-    assert default == f"shadow-online-{STRATEGY_VERSION}" and STRATEGY_VERSION in default
+    assert default.startswith(f"shadow-online-{STRATEGY_VERSION}-")
+    # a cost change must change the default (was static before)
+    assert resolve_run_id(None, Settings(run_id=None)) != resolve_run_id(None, Settings(commission_pct=0.05))
 
 
 def test_fetch_finer_bars_falls_back_to_empty_on_provider_error():

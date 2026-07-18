@@ -1005,7 +1005,7 @@ def test_open_trade_is_reconciled_with_the_rates_it_was_opened_with():
                         open=4000, high=4030, low=3999, close=4025, volume=1.0)        # 02:00->02:15 TP
         bars, now = [b1, tp_bar], opened + timedelta(minutes=30)
         # CURRENT config says swap=0. The fix must ignore it for this already-open trade.
-        assert reconcile_open_trades(DSN, bars, run_id=run_id, provider_name="csv", now=now,
+        assert reconcile_open_trades(DSN, bars, symbol=sym, provider_name="csv", now=now,
                                      shadow_config=ShadowConfig(swap_pct_per_night=0.0)) == 1
         with psycopg.connect(DSN) as c:
             r_stored = float(c.execute("SELECT r_multiple FROM trades WHERE decision_id=%s",
@@ -1062,13 +1062,13 @@ def test_reconcile_open_trades_closes_hit_trades_idempotently():
         tp_bar = Candle(open_time=end, close_time=end + timedelta(minutes=15),
                         open=4000, high=4030, low=3999, close=4025, volume=1.0)
         now = end + timedelta(minutes=15)
-        assert reconcile_open_trades(DSN, [tp_bar], run_id=run_id, provider_name="csv",
+        assert reconcile_open_trades(DSN, [tp_bar], symbol=sym, provider_name="csv",
                                      now=now) == 1   # closes the open trade
         with psycopg.connect(DSN) as c:
             row = c.execute("SELECT status, exit_reason FROM trades WHERE decision_id=%s AND run_id=%s",
                             (dec_id, run_id)).fetchone()
         assert row[0] == "closed" and row[1] == "tp_hit"
-        assert reconcile_open_trades(DSN, [tp_bar], run_id=run_id, provider_name="csv",
+        assert reconcile_open_trades(DSN, [tp_bar], symbol=sym, provider_name="csv",
                                      now=now) == 0   # idempotent: none left open
     finally:
         _cleanup(sym)
@@ -1101,7 +1101,7 @@ def test_reconcile_open_trades_skips_an_uncovered_trade_fail_closed():
                         close_time=datetime(2026, 7, 8, 14, 15, tzinfo=timezone.utc),
                         open=4000, high=4030, low=3999, close=4025, volume=1.0)
         now = datetime(2026, 7, 8, 14, 15, tzinfo=timezone.utc)
-        assert reconcile_open_trades(DSN, [tp_bar], run_id=run_id, provider_name="csv", now=now) == 0
+        assert reconcile_open_trades(DSN, [tp_bar], symbol=sym, provider_name="csv", now=now) == 0
         with psycopg.connect(DSN) as c:
             status = c.execute("SELECT status FROM trades WHERE decision_id=%s",
                                (dec_id,)).fetchone()[0]
@@ -1110,6 +1110,44 @@ def test_reconcile_open_trades_skips_an_uncovered_trade_fail_closed():
         with psycopg.connect(DSN) as c:
             c.execute("DELETE FROM trades WHERE run_id=%s", (run_id,))
             c.execute("DELETE FROM decisions WHERE run_id=%s", (run_id,))
+            c.commit()
+        _cleanup(sym)
+
+
+def test_reconcile_drains_open_trades_from_a_previous_run():
+    """R2-5 lifecycle: a NEW run must reconcile (drain) positions left open by a PREVIOUS run for
+    the same symbol — closing each under its OWN run_id — else old trades are orphaned and the new
+    run's symbol-wide position gate blocks forever."""
+    from core.models import Direction
+    from data_collector.providers.base import Candle
+    from database.repository import upsert_shadow_trade
+    from shadow.online import reconcile_open_trades
+    from shadow.reconciler import reconcile
+    from shadow.virtual_broker import ShadowConfig, cost_manifest, open_virtual_trade
+
+    sym, old_run = "TST_" + os.urandom(3).hex(), "old-" + os.urandom(3).hex()
+    end = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    cfg = ShadowConfig()
+    try:
+        dec_id = _seed_decision(sym, run_id=old_run, input_fingerprint="drainfp")
+        trade = open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6, spread_pct=0.0,
+                                   spread_provenance="modeled", opened_at=end)
+        upsert_shadow_trade(DSN, decision_id=dec_id, run_id=old_run, symbol=sym, trade=trade,
+                            outcome=reconcile(trade, [], cfg), timeframe="15min",
+                            timeout_bars=96, costs=cost_manifest(trade, cfg))
+        tp_bar = Candle(open_time=end, close_time=end + timedelta(minutes=15),
+                        open=4000, high=4030, low=3999, close=4025, volume=1.0)
+        now = end + timedelta(minutes=15)
+        # Reconcile by SYMBOL (a new run tick has a different run_id) -> still closes the old trade.
+        assert reconcile_open_trades(DSN, [tp_bar], symbol=sym, provider_name="csv", now=now) == 1
+        with psycopg.connect(DSN) as c:
+            row = c.execute("SELECT status, run_id FROM trades WHERE decision_id=%s",
+                           (dec_id,)).fetchone()
+        assert row[0] == "closed" and row[1] == old_run   # closed under ITS OWN run, not the new one
+    finally:
+        with psycopg.connect(DSN) as c:
+            c.execute("DELETE FROM trades WHERE run_id=%s", (old_run,))
+            c.execute("DELETE FROM decisions WHERE run_id=%s", (old_run,))
             c.commit()
         _cleanup(sym)
 

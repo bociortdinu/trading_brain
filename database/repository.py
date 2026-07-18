@@ -526,19 +526,28 @@ def find_decision_by_fingerprint(dsn: str, *, input_fingerprint: str, run_id: st
     return row[0] if row else None
 
 
-def open_shadow_trades(dsn: str, run_id: str) -> list[dict]:
-    """OPEN shadow trades for a run — enough to reconstruct the VirtualTrade and reconcile
-    them against new bars on a later tick."""
+def open_shadow_trades(dsn: str, run_id: str | None = None, *, symbol: str | None = None) -> list[dict]:
+    """OPEN shadow trades — enough to reconstruct the VirtualTrade and reconcile them against new
+    bars on a later tick. Filter by `run_id` (one run) OR `symbol` (ACROSS runs, so a new run can
+    still drain/reconcile positions left open by a previous run). Each row carries its own run_id."""
     import psycopg
 
     from psycopg.rows import dict_row
 
+    where = ["mode = 'shadow'", "status = 'open'"]
+    params: list = []
+    if run_id is not None:
+        where.append("run_id = %s")
+        params.append(run_id)
+    if symbol is not None:
+        where.append("symbol = %s")
+        params.append(symbol)
     with psycopg.connect(dsn, row_factory=dict_row) as conn:
         return conn.execute(
-            "SELECT decision_id, symbol, side, entry_price, sl_price, tp_price, opened_at, "
+            "SELECT decision_id, run_id, symbol, side, entry_price, sl_price, tp_price, opened_at, "
             "spread_pct, spread_provenance, slippage_pct, timeout_bars, costs FROM trades "
-            "WHERE mode = 'shadow' AND status = 'open' AND run_id = %s",
-            (run_id,),
+            "WHERE " + " AND ".join(where),
+            tuple(params),
         ).fetchall()
 
 
