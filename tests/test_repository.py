@@ -1161,6 +1161,37 @@ def test_run_manifest_pins_a_run_to_one_config():
             c.commit()
 
 
+def test_online_verifies_run_manifest_before_any_fetch_or_mutation():
+    """A shadow_tick started with a config incompatible with the run_id must abort with ZERO side
+    effects. The old order fetched + reconciled (mutating open trades) and could return at the
+    position gate WITHOUT ever checking the manifest. Now the manifest is verified first, so a
+    mismatch raises before the provider is even touched."""
+    import asyncio
+
+    from config.settings import Settings
+    from database.repository import RunConfigMismatch, assert_run_manifest
+    from shadow.online import shadow_tick
+    from shadow.virtual_broker import ShadowConfig
+
+    run_id = "rm-order-" + os.urandom(3).hex()
+
+    class ExplodingProvider:
+        async def get_ohlcv(self, *a, **k):
+            raise AssertionError("provider was fetched BEFORE the run-manifest check")
+
+    try:
+        assert_run_manifest(DSN, run_id, {"pinned": "A"}, "hashA")   # pin to a different config
+        settings = Settings(db_dsn=DSN)
+        with pytest.raises(RunConfigMismatch):        # NOT AssertionError -> no fetch happened
+            asyncio.run(shadow_tick(
+                settings, ExplodingProvider(), "csv", decision_maker=object(),
+                run_id=run_id, shadow_config=ShadowConfig(commission_pct=0.07)))
+    finally:
+        with psycopg.connect(DSN) as c:
+            c.execute("DELETE FROM run_manifests WHERE run_id=%s", (run_id,))
+            c.commit()
+
+
 def test_online_decision_and_open_trade_are_one_atomic_chain():
     """Online writes the decision + its open trade in ONE transaction, so a crash can't leave a
     committed decision with no trade (online had no recovery for that window). And a re-run with

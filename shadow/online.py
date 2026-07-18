@@ -80,17 +80,18 @@ def _to_trade(row: dict) -> VirtualTrade:
 
 def reconcile_open_trades(dsn: str, coarse_bars: list[Candle], *, run_id: str,
                           shadow_config: ShadowConfig | None = None,
-                          fine_bars: list[Candle] | None = None,
-                          want_tf: str = TRIGGER_TF) -> int:
+                          fine_bars: list[Candle] | None = None) -> int:
     """Reconcile OPEN shadow trades against `coarse_bars` (the trigger timeframe), optionally using
     the finer `fine_bars` (e.g. M1) PER TRADE when they continuously cover that trade's window.
     Update (close) those hit in place; returns how many left 'open'.
 
     Each trade is reconciled with the ShadowConfig it was OPENED with (rebuilt from its stored cost
     manifest), NOT the current one — a live config change must never silently re-price an already-
-    open position's R. `shadow_config` is only the fallback for what a (legacy) manifest lacked.
-    The finer feed is used ONLY when it fully covers the trade (else a touch could hide in a gap):
-    the granularity actually used and any fallback are recorded on the closed trade."""
+    open position's R. That frozen config also decides the reconcile granularity per trade (its
+    own `reconcile_timeframe`), so the CURRENT settings never drive an old trade's measurement.
+    `shadow_config` is only the fallback for what a (legacy) manifest lacked. The finer feed is
+    used ONLY when it fully covers the trade (else a touch could hide in a gap): the granularity
+    actually used and any fallback are recorded on the closed trade."""
     fallback = shadow_config or ShadowConfig()
     fine_bars = fine_bars or []
     closed = 0
@@ -98,8 +99,10 @@ def reconcile_open_trades(dsn: str, coarse_bars: list[Candle], *, run_id: str,
         trade = _to_trade(row)
         cfg = shadow_config_from_costs(row.get("costs"), timeout_bars=row.get("timeout_bars"),
                                        fallback=fallback)
+        # Per-trade FROZEN granularity — not the current settings' reconcile_timeframe.
         bars, tf_used, fell_back = select_reconcile_bars_for_trade(
-            fine_bars, coarse_bars, opened_at=trade.opened_at, want_tf=want_tf, trigger_tf=TRIGGER_TF)
+            fine_bars, coarse_bars, opened_at=trade.opened_at,
+            want_tf=cfg.reconcile_timeframe, trigger_tf=TRIGGER_TF)
         # Record the granularity that ACTUALLY produced this R (per trade; may be a fallback).
         cfg = cfg.model_copy(update={"reconcile_timeframe": tf_used})
         outcome = reconcile(trade, bars, cfg)
@@ -138,6 +141,26 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     now = datetime.now(timezone.utc)
     brain_symbol = settings.symbol_query
     provider_symbol = settings.provider_symbol(brain_symbol)
+
+    # VERIFY THE RUN CONFIG FIRST — before any fetch or DB mutation. A process started with a config
+    # incompatible with this run_id must abort with ZERO side effects; the old order reconciled
+    # (mutating open trades) and could return at the position gate without ever checking the
+    # manifest. The execution manifest depends only on config/versions, so it is known here.
+    exec_manifest = execution_manifest(
+        modeled_spread_pct=settings.replay_spread_pct, slippage_pct=settings.slippage_pct,
+        config=shadow_config, single_position=True, cooldown_bars=0,
+        risk_config_version=RiskConfig().version, prefilter_version=PrefilterConfig().version)
+    exec_manifest.update({
+        "run_kind": "shadow_online",
+        "maker": model_name,
+        "provider": provider_name,
+        "symbol": brain_symbol,
+        "feedback": True,
+        **git_metadata(),
+    })
+    exec_hash = execution_hash(exec_manifest)
+    assert_run_manifest(settings.db_dsn, run_id, exec_manifest, exec_hash)   # raises on mismatch
+
     windows = await fetch_windows(provider, provider_symbol, settings.timeframes, now)
     closes = m15_closes(windows)
     if not closes:
@@ -149,15 +172,17 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     #    entry — so we never stack a new position on one the same bars should have closed. Prefer
     #    finer (M1) bars for intrabar SL/TP ordering when configured and available; else fall back
     #    to the trigger timeframe and record that the R was measured coarsely.
-    want_tf = shadow_config.reconcile_timeframe
+    # Best-effort provisioning of finer bars (current settings decide whether to fetch M1); the
+    # PER-TRADE decision to actually use them is made against each trade's frozen config inside
+    # reconcile_open_trades. A frozen-M1 trade under a now-M15 config simply falls back (flagged).
     fine_bars: list[Candle] = []
-    if want_tf != TRIGGER_TF:
-        fine_bars = await _fetch_finer_bars(provider, provider_symbol, want_tf,
+    if shadow_config.reconcile_timeframe != TRIGGER_TF:
+        fine_bars = await _fetch_finer_bars(provider, provider_symbol,
+                                            shadow_config.reconcile_timeframe,
                                             shadow_config.timeout_bars, now)
-    summary["reconcile_want_tf"] = want_tf   # per-trade granularity/fallback is recorded on each trade
     summary["reconciled_closed"] = reconcile_open_trades(
         settings.db_dsn, windows[TRIGGER_TF], run_id=run_id, shadow_config=shadow_config,
-        fine_bars=fine_bars, want_tf=want_tf)
+        fine_bars=fine_bars)
 
     # 2) POSITION GATE (matches the backtest): one position per run at a time. If a trade is
     #    still open after reconciliation, do NOT decide or open another (also saves an LLM call).
@@ -188,23 +213,8 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
                                recent_trades=_fb["recent_trades"])
 
     # The fingerprint includes feedback AND the execution config (a decision made with a different
-    # track record or a different config is a different decision).
-    exec_manifest = execution_manifest(
-        modeled_spread_pct=settings.replay_spread_pct, slippage_pct=settings.slippage_pct,
-        config=shadow_config, single_position=True, cooldown_bars=0,
-        risk_config_version=RiskConfig().version, prefilter_version=PrefilterConfig().version)
-    exec_manifest.update({
-        "run_kind": "shadow_online",
-        "maker": model_name,
-        "provider": provider_name,
-        "symbol": brain_symbol,
-        "feedback": True,
-        **git_metadata(),
-    })
-    exec_hash = execution_hash(exec_manifest)
-    # A run id is an experiment identity, not just a label. Pin it before the paid/free maker
-    # can run, exactly as the backtest does, so one run cannot silently mix code/config/provider.
-    assert_run_manifest(settings.db_dsn, run_id, exec_manifest, exec_hash)
+    # track record or a different config is a different decision). The run manifest (exec_hash) was
+    # already verified at the top, before any mutation.
     fingerprint = decision_fingerprint(
         input_hash=build_decision_input(packet, mode="online", feedback=feedback).input_hash(),
         model=model_name, provider=provider_name, risk_config_version=RiskConfig().version,
