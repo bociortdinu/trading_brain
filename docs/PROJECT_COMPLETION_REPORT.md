@@ -70,10 +70,14 @@ Aceste puncte sunt prioritare chiar dacă nu se va trimite nicio ordine.
 
 ### P0 — operare repetabilă
 
-1. **Pornire și supraveghere durabilă.** Un singur mod documentat de a porni PostgreSQL,
-   `trading_hands`, collectorul, `shadow.online` și dashboardul; restart automat, shutdown curat,
-   rotație de loguri și readiness checks. Acum sunt comenzi manuale și nu există packaging de
-   serviciu/Compose pentru `trading_brain`.
+1. **Pornire și supraveghere durabilă.** **Livrat parțial:** `Dockerfile` + `docker-compose.yaml`
+   + `Makefile` + [RUNBOOK.md](RUNBOOK.md). `make up` pornește nucleul (PostgreSQL → `migrate`
+   one-shot → dashboard) cu `restart: unless-stopped`, healthchecks (pg_isready + `/api/state`)
+   și readiness prin `depends_on` (condition). Bucla de date (collector + `shadow.online`) e sub
+   profilul `data` (`make up-data`), fiindcă are nevoie de o sursă externă (`trading_hands`/Polygon/CSV).
+   Config-ul e validat cu `docker compose config`; **rularea live `up` nu a fost făcută în sandbox**
+   (daemon Docker indisponibil) — de rulat pe mașina operatorului. **Rămâne:** rotația logurilor
+   (acum default json-file al Docker) și supervizarea peste restart-ul componentelor.
 2. **Lifecycle-ul autentificării XTB.** Alertă înainte/după expirarea TGT, procedură clară de
    re-login și verificare că serviciile brain își revin după reautentificare. Loginul din browser
    rămâne o intervenție de operator.
@@ -172,6 +176,7 @@ existe. Codul verde demonstrează consistență software, nu profitabilitate.
 2. Adaugă CI cu PostgreSQL (**făcut** — `.github/workflows/ci.yaml`, pending prima rulare) și
    backup/restore testat (încă de făcut).
 3. Livrează un stack operabil printr-o singură comandă, cu supervisor și runbook de reauth XTB.
+   (**făcut** — `make up` + [RUNBOOK.md](RUNBOOK.md), pending prima rulare live pe mașina operatorului).
 4. Rulează Shadow MVP continuu; folosește dashboardul pentru heartbeat și audit.
 5. Adaugă M1/ticks și termenii reali GOLD; repetă măsurarea.
 6. Decide providerul de știri sau scoate știrile din DoD-ul v1.

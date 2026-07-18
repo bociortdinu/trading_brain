@@ -12,6 +12,7 @@ and safe lifecycle.)
 - Architecture & functionality: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - Execution plan (phased): [docs/EXECUTION_PLAN.md](docs/EXECUTION_PLAN.md)
 - Current completion/readiness audit: [docs/PROJECT_COMPLETION_REPORT.md](docs/PROJECT_COMPLETION_REPORT.md)
+- One-command operable stack (Docker Compose): [docs/RUNBOOK.md](docs/RUNBOOK.md) — `make up`
 
 ## Phase 0 — run it
 

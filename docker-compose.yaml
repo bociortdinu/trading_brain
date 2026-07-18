@@ -1,0 +1,92 @@
+name: trading_brain
+
+# One command brings up the operable core: PostgreSQL, a one-shot migrate, and the read-only
+# dashboard. The market-data loop (collector + shadow.online) needs an external data source
+# (a running trading_hands, or Polygon/CSV), so it lives behind the `data` profile — enable it
+# with `docker compose --profile data up -d` once a provider is configured.
+#
+# All connection strings are assembled here from a handful of vars (see .env.compose.example);
+# the admin role does DDL, the app role only ever gets DML.
+
+x-brain-env: &brain-env
+  BRAIN_DB_DSN: postgresql://${BRAIN_APP_USER:-trading_brain_app}:${BRAIN_APP_PASSWORD:?set BRAIN_APP_PASSWORD in .env.compose}@db:5432/${BRAIN_DB_NAME:-trading_brain}
+  BRAIN_ADMIN_DB_DSN: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.compose}@db:5432/postgres
+  BRAIN_MARKET_DATA_PROVIDER: ${BRAIN_MARKET_DATA_PROVIDER:-xtb}
+  BRAIN_TRADING_HANDS_URL: ${BRAIN_TRADING_HANDS_URL:-http://host.docker.internal:4000}
+  BRAIN_POLYGON_API_KEY: ${BRAIN_POLYGON_API_KEY:-}
+  BRAIN_CSV_DIR: ${BRAIN_CSV_DIR:-}
+
+x-brain-service: &brain-service
+  build: .
+  image: trading_brain:local
+  environment: *brain-env
+
+services:
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.compose}
+      POSTGRES_DB: postgres
+    ports:
+      - 127.0.0.1:${BRAIN_DB_PORT:-5433}:5432
+    volumes:
+      - brain-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: create the app role + runtime DB (admin), then apply migrations from scratch.
+  # Every other service waits for this to succeed.
+  migrate:
+    <<: *brain-service
+    command: ["sh", "-c", "python -m database.bootstrap && python -m database.migrate"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  dashboard:
+    <<: *brain-service
+    command: ["python", "-m", "dashboard", "--host", "0.0.0.0", "--port", "8080"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - 127.0.0.1:${BRAIN_DASHBOARD_PORT:-8080}:8080
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/state?limit=1', timeout=4).status==200 else 1)\""]
+      interval: 15s
+      timeout: 6s
+      retries: 5
+      start_period: 10s
+
+  # --- data loop (opt-in: `--profile data`) — needs a reachable market-data source ----------
+  collector:
+    <<: *brain-service
+    command: ["python", "-m", "app.jobs"]
+    profiles: ["data"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  online:
+    <<: *brain-service
+    command: ["python", "-m", "shadow.online"]
+    profiles: ["data"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  brain-postgres-data:
