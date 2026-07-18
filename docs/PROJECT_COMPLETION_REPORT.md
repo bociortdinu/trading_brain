@@ -40,7 +40,7 @@ Risk Engine -> gate-uri stateful -> router live -> /purchase -> poziție XTB
 | Risk Engine | Implementat pentru shadow | fail-closed, spread/sesiune/confidence, SL/TP determinist; execuția rămâne explicit blocată |
 | Backtest/shadow | Implementat ca motor | o poziție per run, resume, deduplicare, benzi pentru ambiguitate intrabar, metrici |
 | Dashboard operator | Implementat | read-only, arată sănătatea, traseul deciziei, run-uri, cost/audit și alerte |
-| Teste curente | Verzi | Python: **241 passed, 34 skipped** fără DB; Go: `go test -race ./...` și `go vet ./...`; launcher Node: **8 passed** |
+| Teste curente | Verzi (local) | Python: **287 passed, 38 skipped** fără DB și **325 passed** cu baza `_test` izolată; Go: `go test -race ./...` + `vet` (repo `trading_hands`); launcher Node: **8 passed**. Categorii NErulate încă: **live Compose**, **live XTB**, **CI remote**. |
 
 Schema bazei active este la versiunea `0023_operational_observability` și corespunde codului.
 
@@ -116,7 +116,7 @@ iar testele nu mai scriu în baza operațională.
    **normalizarea unității/semnului** — modelul presupune **% din notional/preț**, dar XTB poate cota
    swap-ul în **puncte/valută de cont** (de convertit înainte de a te încrede în expectancy);
    `swap_currency` e doar informativ, nu există import automat din specificație.
-2. **Reconciliere M1 sau ticks.** **Suportat end-to-end:** `reconcile_timeframe` în `ShadowConfig`
+2. **Reconciliere M1 sau ticks.** **Suportat DOAR reconciler-side (NU end-to-end):** `reconcile_timeframe` în `ShadowConfig`
    (default `15min`, setabil `1min`) — reconciliatorul ordonează atingerile SL/TP la M1 și **rezolvă
    banda de ambiguitate**; timeout-ul e o **durată** (invariant la granularitate, nu 96 minute pe M1);
    M1 se folosește doar dacă **acoperă continuu** trade-ul de la intrare (altfel un SL din gol ar fi
@@ -253,6 +253,16 @@ estimarea. Trecerea la bani reali nu se poate estima onest înaintea măsurător
 - **P1**: block bootstrap pentru randamente serial-corelate + config complet de finanțare în
   evaluare + costuri pe componente (`10c6684`); triggere CI + hardening backup + check `.env`
   (`fe45e1d`).
+
+**Runda 2 de review a găsit că P0-2..8 erau INCOMPLETE — reparate ulterior (nu declara „toate P0
+gata" fără aceste commituri):** bara parțială de intrare cerută în acoperire + backtest forțat pe
+M15 (`47583c2`); credentialele admin scoase din serviciile app + secrete pe serviciu (`9267910`,
+test `test_compose.py`); eligibility (incl. `max_clock_skew_seconds`) în fingerprint-ul de backtest
+(`1efff57`); validare strictă în `Settings` + `reconcile` restrâns la 1min|15min (`4b1eb76`);
+„verified" cere commit real, nu doar `dirty=false` (`2863601`); caption-ul de costuri pe componente
+(`0e04119`); dump atomic + verificare checksum la restore (`819031b`); `.env` reale la 0600;
+teste de acoperire weekend/iarnă/early-close (`a86d161`); run_id derivat din config + drenarea
+trade-urilor deschise din run-ul anterior (`93babb2`).
 
 **Rămâne (trading_brain, necesită sesiune dedicată):** identitatea snapshotului per
 provider/dataset (migrare + cheie de observație); impunerea reală append-only în DB (rol de
