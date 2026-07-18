@@ -24,6 +24,12 @@ x-brain-service: &brain-service
       BRAIN_GIT_BRANCH: ${BRAIN_GIT_BRANCH:-unknown}
       BRAIN_GIT_DIRTY: ${BRAIN_GIT_DIRTY:-unknown}
   image: trading_brain:local
+  # Pass EVERY BRAIN_* the operator sets in .env.compose into the container (costs, reconcile
+  # timeframe, model, eligibility, run id, ...). The assembled DSNs in `environment` below win
+  # over anything in the file (compose precedence), so db:5432 wiring is preserved.
+  env_file:
+    - path: .env.compose
+      required: false
   environment: *brain-env
 
 services:
