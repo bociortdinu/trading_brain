@@ -50,7 +50,31 @@ python -m app.jobs
 ```
 
 `app.collect`/`app.jobs` write `market_snapshots` (idempotent on `(symbol, bar_close)`;
-a spread-less snapshot can later be enriched). No orders are placed.
+the contextual spread is a separate append-only fact, never mutating the observation).
+No orders are placed.
+
+## Phase 3 / 5 — shadow backtest & walk-forward evaluation
+
+No real money, no execution. The deterministic maker (`ConfluenceStrategy`) is free; `--maker
+claude` is the real paid model, guarded by a hard call cap + explicit confirmation.
+
+```bash
+# Backtest over historical bars (single position at a time, full cost model):
+python -m shadow.runner --count 2500                      # deterministic, free
+python -m shadow.runner --count 2500 --persist --run-id my-exp   # write the auditable chain
+python -m shadow.runner --maker claude --max-llm-calls 50 --yes  # PAID, capped + confirmed
+
+# Continuous shadow-online (decide on each M15 close, reconcile open trades):
+python -m shadow.online --once            # one tick   (deterministic maker only online)
+python -m shadow.online                   # loop, waking at each M15 close
+
+# Walk-forward evaluation: baselines (confluence / random / flat), bootstrap CI, drawdown,
+# confidence calibration (ECE), regime coverage, per-fold + overall:
+python -m shadow.evaluation --count 2500 --folds 2
+```
+
+Backtests take an exclusive lock on `run_id` (a stateful run must be serial); a crashed run
+resumes without re-calling the model or duplicating trades.
 
 ## Tests
 
@@ -65,12 +89,12 @@ BRAIN_DB_DSN='postgresql://user:pw@127.0.0.1:5433/trading_brain' python -m pytes
 | Path | Role |
 |---|---|
 | `config/` | typed settings (Pydantic) |
-| `brokers_bridge/` | async HTTP client for the 7 trading_hands endpoints |
+| `brokers_bridge/` | async HTTP client for the 8 trading_hands endpoints (incl. `/candles`) |
 | `data_collector/` | `MarketDataProvider` (XTB real-time, Polygon/Massive, CSV) + strict candle/series validation + session calendars + news (`as_of`) |
 | `features/` | indicators (numpy), regime/S-R engineering, MTF `FeaturePacket`, eligibility |
-| `database/` | versioned `migrations/` + `migrate.py` (app role) + `bootstrap.py` (admin role) + `repository.py` |
+| `database/` | versioned `migrations/` (0001–0019) + `migrate.py` (app role) + `bootstrap.py` (admin role) + `repository.py` + `feedback.py` (as_of-safe track record) |
 | `app/` | `smoke`, `collect`, `decide`, `jobs` (M15 scheduler) |
-| `decision/` | `schema` (strict I/O contract), `prefilter`, `llm_client` (Anthropic, fail-closed), `pipeline` |
+| `decision/` | `schema` (strict I/O contract, incl. news + feedback), `prefilter`, `llm_client` (Anthropic, fail-closed), `pipeline` |
 | `risk/` | `engine.py` — rigid gate + deterministic ATR-based SL/TP (never the LLM's job) |
-| `shadow/` | `virtual_broker`, `reconciler`, `runner` (backtest), `online` (continuous), `metrics` |
+| `shadow/` | `virtual_broker`, `reconciler`, `runner` (backtest), `online` (continuous), `metrics`, `evaluation` (walk-forward + baselines) |
 | `core/` | shared models/enums |

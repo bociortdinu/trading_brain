@@ -8,21 +8,69 @@
 
 ## Rezumat faze
 
-| Fază | Titlu | Livrează | Blochează |
+| Fază | Titlu | Livrează | Stadiu (2026-07-18) |
 |---|---|---|---|
-| 0 | Fundație | schelet, config, client trading_hands, health-check | tot |
-| 1 | Colectare + Features | snapshots MTF reale în DB (fără AI) | 2 |
-| 2 | Brain + Risk Engine | decizii validate (fără execuție) | 3 |
-| 3 | Shadow Mode | execuție fantomă + reconciliere modelată | 5 (parțial) |
-| 4 | Istoric autoritativ (ipax) | rezultat live autoritativ (subproiect) | 6 |
-| 5 | Feedback loop + evaluare | walk-forward cu baseline/costuri/calibrare | 6 |
-| 6 | Go-live controlat | live cu volum minim + kill-switch | — |
+| 0 | Fundație | schelet, config, client trading_hands, health-check | ✅ livrat |
+| 1 | Colectare + Features | snapshots MTF reale în DB (fără AI) | ✅ livrat |
+| 2 | Brain + Risk Engine | decizii validate (fără execuție) | ✅ livrat |
+| 3 | Shadow Mode | execuție fantomă + reconciliere modelată | ✅ livrat (motor complet) |
+| 4 | Istoric autoritativ (ipax) | rezultat live autoritativ (subproiect) | 🔬 SPIKE (cere trade-uri live) |
+| 5 | Feedback loop + evaluare | walk-forward cu baseline/costuri/calibrare | ◑ framework livrat; verdict LLM = plătit, amânat |
+| 6 | Go-live controlat | live cu volum minim + kill-switch | ⛔ neînceput (bani reali; porțile 4+5) |
 
 Cross-cutting (în toate fazele): manifest de reproducere, teste, discipline anti look-ahead.
 
 ---
 
-## Status onest (2026-07-14, după runda 3 de review extern)
+## Stadiu actual (2026-07-18)
+
+Instantaneu exact al proiectului. (Secțiunile „Status onest / Runda N" de mai jos sunt
+**changelog-ul de audit** — cum am ajuns aici; nu le citi ca stare curentă.)
+
+**Livrat și testat (Fazele 0–3 + framework-ul Fazei 5):**
+- **Colectare + features**: providere OHLCV (XTB real-time via trading_hands, Polygon/Massive,
+  CSV), doar bare închise, calendar de sesiune DST-aware, snapshot **imutabil** (OHLCV+features)
+  separat de spreadul contextual (`spread_observations`, append-only) și de eligibilitate
+  (`snapshot_evaluations`, per mode+policy). Backtest **O(n)** (precompute per-timeframe).
+- **Decizie + risc**: contract I/O strict (Structured Outputs), prefiltru, `AnthropicDecisionMaker`
+  fail-closed (primul apel LLM real făcut), Risk Engine determinist (SL/TP din ATR, spread
+  obligatoriu, sesiune pe **calendarul providerului**, fail-closed). Maker selectabil
+  `deterministic|claude`.
+- **Shadow Mode**: broker virtual (mid + cost round-trip plat + slippage + gap-through-stop +
+  comision/swap dacă ratele sunt setate), reconciliere intrabar cu bandă pesimist/optimist,
+  backtest + online continuu, **position gate** (o poziție o dată), **rezervare atomică**
+  înainte de apelul plătit + **recovery după crash** (refolosește decizia persistată, nu
+  reapelează maker-ul), lock exclusiv pe `run_id`.
+- **Feedback loop + evaluare (Faza 5, deterministic)**: track record `as_of`-safe injectat în
+  `DecisionInput`; protocol walk-forward cu baseline-uri (confluence/random/flat), bootstrap CI,
+  drawdown, calibrare confidence (ECE), acoperire pe regimuri.
+- **Persistență + audit**: `decisions`/`trades`/`snapshot_evaluations`/`spread_observations`/
+  `llm_calls`/`decision_reservations`; tabele de fapte **UPDATE-protected**; `schema_migrations`
+  read-only pentru app-role.
+- **trading_hands** (Go): endpoint `/candles` real-time (paginat), keepalive + **reconnect dovedit**
+  cu mock CoreAPI, data race pe `account` reparat.
+
+**Cifre reale:** **257 teste** (227 fără DB + 30 DB-gated), Go `-race`/`vet`/`gofmt` curate.
+**19 migrări** (0001–0019). Versiuni: features `1.2.0`, decision-schema `2026.3`, prompt `2026.1`,
+strategy `2026.1`, risk `2026.2`. Commit-uri feature: **23 în trading_brain, 7 în trading_hands**.
+
+**NU e făcut / deferit (onest):**
+- **Măsurarea edge-ului real cu LLM** — cere o rulare **plătită** `--maker claude` (amânată de user).
+  Framework-ul + baseline-urile deterministe există; lipsește doar rularea LLM.
+- **Serviciu monitorizat** — `shadow.online`/`app.jobs` nu rulează ca daemon → nu se acumulează
+  track record încă.
+- **Faza 4 (ipax)** = SPIKE; **Faza 6 (go-live)** = neînceput (ambele cer execuție/close-uri reale).
+- **Rate reale swap/comision** (cele 2 numere din xStation5); **știri LIVE** (cere sursă/API key);
+  swap long/short + DST/triple; `llm_calls` per-attempt (retry_count făcut, rânduri nu);
+  exact-once la LLM = **imposibil** (Anthropic nu acceptă cheie de idempotency — închis);
+  DELETE într-un rol de retenție separat (acum e UPDATE-protected, nu append-only strict);
+  nivel 3 kNN/pgvector pentru feedback.
+
+---
+
+## Status onest (istoric — runda 3 de review extern)
+
+> Changelog de audit. Reflectă starea de la momentul rundei, nu cea curentă (vezi „Stadiu actual").
 
 Supraevaluări corectate (reviewer-ul a avut dreptate de fiecare dată):
 
@@ -480,10 +528,11 @@ Nucleul Shadow Mode e gata (pur, determinist, testat):
 - [shadow/metrics.py](../shadow/metrics.py) — `summarize`: win rate, expectancy R, **rată de ambiguitate**, bandă `avg_r_pessimistic..optimistic`, breakdown pe motiv de ieșire.
 - `database.repository.upsert_shadow_trade` (nu `record_shadow_trade` — a fost înlocuit) → tabelul
   `trades` (`mode='shadow'`, benzi + ambiguitate, idempotent pe `(decision_id, run_id)`, monoton).
-Teste: `tests/test_shadow.py` (22, incl. politica conservatoare pe bara parțială) +
-`tests/test_shadow_runner.py` (4, incl. position gate + cap `--max-llm-calls`) +
-`tests/test_repository.py` (13, incl. lanțul complet snapshot→eval→decizie→trade, upsert monoton
-și **resume real**: backtestul rulat de două ori → 0 apeluri LLM repetate, 0 duplicate).
+Teste (curent): `tests/test_shadow.py` (23, incl. politica conservatoare pe bara parțială) +
+`tests/test_shadow_runner.py` (7, incl. position gate, cap `--max-llm-calls`, fast==slow) +
+`tests/test_repository.py` (30, incl. lanțul complet snapshot→eval→decizie→trade, upsert monoton,
+rezervare atomică/recovery, feedback `as_of`-safe) — **resume real**: backtestul rulat de două ori
+→ 0 apeluri LLM repetate, 0 duplicate.
 
 **Livrat (post-audit):**
 - **Backtest replay** — [shadow/runner.py](../shadow/runner.py): `backtest_over_windows` + spread modelat (`replay_spread_pct`); metrici de edge (win rate, expectancy R, bandă ambiguitate); `--persist` scrie lanțul complet (snapshot→eval→decizie→trade) cu `run_id`. Rulat real pe XTB. **Concluzia „nu are edge — toate sl_hit" NU se susține**: acea rulare era un
