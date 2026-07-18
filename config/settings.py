@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,7 +21,7 @@ class Settings(BaseSettings):
 
     # trading_hands HTTP API
     trading_hands_url: str = "http://127.0.0.1:4000"
-    http_timeout_seconds: float = 10.0
+    http_timeout_seconds: float = Field(10.0, gt=0)
 
     # PostgreSQL. `db_dsn` is the APPLICATION role (runtime DML only). `admin_db_dsn` is a
     # SEPARATE privileged role used by bootstrap/migrate. Repository tests are destructive and
@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     polygon_base_url: str = "https://api.polygon.io"
     # Client-side spacing between provider requests. Free tier is ~5 req/min, so
     # ~13s keeps us under it; set to 0 on a paid plan.
-    polygon_min_interval_seconds: float = 13.0
+    polygon_min_interval_seconds: float = Field(13.0, ge=0)
 
     # Decision eligibility. "online" measures freshness vs the wall clock; "replay"
     # vs as_of. The free tier is delayed, so it is for replay/dev — online Shadow is
@@ -65,12 +65,12 @@ class Settings(BaseSettings):
     eligibility_recent_window_bars: dict[str, int] = Field(
         default_factory=lambda: {"15min": 8, "1h": 6, "4h": 4, "1day": 3}
     )
-    eligibility_max_feed_lag_seconds: int = 1800
-    eligibility_max_quote_lag_seconds: int = 120
+    eligibility_max_feed_lag_seconds: int = Field(1800, gt=0)
+    eligibility_max_quote_lag_seconds: int = Field(120, gt=0)
     # The feed-vs-broker basis is trustworthy only when the XTB quote is observed close to
     # the bar close; beyond this lag the number is dominated by price movement, so it is
     # marked unreliable and the basis magnitudes are not reported.
-    max_basis_lag_seconds: int = 90
+    max_basis_lag_seconds: int = Field(90, gt=0)
 
     # LLM decision layer (Faza 2). ONE configurable baseline model; the benchmark model runs
     # on the SAME frozen inputs for comparison. No Haiku tiering yet (news classification is
@@ -82,10 +82,10 @@ class Settings(BaseSettings):
 
     # Shadow backtest: a MODELED spread for historical (replay) bars — we never borrow the
     # current live quote for a past bar. ~XTB gold spread observed live (~0.018-0.02%).
-    replay_spread_pct: float = 0.02
+    replay_spread_pct: float = Field(0.02, ge=0)
     # Modeled execution slippage (adverse) applied to every shadow entry AND exit fill, on top
     # of the spread. Keeps shadow R-multiples honest (not over-optimistic).
-    slippage_pct: float = 0.005
+    slippage_pct: float = Field(0.005, ge=0)
     # Real XTB GOLD financing terms. Default = NOT modeled (shadow R is then not net of financing;
     # the persisted cost manifest says so). Wire these from xStation5 -> GOLD -> Specification. The
     # MODEL supports a long/short swap split, a triple-swap weekday, and a DST-aware rollover tz;
@@ -94,16 +94,26 @@ class Settings(BaseSettings):
     swap_pct_per_night: float = 0.0                 # legacy single rate (both directions) if no split
     swap_long_pct_per_night: float | None = None    # BUY overnight (%/night of notional)
     swap_short_pct_per_night: float | None = None   # SELL overnight
-    triple_swap_weekday: int | None = None          # 0=Mon..6=Sun charged 3x (e.g. 2 = Wednesday)
+    triple_swap_weekday: int | None = Field(None, ge=0, le=6)   # 0=Mon..6=Sun charged 3x (e.g. 2=Wed)
     swap_currency: str | None = None                # informational: currency the swap is quoted in
     financing_terms_version: str = "unset"          # provenance of the terms above
-    rollover_hour_utc: int = 22                     # rollover hour, interpreted in rollover_tz
+    rollover_hour_utc: int = Field(22, ge=0, le=23)             # rollover hour, in rollover_tz
     rollover_tz: str = "UTC"                        # IANA tz for the DST-aware rollover wall-clock
     # Intrabar reconciliation granularity. "15min" (default) reconciles on the decision bar, so
     # SL and TP can both land in one bar (the pessimistic/optimistic ambiguity band). "1min"
     # resolves the touch ordering at M1 — fetched only for reconciliation, and it falls back to
     # 15min (flagged on the trade) if the provider cannot serve M1.
-    reconcile_timeframe: str = "15min"
+    reconcile_timeframe: Literal["1min", "15min"] = "15min"
+
+    @field_validator("rollover_tz")
+    @classmethod
+    def _validate_rollover_tz(cls, v: str) -> str:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"invalid BRAIN_ROLLOVER_TZ {v!r}: {exc}") from exc
+        return v
 
     def provider_symbol(self, brain_symbol: str) -> str:
         # Only Polygon uses a different ticker (C:XAUUSD); XTB and CSV use the brain symbol

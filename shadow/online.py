@@ -476,7 +476,8 @@ def main() -> int:
     parser.add_argument("--maker", choices=["deterministic", "claude"], default="deterministic",
                         help="decision maker: deterministic (free) or claude (paid API)")
     args = parser.parse_args()
-    settings = load_settings()
+    settings = load_settings()            # Settings validators run here (bad config -> hard exit)
+    _shadow_config(settings)              # build+validate the ShadowConfig ONCE at startup, not per tick
     run_id = resolve_run_id(args.run_id, settings)
     log.info("shadow online run_id=%s", run_id)
     maker, model_name = _build_maker(settings, args.maker)

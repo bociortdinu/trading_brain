@@ -17,12 +17,14 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from core.models import Direction
 
 SpreadProvenance = Literal["observed_xtb", "modeled", "historical"]
 Timeframe = Literal["1min", "15min", "1h", "4h", "1day"]
+TriggerTimeframe = Literal["15min"]           # the decision cadence (exactly M15 today)
+ReconcileTimeframe = Literal["1min", "15min"]  # only FINE timeframes make sense for reconciliation
 
 
 class ShadowConfig(BaseModel):
@@ -50,12 +52,12 @@ class ShadowConfig(BaseModel):
     rollover_tz: str = "UTC"
     # The decision cadence: `timeout_bars` is counted in THIS timeframe, so the hold horizon is a
     # fixed DURATION (timeout_bars * trigger_timeframe) regardless of the reconcile granularity.
-    trigger_timeframe: Timeframe = "15min"
+    trigger_timeframe: TriggerTimeframe = "15min"
     # Timeframe used for INTRABAR reconciliation (SL/TP touch ordering). Default = the decision
     # timeframe ("15min"): SL and TP can then both land in one bar -> the both-hit ambiguity band.
     # Set "1min" to resolve that ordering at M1 granularity (far fewer ambiguous cases). Recorded
     # in the manifest and the fingerprint; the actual granularity used is stored at close time.
-    reconcile_timeframe: Timeframe = "15min"
+    reconcile_timeframe: ReconcileTimeframe = "15min"
     # Online entries land MID-BAR (opened_at inside an M15 bar). We only have that bar's full
     # OHLC, which mixes pre- and post-entry movement. Conservative policy: on the partial entry
     # bar a STOP touch counts (pessimistic — the adverse move may be post-entry) but a TP touch
@@ -71,6 +73,13 @@ class ShadowConfig(BaseModel):
         except (ZoneInfoNotFoundError, ValueError) as exc:
             raise ValueError(f"invalid rollover_tz {v!r}: {exc}") from exc
         return v
+
+    @model_validator(mode="after")
+    def _reconcile_not_coarser_than_trigger(self) -> "ShadowConfig":
+        from data_collector.providers.base import timeframe_minutes
+        if timeframe_minutes(self.reconcile_timeframe) > timeframe_minutes(self.trigger_timeframe):
+            raise ValueError("reconcile_timeframe must not be coarser than trigger_timeframe")
+        return self
 
 
 class VirtualTrade(BaseModel):
