@@ -1,11 +1,17 @@
 # trading_brain
 
 Decision brain for the XTB trading system. Pure math in Python (data + indicators);
-a commercial LLM (Claude) is the sole decision-maker; a rigid Risk Engine gates every
-order sent to **trading_hands** over HTTP.
+a commercial LLM (Claude) is, *by design*, the sole directional decision-maker; a rigid
+Risk Engine gates every candidate decision. **No order is currently sent** — there is no live
+router and `execution_ready` is always `False`; the Risk Engine only approves *shadow*
+eligibility (deterministic SL/TP), and `trading_hands` is used read-only for data. (Runtime
+today: backtests and the continuous online loop run the free deterministic strategy as a
+stand-in — Claude stays gated off in the unbounded loop until it has a daily/monthly cost cap
+and safe lifecycle.)
 
 - Architecture & functionality: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - Execution plan (phased): [docs/EXECUTION_PLAN.md](docs/EXECUTION_PLAN.md)
+- Current completion/readiness audit: [docs/PROJECT_COMPLETION_REPORT.md](docs/PROJECT_COMPLETION_REPORT.md)
 
 ## Phase 0 — run it
 
@@ -54,7 +60,7 @@ python -m app.jobs
 the contextual spread is a separate append-only fact, never mutating the observation).
 No orders are placed.
 
-## Phase 3 / 5 — shadow backtest & walk-forward evaluation
+## Phase 3 / 5 — shadow backtest & temporal-fold evaluation
 
 No real money, no execution. The deterministic maker (`ConfluenceStrategy`) is free; `--maker
 claude` is the real paid model, guarded by a hard call cap + explicit confirmation.
@@ -91,7 +97,9 @@ python -m dashboard --open       # http://127.0.0.1:8080
 ```
 
 Nu expune endpointuri de ordine sau scriere, iar conexiunile sale DB sunt forțate `READ ONLY`.
-Detalii: [dashboard/README.md](dashboard/README.md).
+Alertele operaționale (ex. trade-uri rămase open) pot include **run-uri legacy neverificate**;
+în schimb **metricile oficiale de track record consumă doar run-uri cu manifest verificat** —
+`NO_VERIFIED_TRACK_RECORD` până când există așa ceva. Detalii: [dashboard/README.md](dashboard/README.md).
 
 ## Tests
 
@@ -116,5 +124,5 @@ BRAIN_TEST_DB_DSN='postgresql://user:pw@127.0.0.1:5433/trading_brain_test' pytho
 | `app/` | `smoke`, `collect`, `decide`, `jobs` (M15 scheduler) |
 | `decision/` | `schema` (strict I/O contract, incl. news + feedback), `prefilter`, `llm_client` (Anthropic, fail-closed), `pipeline` |
 | `risk/` | `engine.py` — rigid gate + deterministic ATR-based SL/TP (never the LLM's job) |
-| `shadow/` | `virtual_broker`, `reconciler`, `runner` (backtest), `online` (continuous), `metrics`, `evaluation` (walk-forward + baselines) |
+| `shadow/` | `virtual_broker`, `reconciler`, `runner` (backtest), `online` (continuous), `metrics`, `evaluation` (temporal-fold report + baselines; not true walk-forward — the maker is not trainable per fold) |
 | `core/` | shared models/enums |
