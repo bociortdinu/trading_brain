@@ -9,6 +9,7 @@ export
 POSTGRES_USER   ?= postgres
 BRAIN_DB_NAME   ?= trading_brain
 BRAIN_APP_USER  ?= trading_brain_app
+BACKUP_KEEP     ?= 14
 
 COMPOSE := docker compose --env-file .env.compose
 
@@ -47,11 +48,12 @@ migrate: | .env.compose ## Re-run bootstrap + migrations (idempotent)
 psql: ## Open a psql shell on the runtime DB (admin, via local trust inside the container)
 	$(COMPOSE) exec db psql -U $(POSTGRES_USER) -d $(BRAIN_DB_NAME)
 
-backup: ## pg_dump the runtime DB to backups/ (custom format)
+backup: ## pg_dump the runtime DB to backups/ (custom format; keeps newest $(BACKUP_KEEP)). For scheduled backups use deploy/systemd + scripts/db_backup.sh
 	@mkdir -p backups
 	$(COMPOSE) exec -T db pg_dump -U $(POSTGRES_USER) -Fc $(BRAIN_DB_NAME) \
-	  > backups/$(BRAIN_DB_NAME)_$$(date +%Y%m%d_%H%M%S).dump
-	@echo "wrote backups/ (custom-format dump; restore with: make restore FILE=backups/<name>.dump)"
+	  > backups/$(BRAIN_DB_NAME)_$$(date -u +%Y%m%dT%H%M%SZ).dump
+	@ls -1t backups/$(BRAIN_DB_NAME)_*.dump 2>/dev/null | tail -n +$$(($(BACKUP_KEEP)+1)) | xargs -r rm -f
+	@echo "wrote backups/ (kept newest $(BACKUP_KEEP); restore with: make restore FILE=backups/<name>.dump)"
 
 restore: ## Restore a dump into the runtime DB: make restore FILE=backups/<name>.dump
 	@test -n "$(FILE)" || { echo "usage: make restore FILE=backups/<name>.dump"; exit 2; }

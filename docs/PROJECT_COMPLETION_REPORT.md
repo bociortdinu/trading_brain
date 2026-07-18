@@ -92,8 +92,12 @@ Aceste puncte sunt prioritare chiar dacă nu se va trimite nicio ordine.
    verificare de idempotență → `bootstrap_test` → suita completă). **Pending prima rulare pe GitHub**
    pentru confirmare verde. Rămâne de adăugat un **test de upgrade** propriu-zis (migrare pe o bază
    pre-existentă, nu doar de la zero).
-5. **Backup și restore.** Backup automat pentru DB și un restore testat; fără acesta auditul și
-   track record-ul se pot pierde.
+5. **Backup și restore.** **Livrat:** `scripts/db_backup.sh` (pg_dump custom-format + retenție) +
+   `scripts/db_restore.sh` (cu guard `_test`/`--force`), unitate systemd + timer în `deploy/systemd/`
+   (și exemplu cron), plus `make backup`/`restore` prin container. **Restore testat** în CI
+   (`backup-restore`): dump → restore într-o bază nouă → compară numărul de migrări. Logica
+   scripturilor e unit-testată (`tests/test_backup.py`, cu pg_dump/pg_restore mock). Rămâne ca
+   operatorul să seteze DSN-ul admin + programul pe mașina reală.
 
 **DoD:** stackul pornește repetabil, rulează cel puțin 72 h fără intervenție în afară de
 reauth-ul documentat, se autorecuperează după restartul componentelor, alertele dispar/reapar corect,
@@ -178,7 +182,7 @@ existe. Codul verde demonstrează consistență software, nu profitabilitate.
 
 1. Curăță/separă baza de test și rezolvă trade-urile legacy rămase open.
 2. Adaugă CI cu PostgreSQL (**făcut** — `.github/workflows/ci.yaml`, pending prima rulare) și
-   backup/restore testat (încă de făcut).
+   backup/restore testat (**făcut** — scripturi + systemd + job CI `backup-restore`).
 3. Livrează un stack operabil printr-o singură comandă, cu supervisor și runbook de reauth XTB.
    (**făcut** — `make up` + [RUNBOOK.md](RUNBOOK.md), pending prima rulare live pe mașina operatorului).
 4. Rulează Shadow MVP continuu; folosește dashboardul pentru heartbeat și audit.

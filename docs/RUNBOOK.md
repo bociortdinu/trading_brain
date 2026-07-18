@@ -65,13 +65,37 @@ make up           # repornește
 
 ## Backup / restore
 
+**Manual (doar Docker, fără client pe host)** — rulează `pg_dump`/`pg_restore` în containerul `db`:
+
 ```bash
-make backup                              # backups/trading_brain_YYYYMMDD_HHMMSS.dump
+make backup                              # backups/trading_brain_<UTC>.dump; păstrează ultimele BACKUP_KEEP (14)
 make restore FILE=backups/<nume>.dump    # restore în baza runtime (--clean --if-exists)
 ```
 
-Programează `make backup` periodic (cron/systemd timer) și **testează** un restore înainte să te
-bazezi pe el.
+**Automat (programat, cu retenție)** — `scripts/db_backup.sh` (necesită `postgresql-client` pe host):
+
+```bash
+# systemd timer (zilnic 02:30, cu retenție):
+sudo install -Dm644 deploy/systemd/backup.env.example /etc/trading_brain/backup.env   # editează DSN-ul, chmod 0600
+sudo install -Dm755 scripts/db_backup.sh /opt/trading_brain/scripts/db_backup.sh
+sudo cp deploy/systemd/trading-brain-backup.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now trading-brain-backup.timer
+# sau cron:
+30 2 * * *  BRAIN_BACKUP_DSN='postgresql://postgres:PW@127.0.0.1:5433/trading_brain' \
+            BACKUP_DIR=/var/backups/trading_brain BACKUP_KEEP=30 /opt/trading_brain/scripts/db_backup.sh
+```
+
+**Restore testat.** Nu te baza pe un backup pe care nu l-ai restaurat. `scripts/db_restore.sh`
+refuză orice bază al cărei nume nu se termină în `_test` (fără `--force`), ca să nu suprascrii din
+greșeală baza operațională. CI-ul (`backup-restore`) face round-trip-ul complet — dump → restore
+într-o bază nouă → compară numărul de migrări aplicate — la fiecare push.
+
+```bash
+# verificare locală (necesită client pe host): restaurează într-o bază _test și compară
+scripts/db_restore.sh 'postgresql://postgres:PW@127.0.0.1:5433/trading_brain_test' backups/<nume>.dump
+```
+
+Folosește un DSN **admin/owner** pentru dump (rolul de aplicație nu poate citi toate obiectele).
 
 ## Oprire / reset
 

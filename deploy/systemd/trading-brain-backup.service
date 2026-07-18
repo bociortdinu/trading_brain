@@ -1,0 +1,16 @@
+[Unit]
+Description=trading_brain PostgreSQL backup (pg_dump custom format + retention)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Adjust to your install. Keep the DSN in the EnvironmentFile (chmod 0600), never on the cmdline.
+WorkingDirectory=/opt/trading_brain
+EnvironmentFile=/etc/trading_brain/backup.env
+ExecStart=/opt/trading_brain/scripts/db_backup.sh
+# Least privilege for a backup job.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/backups/trading_brain
+PrivateTmp=true
