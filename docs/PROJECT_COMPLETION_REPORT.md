@@ -83,8 +83,11 @@ Aceste puncte sunt prioritare chiar dacă nu se va trimite nicio ordine.
    snapshoturi de test vechi** trebuie curățate din baza operațională. Separat: clasificarea/închiderea
    controlată a celor 12 trade-uri legacy, marcarea datelor istorice neverificate și o politică de
    retenție. Metricile oficiale trebuie să consume exclusiv run-uri cu manifest verificat.
-4. **CI pentru `trading_brain`.** Suită fără infrastructură plus o bază PostgreSQL izolată, aplicarea
-   migrărilor de la zero și test de upgrade. `trading_hands` are CI; brain nu are workflow propriu.
+4. **CI pentru `trading_brain`.** Adăugat `.github/workflows/ci.yaml` cu două job-uri: `no-db`
+   (suită fără infrastructură) și `db` (PostgreSQL izolat + `bootstrap` → `migrate` de la zero →
+   verificare de idempotență → `bootstrap_test` → suita completă). **Pending prima rulare pe GitHub**
+   pentru confirmare verde. Rămâne de adăugat un **test de upgrade** propriu-zis (migrare pe o bază
+   pre-existentă, nu doar de la zero).
 5. **Backup și restore.** Backup automat pentru DB și un restore testat; fără acesta auditul și
    track record-ul se pot pierde.
 
@@ -166,7 +169,8 @@ existe. Codul verde demonstrează consistență software, nu profitabilitate.
 ## 7. Ordinea recomandată de execuție
 
 1. Curăță/separă baza de test și rezolvă trade-urile legacy rămase open.
-2. Adaugă CI cu PostgreSQL și backup/restore testat.
+2. Adaugă CI cu PostgreSQL (**făcut** — `.github/workflows/ci.yaml`, pending prima rulare) și
+   backup/restore testat (încă de făcut).
 3. Livrează un stack operabil printr-o singură comandă, cu supervisor și runbook de reauth XTB.
 4. Rulează Shadow MVP continuu; folosește dashboardul pentru heartbeat și audit.
 5. Adaugă M1/ticks și termenii reali GOLD; repetă măsurarea.

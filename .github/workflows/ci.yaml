@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Fast lane: everything that needs no infrastructure. Repository/operations tests skip
+  # themselves when BRAIN_TEST_DB_DSN is absent, so this stays green without a database.
+  no-db:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install (dev extras)
+        run: pip install -e '.[dev]'
+
+      - name: Test (no infrastructure; DB-gated tests skip)
+        run: python -m pytest -q
+
+  # Full lane: an isolated PostgreSQL, migrations applied FROM SCRATCH through the project's
+  # own admin/app-role split, then the complete suite against the `_test` database.
+  db:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # Admin (privileged) creds do DDL; the least-privilege app role only ever gets DML.
+      BRAIN_ADMIN_DB_DSN: postgresql://postgres:postgres@localhost:5432/postgres
+      BRAIN_DB_DSN: postgresql://trading_brain_app:ci_app_password@localhost:5432/trading_brain
+      BRAIN_TEST_DB_DSN: postgresql://trading_brain_app:ci_app_password@localhost:5432/trading_brain_test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install (dev + db extras)
+        run: pip install -e '.[dev,db]'
+
+      - name: Bootstrap runtime role + database (admin DDL creates the app role)
+        run: python -m database.bootstrap
+
+      - name: Apply migrations from scratch (runtime DB)
+        run: python -m database.migrate
+
+      - name: Migrations are idempotent (re-apply must be a clean no-op)
+        run: python -m database.migrate
+
+      - name: Bootstrap the isolated `_test` DB and migrate it from scratch
+        run: python -m database.bootstrap_test
+
+      - name: Full suite against the isolated test database
+        run: python -m pytest -q
