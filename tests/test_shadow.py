@@ -345,6 +345,22 @@ def test_covers_window_fails_when_trade_is_older_than_the_bar_window():
     assert covers_window(full, opened, now, "15min", cal) is True
 
 
+def test_count_missed_open_bars_is_calendar_aware():
+    """R2-16: downtime gap = open-market decision bars skipped between two decided closes; a normal
+    weekend (market closed) is NOT a gap."""
+    from data_collector.session import calendar_for
+    from shadow.reconciler import count_missed_open_bars
+    cal = calendar_for("csv")
+    mon = datetime(2026, 7, 6, 14, 0, tzinfo=UTC)
+    assert count_missed_open_bars(mon, mon + timedelta(hours=1), cal) == 3   # 14:15/14:30/14:45
+    assert count_missed_open_bars(mon, mon + timedelta(minutes=15), cal) == 0  # adjacent
+    assert count_missed_open_bars(None, mon, cal) == 0                        # no prior decision
+    # a fully market-closed weekend span registers no missed decisions
+    fri_after_close = datetime(2026, 7, 10, 21, 15, tzinfo=UTC)               # after Fri 17:00 ET close
+    sun_before_open = datetime(2026, 7, 12, 20, 0, tzinfo=UTC)                # before Sun 17:00 ET open
+    assert count_missed_open_bars(fri_after_close, sun_before_open, cal) == 0
+
+
 def test_covers_window_requires_the_partial_entry_bar():
     """P0-2 completion: a trade opened MID-bar can have its SL/TP hit inside the entry bar, so if
     the bar CONTAINING opened_at is missing (market open) the window is NOT covered. Starting one

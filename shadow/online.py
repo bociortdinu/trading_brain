@@ -42,6 +42,7 @@ from database.repository import (
     insert_evaluation,
     insert_llm_call,
     insert_spread_observation,
+    last_decision_as_of,
     open_shadow_trades,
     reserve_decision,
     upsert_shadow_trade,
@@ -57,7 +58,7 @@ from decision.schema import (
 )
 from features.mtf import TRIGGER_TF
 from risk.engine import RiskConfig
-from shadow.reconciler import reconcile, select_reconcile_bars_for_trade
+from shadow.reconciler import count_missed_open_bars, reconcile, select_reconcile_bars_for_trade
 from shadow.runner import ConfluenceStrategy
 from shadow.virtual_broker import (
     ShadowConfig,
@@ -186,6 +187,17 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
         return {"status": "no_bars"}
     as_of = closes[-1]
     summary: dict = {"as_of": as_of.isoformat()}
+
+    # DOWNTIME CATCH-UP (visibility): each tick decides only the LATEST bar, so after downtime the
+    # bars between the last decision and now are skipped. Count and record the gap (calendar-aware,
+    # so a weekend is not a gap) — the track record is only "continuous" if this stays 0.
+    prev = last_decision_as_of(settings.db_dsn, run_id, brain_symbol)
+    missed = count_missed_open_bars(prev, as_of, calendar_for(provider_name))
+    if missed:
+        summary["missed_bars"] = missed
+        log.warning("downtime gap: %d open-market bar(s) skipped between %s and %s (run=%s) — the "
+                    "track record is not continuous over this gap", missed,
+                    prev.isoformat() if prev else "?", as_of.isoformat(), run_id)
 
     # 1) RECONCILE FIRST: close any open trade the new bars just hit, BEFORE considering a new
     #    entry — so we never stack a new position on one the same bars should have closed. Prefer

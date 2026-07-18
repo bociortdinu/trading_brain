@@ -705,3 +705,16 @@ def latest_snapshot_bar_close(dsn: str, symbol: str):
             "SELECT max(bar_close) FROM market_snapshots WHERE symbol = %s", (symbol,)
         ).fetchone()
     return row[0] if row and row[0] else None
+
+
+def last_decision_as_of(dsn: str, run_id: str, symbol: str):
+    """The as_of of the most recent decision recorded for this run+symbol, or None — the bar the
+    online loop last decided on. Used to detect (and log) how many bars a downtime gap skipped."""
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        row = conn.execute(
+            "SELECT max(s.bar_close) FROM decisions d JOIN market_snapshots s ON s.id=d.snapshot_id "
+            "WHERE d.run_id = %s AND s.symbol = %s", (run_id, symbol),
+        ).fetchone()
+    return row[0] if row and row[0] else None

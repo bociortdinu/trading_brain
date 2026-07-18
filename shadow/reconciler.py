@@ -135,6 +135,23 @@ def _post_entry_bars(trade: VirtualTrade, bars: list[Candle]) -> list[Candle]:
     return usable
 
 
+def count_missed_open_bars(prev_close: datetime | None, current_close: datetime, calendar,
+                           minutes: int = 15) -> int:
+    """Open-market decision bars STRICTLY between two decided bar-closes — i.e. how many decisions
+    a downtime gap skipped. Market-closed bars (weekend/session break) are NOT counted, so a normal
+    weekend does not register as a gap."""
+    if prev_close is None or current_close <= prev_close:
+        return 0
+    step = timedelta(minutes=minutes)
+    t = prev_close + step
+    missed = 0
+    while t < current_close:
+        if calendar.is_open(t - step):     # the bar [t-step, t] fell in open market -> was decidable
+            missed += 1
+        t += step
+    return missed
+
+
 def covers_window(bars: list[Candle], opened_at: datetime, now: datetime, timeframe: str,
                   calendar) -> bool:
     """CALENDAR-AWARE coverage: True iff every market-OPEN bar between the first fully-post-entry
