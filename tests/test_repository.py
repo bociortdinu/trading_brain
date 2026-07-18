@@ -1140,6 +1140,34 @@ def test_insert_llm_call_logs_success_and_failure():
         _cleanup(sym)
 
 
+def test_verified_scope_requires_a_real_commit_not_just_clean():
+    """R2-7: a run with git_dirty='false' but git_commit unknown/absent must NOT count as verified —
+    a clean flag without a provable commit is not reproducible. Mirrors the dashboard's scope."""
+    from database.repository import assert_run_manifest
+
+    good, bad, ukn = ("v-good-" + os.urandom(2).hex(), "v-bad-" + os.urandom(2).hex(),
+                      "v-ukn-" + os.urandom(2).hex())
+    verified_sql = (
+        "SELECT rm.run_id FROM run_manifests rm "
+        "WHERE rm.manifest->>'run_kind' IN ('shadow_online','executable_backtest') "
+        "AND rm.manifest->>'git_dirty'='false' "
+        "AND COALESCE(rm.manifest->>'git_commit','unknown') NOT IN ('unknown','')")
+    try:
+        assert_run_manifest(DSN, good, {"run_kind": "shadow_online", "git_dirty": "false",
+                                        "git_commit": "abc1234"}, "hgood")
+        assert_run_manifest(DSN, bad, {"run_kind": "shadow_online", "git_dirty": "false",
+                                       "git_commit": "unknown"}, "hbad")
+        assert_run_manifest(DSN, ukn, {"run_kind": "shadow_online", "git_dirty": "false"}, "hukn")
+        with psycopg.connect(DSN) as c:
+            verified = {r[0] for r in c.execute(verified_sql).fetchall()}
+        assert good in verified
+        assert bad not in verified and ukn not in verified   # clean flag alone is not enough
+    finally:
+        with psycopg.connect(DSN) as c:
+            c.execute("DELETE FROM run_manifests WHERE run_id = ANY(%s)", ([good, bad, ukn],))
+            c.commit()
+
+
 def test_backtest_run_manifest_includes_full_eligibility_policy():
     """R2-3: the backtest execution manifest must fold in the eligibility policy INCLUDING
     max_clock_skew_seconds, so two runs with different eligibility can't share a run/fingerprint."""

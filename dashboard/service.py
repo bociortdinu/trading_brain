@@ -244,6 +244,7 @@ class DashboardService:
                                       AND rm.manifest->>'run_kind' IN
                                           ('shadow_online','executable_backtest')
                                       AND rm.manifest->>'git_dirty'='false'
+                                      AND COALESCE(rm.manifest->>'git_commit','unknown') NOT IN ('unknown','')
                                 THEN 'verified' ELSE 'unverified' END AS validity
                     FROM trades t JOIN decisions d ON d.id=t.decision_id
                     LEFT JOIN run_manifests rm ON rm.run_id=t.run_id
@@ -263,7 +264,8 @@ class DashboardService:
                     verified_runs = (
                         "SELECT rm.run_id FROM run_manifests rm "
                         "WHERE rm.manifest->>'run_kind' IN ('shadow_online','executable_backtest') "
-                        "AND rm.manifest->>'git_dirty'='false'"
+                        "AND rm.manifest->>'git_dirty'='false' "
+                        "AND COALESCE(rm.manifest->>'git_commit','unknown') NOT IN ('unknown','')"
                     )
                     trade_scope_sql = f"t.run_id IN ({verified_runs}) AND t.symbol NOT LIKE 'TST_%%'"
                     trade_scope_params = ()
@@ -343,12 +345,15 @@ class DashboardService:
                                       AND rm.manifest->>'run_kind' IN
                                           ('shadow_online','executable_backtest')
                                       AND rm.manifest->>'git_dirty'='false'
+                                      AND COALESCE(rm.manifest->>'git_commit','unknown') NOT IN ('unknown','')
                                 THEN 'verified' ELSE 'unverified' END AS validity
                            ,CASE
                              WHEN COALESCE(da.test_data,ta.test_data,false) THEN 'test_data'
                              WHEN rm.run_id IS NULL THEN 'missing_manifest'
                              WHEN rm.manifest->>'git_dirty' IS DISTINCT FROM 'false'
                                THEN 'dirty_or_unknown_worktree'
+                             WHEN COALESCE(rm.manifest->>'git_commit','unknown') IN ('unknown','')
+                               THEN 'unknown_commit'
                              WHEN rm.manifest->>'run_kind' NOT IN
                                   ('shadow_online','executable_backtest')
                                THEN 'non_executable_run_kind'
