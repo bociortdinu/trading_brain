@@ -157,8 +157,25 @@ async def _backtest_over_windows(
     # The execution config is constant across the run; its hash goes into every fingerprint so a
     # config change makes each bar a DIFFERENT decision (recovery can't rebuild a different trade).
     from shadow.virtual_broker import execution_hash, execution_manifest
-    exec_hash = execution_hash(execution_manifest(
-        modeled_spread_pct=modeled_spread_pct, slippage_pct=slippage_pct, config=shadow_config))
+    exec_manifest = execution_manifest(
+        modeled_spread_pct=modeled_spread_pct, slippage_pct=slippage_pct, config=shadow_config,
+        single_position=single_position, cooldown_bars=cooldown_bars,
+        risk_config_version=risk_config.version, prefilter_version=prefilter_config.version)
+    from database.operations import git_metadata
+    exec_manifest.update({
+        "run_kind": "executable_backtest" if single_position else "event_study",
+        "maker": model_name,
+        "provider": provider_name,
+        "symbol": symbol,
+        "feedback": use_feedback,
+        **git_metadata(),
+    })
+    exec_hash = execution_hash(exec_manifest)
+    if persist_dsn and run_id:
+        # Pin this run_id to ONE execution config: refuse a later run with a different config
+        # under the same run_id (else two configs mix into one experiment). Under the run lock.
+        from database.repository import assert_run_manifest
+        assert_run_manifest(persist_dsn, run_id, exec_manifest, exec_hash)
     # Position policy: a single account holds ONE position at a time. Without this gate the
     # backtest opens a new trade on every approved bar (the reviewer saw 23 concurrent
     # positions), which is NOT an executable strategy — the summed R is meaningless. We block

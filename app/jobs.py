@@ -32,6 +32,7 @@ from database.repository import (
     snapshot_spread_status,
     upsert_snapshot,
 )
+from database.operations import OperationalTelemetry
 
 log = logging.getLogger(__name__)
 M15 = timedelta(minutes=15)
@@ -198,19 +199,64 @@ async def safe_catch_up(settings: Settings, provider: MarketDataProvider, provid
         raise
 
 
+def _processed_bars(result: dict) -> int:
+    """Count completed bar actions without treating booleans/errors as observations."""
+    return sum(value for key, value in result.items()
+               if key != "error" and isinstance(value, int) and not isinstance(value, bool))
+
+
+async def observed_catch_up(settings: Settings, provider: MarketDataProvider, provider_name: str,
+                            telemetry: OperationalTelemetry, max_backfill: int = 8,
+                            cache: WindowCache | None = None) -> dict:
+    """Run one collector tick and persist its lifecycle for the operator dashboard."""
+    run_id = telemetry.start_run("collector_tick", symbol=settings.symbol_query)
+    telemetry.heartbeat("healthy", details={"phase": "collecting", "run_id": run_id})
+    try:
+        result = await catch_up(settings, provider, provider_name, max_backfill, cache)
+    except asyncio.CancelledError as exc:
+        telemetry.finish_run(run_id, "cancelled", error=exc)
+        raise
+    except TRANSIENT as exc:
+        log.warning("scheduler tick: transient error (continuing): %s", exc)
+        telemetry.finish_run(run_id, "transient_error", error=exc)
+        telemetry.heartbeat("degraded", error=exc, details={"run_id": run_id})
+        return {"error": str(exc)}
+    except Exception as exc:
+        log.exception("scheduler tick: UNEXPECTED error (escalating)")
+        telemetry.finish_run(run_id, "failed", error=exc)
+        telemetry.heartbeat("error", error=exc, details={"run_id": run_id})
+        raise
+    telemetry.finish_run(run_id, "success", bars_processed=_processed_bars(result), result=result)
+    telemetry.heartbeat("healthy", success=True,
+                        details={"run_id": run_id, "result": result})
+    return result
+
+
 async def run_scheduler(settings: Settings, offset_seconds: float = 5.0) -> None:
     provider = build_provider(settings)
     provider_name = settings.market_data_provider
     cache = WindowCache()
+    telemetry = OperationalTelemetry(settings.db_dsn, "collector_scheduler")
+    telemetry.heartbeat("starting", details={"provider": provider_name,
+                                              "symbol": settings.symbol_query})
     try:
         while True:
-            await safe_catch_up(settings, provider, provider_name, cache=cache)
+            result = await observed_catch_up(
+                settings, provider, provider_name, telemetry, cache=cache)
             wake = next_m15(datetime.now(timezone.utc)) + timedelta(seconds=offset_seconds)
+            telemetry.heartbeat("degraded" if "error" in result else "healthy",
+                                next_wake_at=wake,
+                                details={"phase": "sleeping", "provider": provider_name,
+                                         "last_result": (result if "error" not in result
+                                                         else {"error": "transient_error"})})
             await asyncio.sleep(max(1.0, (wake - datetime.now(timezone.utc)).total_seconds()))
     finally:  # runs on CancelledError too
-        aclose = getattr(provider, "aclose", None)
-        if aclose:
-            await aclose()
+        try:
+            telemetry.stop()
+        finally:
+            aclose = getattr(provider, "aclose", None)
+            if aclose:
+                await aclose()
 
 
 def main() -> int:
@@ -222,18 +268,29 @@ def main() -> int:
     settings = load_settings()
     if args.once:
         provider = build_provider(settings)
+        telemetry = OperationalTelemetry(settings.db_dsn, "collector_once")
 
         async def _once() -> dict:
+            telemetry.heartbeat("starting", details={"provider": settings.market_data_provider,
+                                                      "symbol": settings.symbol_query})
             try:
-                return await catch_up(settings, provider, settings.market_data_provider)
+                return await observed_catch_up(
+                    settings, provider, settings.market_data_provider, telemetry)
             finally:
-                aclose = getattr(provider, "aclose", None)
-                if aclose:
-                    await aclose()
+                try:
+                    telemetry.stop()
+                finally:
+                    aclose = getattr(provider, "aclose", None)
+                    if aclose:
+                        await aclose()
 
         print(f"[scheduler] {asyncio.run(_once())}")
         return 0
-    asyncio.run(run_scheduler(settings))
+    try:
+        asyncio.run(run_scheduler(settings))
+    except KeyboardInterrupt:
+        log.info("collector scheduler stopped by operator")
+        return 130
     return 0
 
 

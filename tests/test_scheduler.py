@@ -10,6 +10,7 @@ from app.jobs import (
     WindowCache,
     floor_m15,
     next_m15,
+    observed_catch_up,
     safe_catch_up,
     select_targets,
     should_observe_spread,
@@ -97,6 +98,56 @@ def test_safe_catch_up_escalates_unexpected_error():
 
     with pytest.raises(KeyError):  # escalated, not hidden
         run(safe_catch_up(_settings(), _Bug(), "polygon"))
+
+
+class _Telemetry:
+    def __init__(self):
+        self.events = []
+
+    def start_run(self, kind, **kwargs):
+        self.events.append(("start", kind, kwargs))
+        return 17
+
+    def finish_run(self, run_id, status, **kwargs):
+        self.events.append(("finish", run_id, status, kwargs))
+
+    def heartbeat(self, status, **kwargs):
+        self.events.append(("heartbeat", status, kwargs))
+
+
+def test_observed_tick_records_success(monkeypatch):
+    async def fake_catch_up(*args, **kwargs):
+        return {"inserted": 2, "unchanged": 1}
+
+    monkeypatch.setattr("app.jobs.catch_up", fake_catch_up)
+    telemetry = _Telemetry()
+    result = run(observed_catch_up(_settings(), object(), "polygon", telemetry))
+    assert result == {"inserted": 2, "unchanged": 1}
+    finish = next(e for e in telemetry.events if e[0] == "finish")
+    assert finish[2] == "success"
+    assert finish[3]["bars_processed"] == 3
+
+
+def test_observed_tick_records_transient_error(monkeypatch):
+    async def fake_catch_up(*args, **kwargs):
+        raise ProviderError("temporary?apiKey=must-not-be-persisted")
+
+    monkeypatch.setattr("app.jobs.catch_up", fake_catch_up)
+    telemetry = _Telemetry()
+    result = run(observed_catch_up(_settings(), object(), "polygon", telemetry))
+    assert "error" in result
+    assert next(e for e in telemetry.events if e[0] == "finish")[2] == "transient_error"
+
+
+def test_observed_tick_records_and_escalates_bug(monkeypatch):
+    async def fake_catch_up(*args, **kwargs):
+        raise KeyError("bug")
+
+    monkeypatch.setattr("app.jobs.catch_up", fake_catch_up)
+    telemetry = _Telemetry()
+    with pytest.raises(KeyError):
+        run(observed_catch_up(_settings(), object(), "polygon", telemetry))
+    assert next(e for e in telemetry.events if e[0] == "finish")[2] == "failed"
 
 
 # ---- window cache: reuse higher timeframes between M15 ticks ---- #

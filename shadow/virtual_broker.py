@@ -87,11 +87,15 @@ def cost_manifest(trade: "VirtualTrade", config: ShadowConfig) -> dict:
     return manifest
 
 
-def execution_manifest(*, modeled_spread_pct: float, slippage_pct: float,
-                       config: ShadowConfig) -> dict:
-    """The execution parameters a shadow trade is built from — everything a crash-recovery would
-    need to REBUILD the exact same trade from a persisted decision. Folded into the decision
-    fingerprint so a config change is a different decision (not a false recovery)."""
+def execution_manifest(*, modeled_spread_pct: float, slippage_pct: float, config: ShadowConfig,
+                       single_position: bool, cooldown_bars: int,
+                       risk_config_version: str, prefilter_version: str) -> dict:
+    """EVERY parameter that can change a shadow trade's outcome — so it can rebuild the exact same
+    trade from a persisted decision (crash recovery) and so a config change is a different decision.
+
+    Includes the position policy (single_position, cooldown_bars) and the risk/prefilter config
+    versions: `timeout_bars=96` vs `5` MUST hash differently (an earlier version omitted it and
+    they collided). Anything the reconciler or the gate reads goes here."""
     return {
         "modeled_spread_pct": modeled_spread_pct,
         "slippage_pct": slippage_pct,
@@ -99,6 +103,11 @@ def execution_manifest(*, modeled_spread_pct: float, slippage_pct: float,
         "swap_pct_per_night": config.swap_pct_per_night,
         "rollover_hour_utc": config.rollover_hour_utc,
         "conservative_partial_entry": config.conservative_partial_entry,
+        "timeout_bars": config.timeout_bars,
+        "single_position": single_position,
+        "cooldown_bars": cooldown_bars,
+        "risk_config_version": risk_config_version,
+        "prefilter_version": prefilter_version,
     }
 
 

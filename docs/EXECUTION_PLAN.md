@@ -45,18 +45,17 @@ Instantaneu exact al proiectului. (Secțiunile „Status onest / Runda N" de mai
   reapelează maker-ul), lock exclusiv pe `run_id`.
 - **Feedback loop + evaluare (Faza 5, deterministic)**: track record `as_of`-safe injectat în
   `DecisionInput` (și în backtest via `--feedback`); **temporal-fold report** cu baseline-uri care
-  chiar tranzacționează (confluence/random/flat), bootstrap CI, drawdown, **discriminare** confidence
-  (ordinal, NU ECE), acoperire pe regimuri.
+  chiar tranzacționează (confluence + random; flat = linia zero care nu tranzacționează niciodată),
+  bootstrap CI, drawdown, **discriminare** confidence (ordinal, NU ECE), acoperire pe regimuri.
 - **Persistență + audit**: `decisions`/`trades`/`snapshot_evaluations`/`spread_observations`/
   `llm_calls`/`decision_reservations`; tabele de fapte **UPDATE-protected**; `schema_migrations`
   read-only pentru app-role.
 - **trading_hands** (Go): endpoint `/candles` real-time (paginat), keepalive + **reconnect dovedit**
   cu mock CoreAPI, data race pe `account` reparat.
 
-**Cifre reale:** **257 teste** (227 fără DB + 30 DB-gated), Go `-race`/`vet`/`gofmt` curate.
-**19 migrări** (0001–0019). Versiuni: features `1.2.0`, decision-schema `2026.3`, prompt `2026.1`,
-strategy `2026.1`, risk `2026.2`. **20 migrări** (0001–0020). Commit-uri feature:
-**25 în trading_brain, 7 în trading_hands**.
+**Cifre reale:** **261 teste** (228 fără DB + 33 DB-gated), Go `-race`/`vet`/`gofmt` curate.
+**22 migrări** (0001–0022). Versiuni: features `1.2.0`, decision-schema `2026.3`, prompt `2026.1`,
+strategy `2026.1`, risk `2026.2`.
 
 **NU e făcut / deferit (onest):**
 - **Măsurarea edge-ului real cu LLM** — cere o rulare **plătită** `--maker claude` (amânată de user).

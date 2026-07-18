@@ -3,8 +3,9 @@
 STRICT anti look-ahead: a decision at `as_of` may only see trades whose outcome was OBSERVED
 before `as_of` — actually known by then. We gate on `outcome_observed_at` (when reconciliation
 recorded the close), NOT `closed_at` (the bar the price hit): after a downtime a trade can close
-at T but only be observed at T+downtime, and a decision in between must not see it. `closed_at`
-is the fallback only for legacy rows written before `outcome_observed_at` existed.
+at T but only be observed at T+downtime, and a decision in between must not see it. A row WITHOUT
+`outcome_observed_at` is EXCLUDED (never assumed known at closed_at — that was a look-ahead risk);
+the pre-0020 backtest rows were explicitly backfilled in migration 0022 (observed == closed there).
 
 Two levels (level 3 kNN/pgvector is deferred):
 - level 1: aggregate performance per market regime (small, cheap, always safe to include);
@@ -37,8 +38,8 @@ def regime_performance(dsn: str, *, run_id: str, before: datetime) -> list[dict]
             WHERE t.run_id = %s
               AND t.status <> 'open'
               AND t.r_multiple IS NOT NULL
-              AND COALESCE(t.outcome_observed_at, t.closed_at) IS NOT NULL
-              AND COALESCE(t.outcome_observed_at, t.closed_at) < %s
+              AND t.outcome_observed_at IS NOT NULL   -- exclude rows w/o verified time provenance
+              AND t.outcome_observed_at < %s
             GROUP BY s.regime
             ORDER BY trades DESC, regime
             """,
@@ -63,9 +64,9 @@ def recent_closed_trades(dsn: str, *, run_id: str, before: datetime, k: int = 5)
             WHERE t.run_id = %s
               AND t.status <> 'open'
               AND t.r_multiple IS NOT NULL
-              AND COALESCE(t.outcome_observed_at, t.closed_at) IS NOT NULL
-              AND COALESCE(t.outcome_observed_at, t.closed_at) < %s
-            ORDER BY COALESCE(t.outcome_observed_at, t.closed_at) DESC
+              AND t.outcome_observed_at IS NOT NULL   -- exclude rows w/o verified time provenance
+              AND t.outcome_observed_at < %s
+            ORDER BY t.outcome_observed_at DESC
             LIMIT %s
             """,
             (run_id, before, k),

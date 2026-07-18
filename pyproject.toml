@@ -29,11 +29,12 @@ dev = ["pytest>=8", "pandas>=2.0"]
 [tool.setuptools.packages.find]
 include = [
     "app*", "brokers_bridge*", "config*", "core*", "database*",
-    "data_collector*", "features*", "decision*", "risk*", "shadow*",
+    "dashboard*", "data_collector*", "features*", "decision*", "risk*", "shadow*",
 ]
 
 [tool.setuptools.package-data]
 database = ["migrations/*.sql"]
+dashboard = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

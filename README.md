@@ -65,13 +65,13 @@ claude` is the real paid model, guarded by a hard call cap + explicit confirmati
 python -m shadow.runner --count 2500                      # deterministic, free
 python -m shadow.runner --count 2500 --persist --run-id my-exp   # write the auditable chain
 python -m shadow.runner --maker claude --max-llm-calls 50 --yes  # PAID, capped + confirmed
-python -m shadow.runner --persist --run-id fb --feedback         # inject the as_of-safe track record
+python -m shadow.runner --persist --run-id fb --feedback --maker claude --yes  # PAID; only Claude reads feedback (deterministic ignores it)
 
 # Continuous shadow-online (decide on each M15 close, reconcile open trades):
 python -m shadow.online --once            # one tick   (deterministic maker only online)
 python -m shadow.online                   # loop, waking at each M15 close
 
-# Temporal fold report: baselines (confluence / random / flat, all trading), bootstrap CI,
+# Temporal fold report: baselines (confluence + random both trade; flat = the never-trade zero line), bootstrap CI,
 # drawdown, confidence discrimination (ordinal, not ECE), regime coverage, per-fold + overall:
 python -m shadow.evaluation --count 2500 --folds 2
 ```
@@ -80,12 +80,28 @@ Backtests take an exclusive lock on `run_id` (a stateful run must be serial). A 
 resumes **when the config is unchanged** (the execution config is part of the decision
 fingerprint), without re-calling the model or duplicating trades.
 
+## Operator dashboard — vezi sistemul cap-coadă
+
+Dashboard local, read-only: stare XTB/DB, quote și bare, lag-ul brain-ului, alerte, traseul
+`bară → features → eligibilitate → decizie → risk → trade shadow`, run-uri și auditul/costul LLM.
+
+```bash
+pip install -e '.[db]'
+python -m dashboard --open       # http://127.0.0.1:8080
+```
+
+Nu expune endpointuri de ordine sau scriere, iar conexiunile sale DB sunt forțate `READ ONLY`.
+Detalii: [dashboard/README.md](dashboard/README.md).
+
 ## Tests
 
 ```bash
 pip install -e '.[dev]'                 # pytest + pandas (indicator cross-check)
-python -m pytest -q                     # no-infra tests (repository tests skip without a DB)
-BRAIN_DB_DSN='postgresql://user:pw@127.0.0.1:5433/trading_brain' python -m pytest -q   # incl. DB tests
+python -m pytest -q                     # no-infra tests (repository tests skip without a test DB)
+BRAIN_TEST_DB_DSN='postgresql://user:pw@127.0.0.1:5433/trading_brain_test' python -m pytest -q
+# Repository tests refuse a database whose name does not end in `_test`.
+# One-time setup (creates only the named `_test` DB, then applies the normal migrations):
+BRAIN_TEST_DB_DSN='postgresql://user:pw@127.0.0.1:5433/trading_brain_test' python -m database.bootstrap_test
 ```
 
 ## Layout
@@ -96,7 +112,7 @@ BRAIN_DB_DSN='postgresql://user:pw@127.0.0.1:5433/trading_brain' python -m pytes
 | `brokers_bridge/` | async HTTP client for the 8 trading_hands endpoints (incl. `/candles`) |
 | `data_collector/` | `MarketDataProvider` (XTB real-time, Polygon/Massive, CSV) + strict candle/series validation + session calendars + news (`as_of`) |
 | `features/` | indicators (numpy), regime/S-R engineering, MTF `FeaturePacket`, eligibility |
-| `database/` | versioned `migrations/` (0001–0019) + `migrate.py` (app role) + `bootstrap.py` (admin role) + `repository.py` + `feedback.py` (as_of-safe track record) |
+| `database/` | versioned `migrations/` (0001–0023), admin-run DDL, isolated test-DB bootstrap, repository/feedback and operational telemetry |
 | `app/` | `smoke`, `collect`, `decide`, `jobs` (M15 scheduler) |
 | `decision/` | `schema` (strict I/O contract, incl. news + feedback), `prefilter`, `llm_client` (Anthropic, fail-closed), `pipeline` |
 | `risk/` | `engine.py` — rigid gate + deterministic ATR-based SL/TP (never the LLM's job) |

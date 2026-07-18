@@ -185,6 +185,34 @@ def evaluations_for(dsn: str, snapshot_id: int) -> list[dict]:
     ]
 
 
+def _open_trade_row(conn, *, decision_id: int, run_id: str, symbol: str, trade, outcome,
+                    timeframe: str, timeout_bars: int, costs: dict, observed_at):
+    """INSERT a FRESH open (or immediately-closed) trade on an EXISTING connection — used to
+    persist a decision and its trade in ONE transaction (online), so a crash can never leave a
+    committed decision with no trade. Fresh decision_id -> no conflict is possible."""
+    from psycopg.types.json import Json
+
+    from core.models import Direction
+
+    side = "buy" if trade.direction == Direction.BUY else "sell"
+    observed = None if outcome.status == "open" else (observed_at or outcome.closed_at)
+    conn.execute(
+        """
+        INSERT INTO trades
+            (decision_id, run_id, symbol, side, mode, entry_price, sl_price, tp_price,
+             opened_at, status, exit_price, exit_reason, closed_at, outcome_observed_at,
+             r_multiple, r_pessimistic, r_optimistic, ambiguous, timeframe, timeout_bars,
+             spread_pct, spread_provenance, slippage_pct, costs)
+        VALUES (%s,%s,%s,%s,'shadow',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """,
+        (decision_id, run_id, symbol, side, trade.entry_mid, trade.sl_price, trade.tp_price,
+         trade.opened_at, outcome.status, outcome.exit_price, outcome.exit_reason, outcome.closed_at,
+         observed, outcome.r_multiple, outcome.r_pessimistic, outcome.r_optimistic, outcome.ambiguous,
+         timeframe, timeout_bars, trade.spread_pct, trade.spread_provenance, trade.slippage_pct,
+         Json(costs)),
+    )
+
+
 def _llm_call_row(conn, result, *, snapshot_id: int | None, decision_id: int | None):
     """INSERT one llm_calls row on an EXISTING connection (no commit). Shared by insert_llm_call
     (standalone) and insert_decision (atomic with the decision), so a paid call is never persisted
@@ -215,7 +243,8 @@ def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, mo
                     data_provider: str, tokens: dict | None = None,
                     run_id: str | None = None, input_fingerprint: str | None = None,
                     spread_observation_id: int | None = None,
-                    blocked_reason: str | None = None, llm_result=None) -> tuple[int, bool]:
+                    blocked_reason: str | None = None, llm_result=None,
+                    open_trade: dict | None = None) -> tuple[int, bool]:
     """Persist a DecisionRecord (decision/pipeline.py) with its reproducibility manifest and
     the FK to the authorizing evaluation. Never fabricates an approved verdict — the
     risk_verdict comes straight from the record. Returns (decision_id, inserted): `inserted` is
@@ -282,10 +311,43 @@ def insert_decision(dsn: str, *, snapshot_id: int, evaluation_id: int | None, mo
         # consistent, never a committed decision with a lost paid call.
         if llm_result is not None and inserted:
             _llm_call_row(conn, llm_result, snapshot_id=snapshot_id, decision_id=row[0])
+        # Atomic decision -> trade (online): the open trade is written in the SAME transaction, so
+        # a crash can't leave a committed decision without its trade. Only on a genuine insert.
+        if open_trade is not None and inserted:
+            _open_trade_row(conn, decision_id=row[0], run_id=run_id, **open_trade)
         conn.commit()
     # (id, inserted): a caller that hit a conflict must NOT proceed as if it produced this
     # decision — the row belongs to an earlier attempt and any fresh `rec` would be discarded.
     return row[0], inserted
+
+
+class RunConfigMismatch(RuntimeError):
+    """This run_id was first used with a DIFFERENT execution config. A run_id is one frozen setup."""
+
+
+def assert_run_manifest(dsn: str, run_id: str, manifest: dict, manifest_hash: str) -> None:
+    """Pin a run_id to ONE execution config. The first persisted use records the manifest; a later
+    use with a different hash is REFUSED (pick a new run_id) so two configs can't be mixed into one
+    experiment. Idempotent for the same config."""
+    import psycopg
+    from psycopg.types.json import Json
+
+    with psycopg.connect(dsn) as conn:
+        row = conn.execute(
+            "INSERT INTO run_manifests (run_id, manifest_hash, manifest) VALUES (%s,%s,%s) "
+            "ON CONFLICT (run_id) DO NOTHING RETURNING manifest_hash",
+            (run_id, manifest_hash, Json(manifest)),
+        ).fetchone()
+        if row is None:   # run_id already pinned -> its hash must match ours
+            existing = conn.execute(
+                "SELECT manifest_hash FROM run_manifests WHERE run_id = %s", (run_id,)).fetchone()[0]
+            conn.commit()
+            if existing != manifest_hash:
+                raise RunConfigMismatch(
+                    f"run_id {run_id!r} was pinned to execution config {existing[:12]}…, not "
+                    f"{manifest_hash[:12]}… — use a NEW run_id for a different config")
+            return
+        conn.commit()
 
 
 class RunLockedError(RuntimeError):

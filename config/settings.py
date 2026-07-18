@@ -23,11 +23,12 @@ class Settings(BaseSettings):
     trading_hands_url: str = "http://127.0.0.1:4000"
     http_timeout_seconds: float = 10.0
 
-    # PostgreSQL. `db_dsn` is the APPLICATION role (connects to the trading_brain DB,
-    # runs migrations, reads/writes). `admin_db_dsn` is a SEPARATE privileged role used
-    # ONLY to create the database (bootstrap); it points at a maintenance DB (e.g. postgres).
+    # PostgreSQL. `db_dsn` is the APPLICATION role (runtime DML only). `admin_db_dsn` is a
+    # SEPARATE privileged role used by bootstrap/migrate. Repository tests are destructive and
+    # may use only `test_db_dsn`, whose database name is required to end in `_test`.
     db_dsn: str = "postgresql://trading_hands@127.0.0.1:5433/trading_brain"
     admin_db_dsn: str | None = None
+    test_db_dsn: str | None = None
 
     # Asset under analysis. `symbol_query` is the XTB symbol; the data feed uses a
     # provider-specific symbol resolved via `provider_symbol_map`.

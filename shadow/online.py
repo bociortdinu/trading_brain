@@ -15,6 +15,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
+import socket
 from datetime import datetime, timedelta, timezone
 
 from app.collect import (
@@ -24,25 +26,28 @@ from app.collect import (
     m15_closes,
     observe_xtb_spread,
 )
-from app.jobs import next_m15
+from app.jobs import TRANSIENT, next_m15
 from config.settings import Settings, load_settings
 from core.models import Direction
 from data_collector.providers.base import Candle
 from data_collector.providers.factory import build_provider
 from data_collector.session import calendar_for
+from database.feedback import build_feedback
+from database.operations import OperationalTelemetry, git_metadata
 from database.repository import (
-    find_decision_by_fingerprint,
+    assert_run_manifest,
+    complete_decision_reservation,
     insert_decision,
     insert_evaluation,
     insert_llm_call,
     insert_spread_observation,
     open_shadow_trades,
+    reserve_decision,
     upsert_shadow_trade,
     upsert_snapshot,
 )
 from decision.pipeline import run_decision
 from decision.prefilter import PrefilterConfig
-from database.feedback import build_feedback
 from decision.schema import FeedbackContext, build_decision_input, decision_fingerprint
 from features.mtf import TRIGGER_TF
 from risk.engine import RiskConfig
@@ -52,6 +57,8 @@ from shadow.virtual_broker import (
     ShadowConfig,
     VirtualTrade,
     cost_manifest,
+    execution_hash,
+    execution_manifest,
     open_virtual_trade,
     shadow_config_from_costs,
 )
@@ -145,76 +152,166 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     feedback = FeedbackContext(regime_performance=_fb["regime_performance"],
                                recent_trades=_fb["recent_trades"])
 
-    # DEDUPE BEFORE THE (paid) LLM: if this exact input was already decided in this run (same M15
-    # bar reprocessed after a restart), skip — don't re-call the model or duplicate the audit.
-    # The fingerprint MUST include feedback (it is part of the input): a decision made with a
-    # different track record is a different decision.
+    # The fingerprint includes feedback AND the execution config (a decision made with a different
+    # track record or a different config is a different decision).
+    exec_manifest = execution_manifest(
+        modeled_spread_pct=settings.replay_spread_pct, slippage_pct=settings.slippage_pct,
+        config=shadow_config, single_position=True, cooldown_bars=0,
+        risk_config_version=RiskConfig().version, prefilter_version=PrefilterConfig().version)
+    exec_manifest.update({
+        "run_kind": "shadow_online",
+        "maker": model_name,
+        "provider": provider_name,
+        "symbol": brain_symbol,
+        "feedback": True,
+        **git_metadata(),
+    })
+    exec_hash = execution_hash(exec_manifest)
+    # A run id is an experiment identity, not just a label. Pin it before the paid/free maker
+    # can run, exactly as the backtest does, so one run cannot silently mix code/config/provider.
+    assert_run_manifest(settings.db_dsn, run_id, exec_manifest, exec_hash)
     fingerprint = decision_fingerprint(
         input_hash=build_decision_input(packet, mode="online", feedback=feedback).input_hash(),
-        model=model_name, provider=provider_name, risk_config_version=RiskConfig().version)
-    if find_decision_by_fingerprint(settings.db_dsn, input_fingerprint=fingerprint, run_id=run_id) is not None:
+        model=model_name, provider=provider_name, risk_config_version=RiskConfig().version,
+        execution_hash=exec_hash)
+
+    # RESERVE BEFORE THE (paid) LLM. Two processes on the same run must not both call and pay: the
+    # loser gets 'held' and skips WITHOUT paying (the old find_decision->call->insert let both pay
+    # and the loser's paid call vanished). 'done' means the FULL chain already exists (decision +
+    # trade are written atomically), so it's safe to skip.
+    worker = f"{socket.gethostname()}:{os.getpid()}"
+    claim, token = reserve_decision(settings.db_dsn, input_fingerprint=fingerprint, run_id=run_id,
+                                    worker=worker)
+    if claim == "held":
+        summary["decision"] = "skipped:held_by_other"
+        return summary
+    if claim == "done":
         summary["decision"] = "skipped:already_decided"
         return summary
 
     status, snap_id = upsert_snapshot(settings.db_dsn, packet)
     summary["snapshot"] = f"{status}:{snap_id}"
-    if snap_id is not None and status != "conflict":
-        # The observed spread is a SEPARATE append-only fact about the snapshot; the decision
-        # below records exactly which observation it consumed.
-        spread_obs_id = None
-        if basis is not None and packet.spread_pct is not None:
-            spread_obs_id = insert_spread_observation(
-                settings.db_dsn, snapshot_id=snap_id, spread_pct=packet.spread_pct,
-                provenance="observed_xtb", observed_at=observed_at or eval_now,
-                quote_time=quote_time, basis=basis,
-            )
-        eval_id = insert_evaluation(settings.db_dsn, snap_id, result)
-        record = await run_decision(packet, result, decision_maker, mode="online",
-                                    prefilter_config=PrefilterConfig(), risk_config=RiskConfig(),
-                                    calendar=calendar_for(provider_name), feedback=feedback)
-        last = getattr(decision_maker, "last_result", None)
-        if record.stage == "llm_failed":
-            # A failed call yielded no decision -> audit it with decision_id NULL.
-            if last is not None:
-                insert_llm_call(settings.db_dsn, last, snapshot_id=snap_id)
-            summary["decision"] = f"llm_failed:{record.llm_error}"
-        else:
-            inp = build_decision_input(packet, mode="online", feedback=feedback)
-            # ATOMIC + idempotent on (input_fingerprint, run_id): a concurrent/duplicate insert
-            # returns the existing decision id instead of creating a second row.
-            # ATOMIC: the decision AND its paid-call audit in one transaction (llm_result), so an
-            # audit failure can't leave a committed decision with a lost paid call.
-            dec_id, _ = insert_decision(
-                settings.db_dsn, snapshot_id=snap_id, evaluation_id=eval_id, model=model_name,
-                record=record, ai_input=inp.model_dump(mode="json"),
-                ai_output=record.decision.model_dump(mode="json") if record.decision else None,
-                mode="shadow", data_provider=provider_name, run_id=run_id,
-                input_fingerprint=fingerprint, spread_observation_id=spread_obs_id, llm_result=last,
-            )
-            summary["decision"] = f"{record.stage}:{record.decision.direction.value if record.decision else '-'}"
-            if record.risk_approved:
-                # Online: fill at the OBSERVED quote mid (captures real latency), not the bar close.
-                observed_mid = None
-                if basis is not None and basis.get("xtb_bid") and basis.get("xtb_ask"):
-                    observed_mid = (basis["xtb_bid"] + basis["xtb_ask"]) / 2
-                # opened_at is the LOCAL OBSERVATION time (basis.observed_at — when the brain saw
-                # the quote), not the broker tick time nor the bar close. The reconciler must not
-                # count M15 movement that happened before the real entry.
-                trade = open_virtual_trade(
-                    record.decision.direction, observed_mid or packet.price,
-                    record.risk.sl_pct, record.risk.tp_pct,
-                    spread_pct=packet.spread_pct or settings.replay_spread_pct,
-                    spread_provenance="observed_xtb" if packet.spread_pct else "modeled",
-                    slippage_pct=settings.slippage_pct, opened_at=observed_at or eval_now,
-                )
-                tid, _ = upsert_shadow_trade(
-                    settings.db_dsn, decision_id=dec_id, run_id=run_id, symbol=brain_symbol,
-                    trade=trade, outcome=reconcile(trade, [], shadow_config), timeframe=TRIGGER_TF,
-                    timeout_bars=shadow_config.timeout_bars, costs=cost_manifest(trade, shadow_config),
-                )
-                summary["opened_trade"] = tid
+    if snap_id is None or status == "conflict":
+        complete_decision_reservation(settings.db_dsn, input_fingerprint=fingerprint, run_id=run_id,
+                                      status="failed", claim_token=token)
+        return summary
+    # Spread + eligibility are separate append-only facts about the snapshot.
+    spread_obs_id = None
+    if basis is not None and packet.spread_pct is not None:
+        spread_obs_id = insert_spread_observation(
+            settings.db_dsn, snapshot_id=snap_id, spread_pct=packet.spread_pct,
+            provenance="observed_xtb", observed_at=observed_at or eval_now,
+            quote_time=quote_time, basis=basis,
+        )
+    eval_id = insert_evaluation(settings.db_dsn, snap_id, result)
+    record = await run_decision(packet, result, decision_maker, mode="online",
+                                prefilter_config=PrefilterConfig(), risk_config=RiskConfig(),
+                                calendar=calendar_for(provider_name), feedback=feedback)
+    last = getattr(decision_maker, "last_result", None)
+    if record.stage == "llm_failed":
+        if last is not None:   # a failed call yielded no decision -> audit it unlinked
+            insert_llm_call(settings.db_dsn, last, snapshot_id=snap_id)
+        complete_decision_reservation(settings.db_dsn, input_fingerprint=fingerprint, run_id=run_id,
+                                      status="failed", claim_token=token)
+        summary["decision"] = f"llm_failed:{record.llm_error}"
+        return summary
+
+    inp = build_decision_input(packet, mode="online", feedback=feedback)
+    # Build the trade (if any) BEFORE persisting, so decision + audit + open trade go in ONE
+    # transaction — a crash can't leave a committed decision without its trade (online had no
+    # recovery for that window, unlike the backtest).
+    open_trade = None
+    if record.risk_approved:
+        observed_mid = None
+        if basis is not None and basis.get("xtb_bid") and basis.get("xtb_ask"):
+            observed_mid = (basis["xtb_bid"] + basis["xtb_ask"]) / 2
+        trade = open_virtual_trade(
+            record.decision.direction, observed_mid or packet.price,
+            record.risk.sl_pct, record.risk.tp_pct,
+            spread_pct=packet.spread_pct or settings.replay_spread_pct,
+            spread_provenance="observed_xtb" if packet.spread_pct else "modeled",
+            slippage_pct=settings.slippage_pct, opened_at=observed_at or eval_now,
+        )
+        open_trade = {"symbol": brain_symbol, "trade": trade,
+                      "outcome": reconcile(trade, [], shadow_config), "timeframe": TRIGGER_TF,
+                      "timeout_bars": shadow_config.timeout_bars,
+                      "costs": cost_manifest(trade, shadow_config), "observed_at": None}
+    dec_id, inserted = insert_decision(
+        settings.db_dsn, snapshot_id=snap_id, evaluation_id=eval_id, model=model_name,
+        record=record, ai_input=inp.model_dump(mode="json"),
+        ai_output=record.decision.model_dump(mode="json") if record.decision else None,
+        mode="shadow", data_provider=provider_name, run_id=run_id,
+        input_fingerprint=fingerprint, spread_observation_id=spread_obs_id, llm_result=last,
+        open_trade=open_trade,
+    )
+    # 'done' only after the full chain is on disk. If the decision already existed (a crash
+    # between the atomic commit and this completion, reclaimed on a later tick), the chain is
+    # already complete — just finalise.
+    complete_decision_reservation(settings.db_dsn, input_fingerprint=fingerprint, run_id=run_id,
+                                  status="done", claim_token=token, decision_id=dec_id)
+    summary["decision"] = f"{record.stage}:{record.decision.direction.value if record.decision else '-'}"
+    if open_trade is not None:
+        summary["opened_trade"] = "opened" if inserted else "exists"
 
     return summary
+
+
+async def observed_shadow_tick(settings: Settings, provider, provider_name: str, *,
+                               decision_maker, run_id: str, model_name: str,
+                               shadow_config: ShadowConfig,
+                               telemetry: OperationalTelemetry) -> dict:
+    """Run and audit one online shadow tick without changing the decision semantics."""
+    operation_id = telemetry.start_run(
+        "shadow_tick", symbol=settings.symbol_query, experiment_id=run_id)
+    telemetry.heartbeat("healthy", details={"phase": "deciding", "run_id": run_id,
+                                              "operation_id": operation_id})
+    try:
+        summary = await shadow_tick(
+            settings, provider, provider_name, decision_maker=decision_maker,
+            run_id=run_id, model_name=model_name, shadow_config=shadow_config)
+    except asyncio.CancelledError as exc:
+        telemetry.finish_run(operation_id, "cancelled", error=exc)
+        raise
+    except TRANSIENT as exc:
+        telemetry.finish_run(operation_id, "transient_error", error=exc)
+        telemetry.heartbeat("degraded", error=exc,
+                            details={"run_id": run_id, "operation_id": operation_id})
+        raise
+    except Exception as exc:
+        telemetry.finish_run(operation_id, "failed", error=exc)
+        telemetry.heartbeat("error", error=exc,
+                            details={"run_id": run_id, "operation_id": operation_id})
+        raise
+    telemetry.finish_run(operation_id, "success", bars_processed=int("as_of" in summary),
+                         result=summary)
+    telemetry.heartbeat("healthy", success=True,
+                        details={"run_id": run_id, "operation_id": operation_id,
+                                 "result": summary})
+    return summary
+
+
+async def shadow_tick_with_retries(settings: Settings, provider, provider_name: str, *,
+                                   decision_maker, run_id: str, model_name: str,
+                                   shadow_config: ShadowConfig,
+                                   telemetry: OperationalTelemetry,
+                                   attempts: int = 3, base_delay_seconds: float = 5.0) -> dict:
+    """Retry only declared transient failures, soon enough not to lose the M15 decision bar."""
+    if attempts < 1:
+        raise ValueError("attempts must be >= 1")
+    for attempt in range(1, attempts + 1):
+        try:
+            return await observed_shadow_tick(
+                settings, provider, provider_name, decision_maker=decision_maker,
+                run_id=run_id, model_name=model_name, shadow_config=shadow_config,
+                telemetry=telemetry)
+        except TRANSIENT:
+            if attempt == attempts:
+                raise
+            delay = base_delay_seconds * attempt
+            log.warning("shadow tick transient failure; retry %d/%d in %.1fs",
+                        attempt + 1, attempts, delay)
+            await asyncio.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def _shadow_config(settings: Settings) -> ShadowConfig:
@@ -246,36 +343,54 @@ def _build_maker(settings: Settings, kind: str):
 
 async def _once(settings: Settings, run_id: str, maker, model_name: str) -> None:
     provider = build_provider(settings)
+    telemetry = OperationalTelemetry(settings.db_dsn, "shadow_online_once")
+    telemetry.heartbeat("starting", details={"run_id": run_id, "maker": model_name})
     try:
-        summary = await shadow_tick(settings, provider, settings.market_data_provider,
-                                    decision_maker=maker, run_id=run_id, model_name=model_name,
-                                    shadow_config=_shadow_config(settings))
+        summary = await observed_shadow_tick(
+            settings, provider, settings.market_data_provider, decision_maker=maker,
+            run_id=run_id, model_name=model_name, shadow_config=_shadow_config(settings),
+            telemetry=telemetry)
     finally:
-        aclose = getattr(provider, "aclose", None)
-        if aclose:
-            await aclose()
+        try:
+            telemetry.stop()
+        finally:
+            aclose = getattr(provider, "aclose", None)
+            if aclose:
+                await aclose()
     print(f"[shadow-online] {summary}")
 
 
 async def _loop(settings: Settings, run_id: str, maker, model_name: str,
                 offset_seconds: float = 5.0) -> None:
     provider = build_provider(settings)
+    telemetry = OperationalTelemetry(settings.db_dsn, "shadow_online")
+    telemetry.heartbeat("starting", details={"run_id": run_id, "maker": model_name,
+                                              "provider": settings.market_data_provider})
     try:
         while True:
+            tick_error = None
             try:
-                summary = await shadow_tick(settings, provider, settings.market_data_provider,
-                                            decision_maker=maker, run_id=run_id,
-                                            model_name=model_name,
-                                            shadow_config=_shadow_config(settings))
+                summary = await shadow_tick_with_retries(
+                    settings, provider, settings.market_data_provider,
+                    decision_maker=maker, run_id=run_id, model_name=model_name,
+                    shadow_config=_shadow_config(settings), telemetry=telemetry)
                 log.info("shadow tick: %s", summary)
-            except Exception:  # noqa: BLE001 — a tick error must not kill the loop
+            except Exception as exc:  # noqa: BLE001 — a tick error must not kill the loop
+                tick_error = exc
                 log.exception("shadow tick failed (continuing)")
             wake = next_m15(datetime.now(timezone.utc)) + timedelta(seconds=offset_seconds)
+            telemetry.heartbeat("healthy" if tick_error is None else "error",
+                                next_wake_at=wake, error=tick_error,
+                                details={"phase": "sleeping", "run_id": run_id,
+                                         "maker": model_name})
             await asyncio.sleep(max(1.0, (wake - datetime.now(timezone.utc)).total_seconds()))
     finally:
-        aclose = getattr(provider, "aclose", None)
-        if aclose:
-            await aclose()
+        try:
+            telemetry.stop()
+        finally:
+            aclose = getattr(provider, "aclose", None)
+            if aclose:
+                await aclose()
 
 
 def main() -> int:
@@ -288,10 +403,14 @@ def main() -> int:
     args = parser.parse_args()
     settings = load_settings()
     maker, model_name = _build_maker(settings, args.maker)
-    if args.once:
-        asyncio.run(_once(settings, args.run_id, maker, model_name))
-    else:
-        asyncio.run(_loop(settings, args.run_id, maker, model_name))
+    try:
+        if args.once:
+            asyncio.run(_once(settings, args.run_id, maker, model_name))
+        else:
+            asyncio.run(_loop(settings, args.run_id, maker, model_name))
+    except KeyboardInterrupt:
+        log.info("shadow online stopped by operator")
+        return 130
     return 0
 
 

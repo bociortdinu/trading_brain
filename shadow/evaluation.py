@@ -178,23 +178,30 @@ def _metrics_for(rows: list[dict]) -> dict:
 
 
 async def evaluate_over_windows(windows, *, symbol, provider_name, modeled_spread_pct,
-                                slippage_pct=0.0, makers=None, folds=1) -> dict:
+                                slippage_pct=0.0, commission_pct=0.0, swap_pct_per_night=0.0,
+                                makers=None, folds=1) -> dict:
     """Run each baseline maker over the FULL window ONCE (in memory, NOTHING persisted), then
     report the full metric bundle overall + per temporal fold. One continuous run preserves
     indicator warm-up and the single-position state; folds are a slice of the OUTPUT, not of the
-    input (see temporal_folds).
+    input (see temporal_folds). ALL makers run on the SAME frozen windows with the SAME cost
+    config, so the comparison is controlled.
 
     `makers` is {name: maker}; defaults to the three baselines. The LLM maker can be passed too,
-    but the honest 'LLM beats baseline net of costs' verdict is only meaningful on a paid run."""
+    but the honest 'LLM beats baseline net of costs' verdict is only meaningful on a paid run.
+    `commission_pct`/`swap_pct_per_night` are applied to every arm — if 0 (default), R is NOT net
+    of financing and the report says so."""
     from shadow.runner import ConfluenceStrategy, backtest_over_windows
+    from shadow.virtual_broker import ShadowConfig
 
     makers = makers or {"confluence": ConfluenceStrategy(), "random": RandomMaker(), "flat": FlatMaker()}
+    cfg = ShadowConfig(commission_pct=commission_pct, swap_pct_per_night=swap_pct_per_night)
+    costs_modeled = commission_pct != 0 or swap_pct_per_night != 0
 
-    report: dict = {"symbol": symbol, "folds": folds, "makers": {}}
+    report: dict = {"symbol": symbol, "folds": folds, "financing_modeled": costs_modeled, "makers": {}}
     for name, maker in makers.items():
         rows = await backtest_over_windows(
             windows, symbol=symbol, provider_name=provider_name, modeled_spread_pct=modeled_spread_pct,
-            slippage_pct=slippage_pct, decision_maker=maker)
+            slippage_pct=slippage_pct, shadow_config=cfg, decision_maker=maker)
         entry = {"overall": _metrics_for(rows)}
         if folds > 1:
             entry["folds"] = [{"meta": fold["meta"], "metrics": _metrics_for(fold["rows"])}
@@ -219,7 +226,9 @@ def format_report(report: dict) -> str:
             f"{(m.get('win_rate') or 0) * 100:>5.1f}% {m.get('expectancy_r', 0):>7} "
             f"{ci_s:>18} {m.get('max_drawdown_r', 0):>8} {spread if spread is not None else '—':>6}")
     lines.append("")
-    lines.append("Baselines to beat NET OF COSTS: a real edge > confluence(no-LLM), > random, > flat(0).")
+    fin = "net of spread+slippage+commission+swap" if report.get("financing_modeled") else \
+        "net of spread+slippage ONLY (commission/swap = 0, NOT modelled)"
+    lines.append(f"Beat these baselines ({fin}): a real edge > confluence(no-LLM), > random, > flat(0).")
     lines.append("`discr` = win-rate spread across confidence buckets (ordinal); NOT ECE — confidence is")
     lines.append("ordinal, so probabilistic calibration (ECE) needs a train fit first.")
     lines.append("NOT a walk-forward (no train→OOS split); the LLM-vs-baseline verdict needs a paid run.")
@@ -253,6 +262,7 @@ def main() -> int:
         return await evaluate_over_windows(
             windows, symbol=symbol, provider_name=settings.market_data_provider,
             modeled_spread_pct=settings.replay_spread_pct, slippage_pct=settings.slippage_pct,
+            commission_pct=settings.commission_pct, swap_pct_per_night=settings.swap_pct_per_night,
             folds=args.folds)
 
     print(format_report(asyncio.run(_run())))

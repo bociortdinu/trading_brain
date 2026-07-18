@@ -256,12 +256,14 @@ def test_execution_config_is_part_of_the_decision_fingerprint():
     from shadow.virtual_broker import ShadowConfig, execution_hash, execution_manifest
 
     base = dict(input_hash="h", model="m", provider="csv", risk_config_version="v")
+    common = dict(single_position=True, cooldown_bars=0, risk_config_version="v",
+                  prefilter_version="pf")
     h_a = execution_hash(execution_manifest(modeled_spread_pct=0.02, slippage_pct=0.005,
-                                            config=ShadowConfig()))
+                                            config=ShadowConfig(), **common))
     h_b = execution_hash(execution_manifest(modeled_spread_pct=0.02, slippage_pct=0.010,   # diff slip
-                                            config=ShadowConfig()))
+                                            config=ShadowConfig(), **common))
     h_c = execution_hash(execution_manifest(modeled_spread_pct=0.02, slippage_pct=0.005,
-                                            config=ShadowConfig(commission_pct=0.01)))       # diff comm
+                                            config=ShadowConfig(commission_pct=0.01), **common))  # diff comm
     assert len({h_a, h_b, h_c}) == 3                                   # every knob moves the hash
     fp = lambda h: decision_fingerprint(**base, execution_hash=h)      # noqa: E731
     assert len({fp(h_a), fp(h_b), fp(h_c)}) == 3                       # -> three distinct decisions

@@ -81,7 +81,8 @@ def main() -> int:
                 # granted (retention is legitimate and the FK CASCADE from market_snapshots needs
                 # it), and delete+reinsert can still emulate an update. A real audit guarantee
                 # needs DELETE moved to a separate retention role — not done, and not claimed.
-                for table in ("spread_observations", "snapshot_evaluations", "llm_calls"):
+                for table in ("spread_observations", "snapshot_evaluations", "llm_calls",
+                              "run_manifests"):
                     conn.execute(pgsql.SQL("REVOKE UPDATE ON {} FROM {}").format(
                         pgsql.Identifier(table), role))
 
@@ -91,7 +92,7 @@ def main() -> int:
                 conn.execute(pgsql.SQL(
                     "REVOKE INSERT, UPDATE, DELETE ON schema_migrations FROM {}").format(role))
                 conn.commit()
-                print(f"granted DML on trading_brain to app role {app_user} "
+                print(f"granted DML on {target_db} to app role {app_user} "
                       f"(UPDATE revoked on fact tables; schema_migrations read-only)")
     except Exception as exc:  # noqa: BLE001
         print(f"migration failed: {exc}", file=sys.stderr)

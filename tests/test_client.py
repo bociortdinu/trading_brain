@@ -35,12 +35,13 @@ def _valid_prediction() -> PredictionRequest:
 
 def test_status_ok():
     def h(_req):
-        return httpx.Response(200, json={"connected": True, "account": "1", "environment": "demo"})
+        return httpx.Response(200, json={"connected": True, "account": "1",
+                                        "environment": "demo", "trading_enabled": False})
 
     async def go():
         async with make_client(h) as c:
             s = await c.status()
-            assert s.connected and s.environment == "demo"
+            assert s.connected and s.environment == "demo" and s.trading_enabled is False
 
     run(go())
 

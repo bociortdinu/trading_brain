@@ -69,6 +69,9 @@ class Status(BaseModel):
     connected: bool
     account: str
     environment: str
+    # Explicit safety fact exposed by trading_hands. Optional only for compatibility while an
+    # older service binary is still running; the dashboard warns when it is absent.
+    trading_enabled: bool | None = None
 
 
 class Balance(BaseModel):

@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="ro">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Trading Brain · Operator Console</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="noise" aria-hidden="true"></div>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+      <div>
+        <p class="eyebrow">XTB · SHADOW CONTROL</p>
+        <h1>Trading Brain</h1>
+      </div>
+    </div>
+    <div class="controls">
+      <label>
+        <span>Simbol</span>
+        <input id="symbol-input" value="GOLD" maxlength="20" autocomplete="off">
+      </label>
+      <label>
+        <span>Experiment</span>
+        <select id="run-filter"><option value="">Toate run-urile</option></select>
+      </label>
+      <label class="toggle-control">
+        <span>Auto-refresh</span>
+        <input id="auto-refresh" type="checkbox" checked>
+        <i aria-hidden="true"></i>
+      </label>
+      <button id="refresh-button" class="primary-button" type="button">
+        <span class="refresh-icon" aria-hidden="true">↻</span> Actualizează
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <section id="connection-strip" class="connection-strip" aria-live="polite">
+      <div class="pulse"></div>
+      <span>Se încarcă starea sistemului…</span>
+    </section>
+
+    <section id="alerts" class="alerts" aria-label="Alerte operaționale"></section>
+
+    <section class="status-grid" aria-label="Stare generală">
+      <article class="status-card" id="status-xtb"></article>
+      <article class="status-card" id="status-market"></article>
+      <article class="status-card" id="status-brain"></article>
+      <article class="status-card" id="status-db"></article>
+    </section>
+
+    <section class="hero-grid">
+      <article class="panel market-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">PIAȚĂ &amp; FEED</p>
+            <h2 id="market-title">GOLD</h2>
+          </div>
+          <span id="quote-time" class="muted">—</span>
+        </div>
+        <div class="quote-row">
+          <div><span>Bid</span><strong id="quote-bid">—</strong></div>
+          <div><span>Ask</span><strong id="quote-ask">—</strong></div>
+          <div><span>Spread</span><strong id="quote-spread">—</strong></div>
+        </div>
+        <div id="price-chart" class="price-chart" aria-label="Istoric recent preț"></div>
+        <div class="market-meta">
+          <div><span>Ultima bară XTB</span><strong id="broker-bar">—</strong></div>
+          <div><span>Ultimul snapshot brain</span><strong id="brain-bar">—</strong></div>
+          <div><span>Provider</span><strong id="provider-name">—</strong></div>
+        </div>
+      </article>
+
+      <article class="panel metrics-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">TRACK RECORD SELECTAT</p>
+            <h2>Rezultate shadow</h2>
+          </div>
+          <span id="metrics-scope" class="tag">TOATE</span>
+        </div>
+        <div class="metric-grid">
+          <div class="metric"><span>Decizii</span><strong id="metric-decisions">—</strong></div>
+          <div class="metric"><span>Trade-uri</span><strong id="metric-trades">—</strong></div>
+          <div class="metric"><span>Deschise</span><strong id="metric-open">—</strong></div>
+          <div class="metric"><span>Win rate</span><strong id="metric-win">—</strong></div>
+          <div class="metric wide"><span>Expectancy</span><strong id="metric-expectancy">—</strong><small>R / trade închis</small></div>
+          <div class="metric wide"><span>Cost LLM auditat</span><strong id="metric-cost">—</strong><small id="metric-llm-calls">— apeluri</small></div>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel pipeline-panel">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">ULTIMA PROCESARE</p>
+          <h2>Traseul deciziei</h2>
+        </div>
+        <button id="show-latest-json" class="ghost-button" type="button">Vezi datele brute</button>
+      </div>
+      <div id="pipeline" class="pipeline"></div>
+      <div id="rationale" class="rationale"></div>
+    </section>
+
+    <section class="lower-grid operations-grid">
+      <article class="panel table-panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">PROCESE</p><h2>Servicii &amp; heartbeat</h2></div>
+          <span id="services-count" class="tag">0</span>
+        </div>
+        <div class="table-wrap compact">
+          <table>
+            <thead><tr><th>Serviciu</th><th>Stare</th><th>Heartbeat</th><th>Următoarea trezire</th><th>Commit</th></tr></thead>
+            <tbody id="services-body"></tbody>
+          </table>
+        </div>
+      </article>
+
+      <article class="panel table-panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">EXECUȚII</p><h2>Ultimele tick-uri</h2></div>
+          <span id="pipeline-runs-count" class="tag">0</span>
+        </div>
+        <div class="table-wrap compact">
+          <table>
+            <thead><tr><th>Start</th><th>Serviciu / tip</th><th>Rezultat</th><th>Bare</th><th>Durată</th></tr></thead>
+            <tbody id="pipeline-runs-body"></tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel table-panel">
+      <div class="panel-heading table-heading">
+        <div>
+          <p class="eyebrow">AUDIT CRONOLOGIC</p>
+          <h2>Timeline M15</h2>
+        </div>
+        <div class="legend">
+          <span><i class="dot ok"></i>Aprobat</span>
+          <span><i class="dot warn"></i>Respins</span>
+          <span><i class="dot muted-dot"></i>Fără decizie</span>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Bară</th><th>Preț</th><th>Regim</th><th>Eligibilitate</th>
+            <th>Model / decizie</th><th>Risk</th><th>Trade</th><th>R</th>
+          </tr></thead>
+          <tbody id="timeline-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="lower-grid">
+      <article class="panel table-panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">POZIȚII</p><h2>Shadow deschise</h2></div>
+          <span id="open-count" class="tag">0</span>
+        </div>
+        <div class="table-wrap compact">
+          <table>
+            <thead><tr><th>Run</th><th>Side</th><th>Entry / acum</th><th>R brut</th><th>SL / TP</th><th>Timeout estimat</th></tr></thead>
+            <tbody id="open-trades-body"></tbody>
+          </table>
+        </div>
+      </article>
+
+      <article class="panel table-panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">EXPERIMENTE</p><h2>Run-uri persistate</h2></div>
+          <span id="runs-count" class="tag">0</span>
+        </div>
+        <div class="table-wrap compact">
+          <table>
+            <thead><tr><th>Run</th><th>Tip / validitate</th><th>Model</th><th>Decizii</th><th>Trade-uri</th><th>Exp. R</th></tr></thead>
+            <tbody id="runs-body"></tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel table-panel">
+      <div class="panel-heading">
+        <div><p class="eyebrow">COST &amp; TRASABILITATE</p><h2>Apeluri LLM</h2></div>
+        <span class="tag">READ ONLY</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Timp</th><th>Model cerut</th><th>Rezultat</th><th>Tokeni in / out</th><th>Cache</th><th>Retry</th><th>Latență</th><th>Cost</th></tr></thead>
+          <tbody id="llm-body"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div><span class="read-only-mark">◉</span> Consolă read-only · niciun endpoint de ordine sau scriere</div>
+    <div id="footer-meta">—</div>
+  </footer>
+
+  <dialog id="detail-dialog">
+    <div class="dialog-heading">
+      <div><p class="eyebrow">AUDIT</p><h2 id="dialog-title">Detalii</h2></div>
+      <button id="close-dialog" class="ghost-button" type="button">Închide</button>
+    </div>
+    <pre id="dialog-content"></pre>
+  </dialog>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

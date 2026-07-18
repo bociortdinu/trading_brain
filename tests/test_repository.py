@@ -12,7 +12,22 @@ from features.mtf import build_feature_packet
 from tests.synthetic import trend
 
 psycopg = pytest.importorskip("psycopg")
-DSN = os.environ.get("BRAIN_DB_DSN")
+DSN = os.environ.get("BRAIN_TEST_DB_DSN")
+
+
+def _is_explicit_test_database(dsn: str) -> bool:
+    try:
+        dbname = psycopg.conninfo.conninfo_to_dict(dsn).get("dbname", "")
+        return dbname.lower().endswith("_test")
+    except Exception:
+        return False
+
+
+if DSN and not _is_explicit_test_database(DSN):
+    raise RuntimeError(
+        "BRAIN_TEST_DB_DSN must target a database whose name ends in '_test'; "
+        "refusing to run destructive repository tests against an operational database"
+    )
 
 
 def _db_ok() -> bool:
@@ -25,7 +40,7 @@ def _db_ok() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(not _db_ok(), reason="no reachable BRAIN_DB_DSN")
+pytestmark = pytest.mark.skipif(not _db_ok(), reason="no reachable BRAIN_TEST_DB_DSN (..._test)")
 
 
 def _packet(symbol: str, *, spread=None, provider="csv"):
@@ -1120,6 +1135,88 @@ def test_llm_audit_is_atomic_with_the_decision():
     finally:
         repo._llm_call_row = real
         with psycopg.connect(DSN) as c:
+            c.execute("DELETE FROM decisions WHERE run_id=%s", (run_id,))
+            c.commit()
+        _cleanup(sym)
+
+
+def test_run_manifest_pins_a_run_to_one_config():
+    """A run_id is ONE frozen setup. The first use records its execution-manifest hash; a later
+    use with a different config is REFUSED (else two configs mix into one experiment)."""
+    from database.repository import RunConfigMismatch, assert_run_manifest
+
+    run_id = "rm-" + os.urandom(3).hex()
+    try:
+        assert_run_manifest(DSN, run_id, {"slippage": 0.005}, "hashA")
+        assert_run_manifest(DSN, run_id, {"slippage": 0.005}, "hashA")   # same -> idempotent
+        with pytest.raises(RunConfigMismatch):
+            assert_run_manifest(DSN, run_id, {"slippage": 0.010}, "hashB")   # different -> refused
+        with psycopg.connect(DSN) as c:   # the app role cannot rewrite the pin (UPDATE revoked)
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                c.execute("UPDATE run_manifests SET manifest_hash='x' WHERE run_id=%s", (run_id,))
+            c.rollback()
+    finally:
+        with psycopg.connect(DSN) as c:
+            c.execute("DELETE FROM run_manifests WHERE run_id=%s", (run_id,))
+            c.commit()
+
+
+def test_online_decision_and_open_trade_are_one_atomic_chain():
+    """Online writes the decision + its open trade in ONE transaction, so a crash can't leave a
+    committed decision with no trade (online had no recovery for that window). And a re-run with
+    the same fingerprint (a reclaimed crash between the atomic commit and the reservation
+    completion) does NOT create a second trade."""
+    from core.models import Direction
+    from database.repository import insert_decision, insert_evaluation, upsert_snapshot
+    from decision.pipeline import DecisionRecord
+    from decision.prefilter import PrefilterResult
+    from decision.schema import DecisionOutput
+    from risk.engine import RiskVerdict
+    from shadow.reconciler import reconcile
+    from shadow.virtual_broker import cost_manifest, open_virtual_trade
+
+    sym, run_id = "TST_" + os.urandom(3).hex(), "atomtr-" + os.urandom(3).hex()
+    end = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    try:
+        _, snap_id = upsert_snapshot(DSN, _packet(sym, spread=0.02))
+        eval_id = insert_evaluation(DSN, snap_id, _eval("online", True, []))
+        decision = DecisionOutput(direction="BUY", confidence=0.8, rationale="x")
+        risk = RiskVerdict(approved=True, reason=None, direction="BUY", confidence=0.8,
+                           sl_pct=0.3, tp_pct=0.6, risk_config_version="v")
+        rec = DecisionRecord(stage="decided", symbol=sym, as_of=end, mode="online",
+                             prefilter=PrefilterResult(passed=True, reasons=[], config_version="pf"),
+                             decision=decision, risk=risk, input_hash="h",
+                             manifest={"prompt_version": "p", "output_schema_version": "s",
+                                       "feature_pipeline_version": "1.2.0", "strategy_version": "st",
+                                       "risk_config_version": "v"})
+        trade = open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6, spread_pct=0.02,
+                                   spread_provenance="observed_xtb", opened_at=end)
+        open_trade = {"symbol": sym, "trade": trade, "outcome": reconcile(trade, []),
+                      "timeframe": "15min", "timeout_bars": 96,
+                      "costs": cost_manifest(trade, __import__("shadow.virtual_broker", fromlist=["ShadowConfig"]).ShadowConfig()),
+                      "observed_at": None}
+
+        def persist():
+            return insert_decision(DSN, snapshot_id=snap_id, evaluation_id=eval_id, model="m",
+                                   record=rec, ai_input={}, ai_output={}, mode="shadow",
+                                   data_provider="csv", run_id=run_id, input_fingerprint="atomtrfp",
+                                   open_trade=open_trade)
+
+        dec_id, inserted = persist()
+        assert inserted is True
+        with psycopg.connect(DSN) as c:
+            n = c.execute("SELECT count(*) FROM trades WHERE decision_id=%s", (dec_id,)).fetchone()[0]
+        assert n == 1, "the decision and its open trade land together (atomic chain)"
+
+        # Re-run same fingerprint (reclaimed crash) -> existing decision, NO duplicate trade.
+        dec_id2, inserted2 = persist()
+        assert dec_id2 == dec_id and inserted2 is False
+        with psycopg.connect(DSN) as c:
+            n = c.execute("SELECT count(*) FROM trades WHERE decision_id=%s", (dec_id,)).fetchone()[0]
+        assert n == 1, "a reclaimed re-run must not open a second trade"
+    finally:
+        with psycopg.connect(DSN) as c:
+            c.execute("DELETE FROM trades WHERE run_id=%s", (run_id,))
             c.execute("DELETE FROM decisions WHERE run_id=%s", (run_id,))
             c.commit()
         _cleanup(sym)
