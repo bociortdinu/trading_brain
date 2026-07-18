@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]        # run on every branch, not just main (a feature push must trigger CI)
   pull_request:
-    branches: [main]
+  workflow_dispatch:        # allow a manual run
 
 jobs:
   # Fast lane: everything that needs no infrastructure. Repository/operations tests skip

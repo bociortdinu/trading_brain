@@ -13,6 +13,7 @@ WorkingDirectory=/opt/trading_brain
 EnvironmentFile=/etc/trading_brain/backup.env
 ExecStart=/opt/trading_brain/scripts/db_backup.sh
 # Least privilege for a backup job.
+UMask=0077
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

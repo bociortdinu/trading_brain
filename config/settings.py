@@ -112,5 +112,24 @@ class Settings(BaseSettings):
         return brain_symbol
 
 
+def warn_if_env_world_readable(env_path: str = ".env") -> str | None:
+    """A .env holds DB/API secrets and must be 0600. Return a warning string if it is group- or
+    world-accessible (does not raise — the caller logs it), else None."""
+    import os
+    import stat
+    try:
+        mode = os.stat(env_path).st_mode
+    except OSError:
+        return None
+    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        return (f"{env_path} is group/other-accessible (mode {stat.S_IMODE(mode):#o}); it holds "
+                f"secrets — run: chmod 600 {env_path}")
+    return None
+
+
 def load_settings() -> Settings:
+    import logging
+    warning = warn_if_env_world_readable(Settings.model_config.get("env_file", ".env"))
+    if warning:
+        logging.getLogger("config.settings").warning("insecure permissions: %s", warning)
     return Settings()
