@@ -6,9 +6,10 @@ MODELLING HONESTY (this is an approximation, not a bid/ask microstructure simula
 - Bars are treated as MID prices. SL/TP are absolute MID levels from the entry mid and the
   deterministic sl_pct / tp_pct the Risk Engine produced.
 - The bid/ask spread is charged as ONE flat round-trip cost deducted from the R-multiple
-  (see reconciler `_r_net`). Touch thresholds are NOT bid/ask-adjusted; a gap through the
-  stop fills IDEALLY at the stop level; there is no latency or slippage yet. Those are
-  refinements tracked for later in the Faza 3 plan.
+  (see reconciler `_r_net`). Touch thresholds are NOT bid/ask-adjusted. Adverse SLIPPAGE is
+  applied to entry and exit fills, and a gap that OPENS past the stop fills at the (worse)
+  open, not idealised at the stop level. What is NOT modelled yet: execution LATENCY, a
+  variable/empirical spread, and true bid/ask microstructure (Faza 3 refinements).
 """
 
 from __future__ import annotations

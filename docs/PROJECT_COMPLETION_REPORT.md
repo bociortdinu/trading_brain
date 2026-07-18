@@ -94,10 +94,11 @@ Aceste puncte sunt prioritare chiar dacă nu se va trimite nicio ordine.
    pre-existentă, nu doar de la zero).
 5. **Backup și restore.** **Livrat:** `scripts/db_backup.sh` (pg_dump custom-format + retenție) +
    `scripts/db_restore.sh` (cu guard `_test`/`--force`), unitate systemd + timer în `deploy/systemd/`
-   (și exemplu cron), plus `make backup`/`restore` prin container. **Restore testat** în CI
-   (`backup-restore`): dump → restore într-o bază nouă → compară numărul de migrări. Logica
-   scripturilor e unit-testată (`tests/test_backup.py`, cu pg_dump/pg_restore mock). Rămâne ca
-   operatorul să seteze DSN-ul admin + programul pe mașina reală.
+   (și exemplu cron), plus `make backup`/`restore` prin container. Round-trip-ul de restore e
+   **definit** în CI (`backup-restore`: dump → restore într-o bază nouă → compară migrări + un rând
+   santinelă JSONB), dar **nu a rulat încă verde pe remote** — nu e „testat live" până atunci.
+   Logica scripturilor e unit-testată (`tests/test_backup.py`, cu pg_dump/pg_restore mock). Rămâne
+   ca operatorul să seteze DSN-ul admin + programul + un restore drill real pe mașina reală.
 
 **DoD:** stackul pornește repetabil, rulează cel puțin 72 h fără intervenție în afară de
 reauth-ul documentat, se autorecuperează după restartul componentelor, alertele dispar/reapar corect,
@@ -237,3 +238,30 @@ estimarea. Trecerea la bani reali nu se poate estima onest înaintea măsurător
 - `EXECUTION_PLAN.md` conține o cronologie lungă de corecții și cifre istorice de teste; statusul
   curent ar trebui separat de jurnal, ca operatorul să nu confunde afirmații vechi cu starea actuală.
 
+
+## 10. Datorie din review-ul extern (stare la zi)
+
+**Rezolvate cu teste** (P0 corectitudine Shadow/audit + P1 evaluare/operațional):
+
+- **P0-1** manifest verificat înainte de orice mutație + granularitate de reconciliere înghețată
+  per trade (`5539fe4`). **P0-2/3** acoperire **calendar-aware** + fail-closed când fereastra unui
+  trade nu e acoperită (`d5d5971`). **P0-4** fingerprint complet (RiskConfig/PrefilterConfig
+  integral + eligibility + calendar-version) (`4b6b244`). **P0-5** proveniență git în Docker +
+  „unknown ≠ clean" (`f652684`). **P0-6** toate variabilele `BRAIN_*` ajung în container + dump
+  redactat (`78fc7d8`). **P0-7** `BRAIN_RUN_ID` + default versionat pe strategie (`09f5d29`).
+  **P0-8** validare strictă a configului (Literal/limite/ZoneInfo) (`6f7418d`).
+- **P1**: block bootstrap pentru randamente serial-corelate + config complet de finanțare în
+  evaluare + costuri pe componente (`10c6684`); triggere CI + hardening backup + check `.env`
+  (`fe45e1d`).
+
+**Rămâne (trading_brain, necesită sesiune dedicată):** identitatea snapshotului per
+provider/dataset (migrare + cheie de observație); impunerea reală append-only în DB (rol de
+retenție separat, granturi per tabel, revocare DELETE de la app-role); politica de catch-up după
+downtime (gap operațional persistat, nu doar ultima bară); lock de dependențe cu hash-uri; fixtures
+live de calendar pentru iarnă/DST/early-close; wiring știri live sau scoaterea din DoD-ul v1; rate
+reale GOLD din specificația contului.
+
+**Blocat (NU în acest repo / neconstruit):** execuția demo (idempotency `/purchase`, state machine
+de ordine, atomicitate order↔DB, garduri, close/PnL autoritativ, client ipax) și testele/keepalive
+Go — sunt în **`trading_hands`** (neatins intenționat) + **Faza 6**. Rularea **live Compose** și
+**CI remote verde** cer mediu cu daemon Docker / GitHub — de făcut de operator.

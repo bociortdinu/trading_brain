@@ -89,8 +89,9 @@ sudo systemctl daemon-reload && sudo systemctl enable --now trading-brain-backup
 
 **Restore testat.** Nu te baza pe un backup pe care nu l-ai restaurat. `scripts/db_restore.sh`
 refuză orice bază al cărei nume nu se termină în `_test` (fără `--force`), ca să nu suprascrii din
-greșeală baza operațională. CI-ul (`backup-restore`) face round-trip-ul complet — dump → restore
-într-o bază nouă → compară numărul de migrări aplicate — la fiecare push.
+greșeală baza operațională. Job-ul CI `backup-restore` **definește** round-trip-ul complet — dump →
+restore într-o bază nouă → compară migrările + un rând santinelă JSONB — dar **nu a rulat încă verde
+pe remote** (nu-l numi „testat" până la prima rulare verde). Fă și un **restore drill real** manual.
 
 ```bash
 # verificare locală (necesită client pe host): restaurează într-o bază _test și compară

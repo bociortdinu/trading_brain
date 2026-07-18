@@ -53,7 +53,9 @@ Instantaneu exact al proiectului. (Secțiunile „Status onest / Runda N" de mai
 - **trading_hands** (Go): endpoint `/candles` real-time (paginat), keepalive + **reconnect dovedit**
   cu mock CoreAPI, data race pe `account` reparat.
 
-**Cifre reale:** **295 teste** (261 fără DB + 34 DB-gated pe o bază `_test` izolată), Go
+**Cifre reale:** **310 teste** (274 fără DB + 36 DB-gated pe o bază `_test` izolată). Categorii de
+verificare: *fără-infra* și *DB-gated* rulate local; *live Compose*, *live XTB* și *CI remote* încă
+NErulate (Docker daemon indisponibil în mediu; CI-ul n-a rulat verde încă). Go
 `-race`/`vet`/`gofmt` curate, launcher Node **8 teste**.
 **23 migrări** (0001–0023). Versiuni: features `1.2.0`, decision-schema `2026.3`, prompt `2026.1`,
 strategy `2026.1`, risk `2026.2`.

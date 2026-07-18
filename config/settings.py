@@ -42,7 +42,8 @@ class Settings(BaseSettings):
 
     # Market-data provider selection (composition via config; interface is MarketDataProvider).
     #   polygon = Massive/Polygon.io REST (delayed on free tier)
-    #   xtb     = real-time via trading_hands /candles (same venue as execution, no basis)
+    #   xtb     = real-time via trading_hands /candles (same VENUE as execution -> reduces venue
+    #             mismatch, but the bar feed and the /quote can still differ in timestamp/aggregation)
     #   csv     = offline files
     market_data_provider: Literal["polygon", "csv", "xtb"] = "polygon"
     csv_dir: str | None = None
