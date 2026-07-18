@@ -32,9 +32,15 @@ fi
 ts="$(date -u +%Y%m%dT%H%M%SZ)"
 out="$OUTDIR/trading_brain_${ts}.dump"
 
-# Custom format so it restores with pg_restore (selective, parallel, --clean).
-pg_dump --dbname="$DSN" --format=custom --file="$out"
-# Integrity checksum next to the dump (verify before a restore: sha256sum -c <file>.sha256).
+# Custom format so it restores with pg_restore (selective, parallel, --clean). Write to a temp
+# file and rename atomically, so a failed/interrupted dump never leaves a partial *.dump that a
+# later restore might trust.
+tmp="$out.partial"
+trap 'rm -f "$tmp"' EXIT
+pg_dump --dbname="$DSN" --format=custom --file="$tmp"
+mv -f "$tmp" "$out"
+trap - EXIT
+# Integrity checksum next to the dump (restore verifies it; or `sha256sum -c <file>.sha256`).
 if command -v sha256sum >/dev/null 2>&1; then
   ( cd "$OUTDIR" && sha256sum "$(basename "$out")" > "$(basename "$out").sha256" )
 fi

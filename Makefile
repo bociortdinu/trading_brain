@@ -55,11 +55,13 @@ psql: ## Open a psql shell on the runtime DB (admin, via local trust inside the 
 	$(COMPOSE) exec db psql -U $(POSTGRES_USER) -d $(BRAIN_DB_NAME)
 
 backup: ## pg_dump the runtime DB to backups/ (custom format; keeps newest $(BACKUP_KEEP)). For scheduled backups use deploy/systemd + scripts/db_backup.sh
-	@mkdir -p backups
-	$(COMPOSE) exec -T db pg_dump -U $(POSTGRES_USER) -Fc $(BRAIN_DB_NAME) \
-	  > backups/$(BRAIN_DB_NAME)_$$(date -u +%Y%m%dT%H%M%SZ).dump
-	@ls -1t backups/$(BRAIN_DB_NAME)_*.dump 2>/dev/null | tail -n +$$(($(BACKUP_KEEP)+1)) | xargs -r rm -f
-	@echo "wrote backups/ (kept newest $(BACKUP_KEEP); restore with: make restore FILE=backups/<name>.dump)"
+	@umask 077; mkdir -p backups; chmod 700 backups
+	@umask 077; out="backups/$(BRAIN_DB_NAME)_$$(date -u +%Y%m%dT%H%M%SZ).dump"; \
+	  $(COMPOSE) exec -T db pg_dump -U $(POSTGRES_USER) -Fc $(BRAIN_DB_NAME) > "$$out.partial" \
+	  && mv -f "$$out.partial" "$$out" \
+	  && ( cd backups && sha256sum "$$(basename "$$out")" > "$$(basename "$$out").sha256" ) \
+	  && echo "wrote $$out (kept newest $(BACKUP_KEEP))" || { rm -f "$$out.partial"; exit 1; }
+	@ls -1t backups/$(BRAIN_DB_NAME)_*.dump 2>/dev/null | tail -n +$$(($(BACKUP_KEEP)+1)) | while read -r f; do rm -f "$$f" "$$f.sha256"; done
 
 restore: ## Restore a dump into the runtime DB (DESTRUCTIVE): make restore FILE=backups/<name>.dump CONFIRM=yes
 	@test -n "$(FILE)" || { echo "usage: make restore FILE=backups/<name>.dump CONFIRM=yes"; exit 2; }

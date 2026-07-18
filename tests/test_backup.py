@@ -46,6 +46,35 @@ def test_backup_writes_a_dump_and_prunes_to_retention(tmp_path):
     assert len(list(outdir.glob("trading_brain_*.dump"))) == 14   # kept exactly BACKUP_KEEP
 
 
+def test_backup_is_atomic_and_writes_a_checksum(tmp_path):
+    outdir = tmp_path / "backups"
+    outdir.mkdir()
+    dump_body = 'for a in "$@"; do case "$a" in --file=*) f="${a#--file=}";; esac; done; echo real > "$f"'
+    r = _run(BACKUP, ["postgresql://u:p@h:5432/trading_brain"], tmp_path,
+             env_extra={"BACKUP_DIR": str(outdir), "BACKUP_KEEP": "14"}, pg_dump=dump_body)
+    assert r.returncode == 0, r.stderr
+    dumps = list(outdir.glob("trading_brain_*.dump"))
+    assert len(dumps) == 1 and not list(outdir.glob("*.partial"))      # atomic: no leftover partial
+    assert dumps[0].with_name(dumps[0].name + ".sha256").exists()      # checksum written
+
+
+def test_restore_verifies_checksum_and_refuses_a_corrupt_dump(tmp_path):
+    import subprocess
+    dump = tmp_path / "x_test.dump"
+    dump.write_text("real\n")
+    good = subprocess.run(["sha256sum", dump.name], cwd=tmp_path, capture_output=True, text=True).stdout
+    (tmp_path / "x_test.dump.sha256").write_text(good)
+    ran = tmp_path / "ran"
+    r = _run(RESTORE, ["postgresql://u:p@h:5432/trading_brain_test", str(dump)], tmp_path,
+             pg_restore=f'echo ok > "{ran}"; exit 0')
+    assert r.returncode == 0 and ran.exists()                          # valid checksum -> restores
+    ran.unlink()
+    (tmp_path / "x_test.dump.sha256").write_text("deadbeef  x_test.dump\n")   # corrupt
+    r = _run(RESTORE, ["postgresql://u:p@h:5432/trading_brain_test", str(dump)], tmp_path,
+             pg_restore=f'echo ok > "{ran}"; exit 0')
+    assert r.returncode == 4 and not ran.exists()                      # refused, pg_restore NOT run
+
+
 def test_backup_needs_a_dsn(tmp_path):
     r = _run(BACKUP, [], tmp_path, pg_dump="exit 0")
     assert r.returncode == 2 and "usage" in r.stderr
