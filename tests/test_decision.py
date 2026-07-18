@@ -256,8 +256,8 @@ def test_execution_config_is_part_of_the_decision_fingerprint():
     from shadow.virtual_broker import ShadowConfig, execution_hash, execution_manifest
 
     base = dict(input_hash="h", model="m", provider="csv", risk_config_version="v")
-    common = dict(single_position=True, cooldown_bars=0, risk_config_version="v",
-                  prefilter_version="pf")
+    common = dict(single_position=True, cooldown_bars=0,
+                  risk_config={"version": "v"}, prefilter_config={"version": "pf"})
     h_a = execution_hash(execution_manifest(modeled_spread_pct=0.02, slippage_pct=0.005,
                                             config=ShadowConfig(), **common))
     h_b = execution_hash(execution_manifest(modeled_spread_pct=0.02, slippage_pct=0.010,   # diff slip

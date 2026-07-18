@@ -148,14 +148,16 @@ def cost_manifest(trade: "VirtualTrade", config: ShadowConfig) -> dict:
 
 def execution_manifest(*, modeled_spread_pct: float, slippage_pct: float, config: ShadowConfig,
                        single_position: bool, cooldown_bars: int,
-                       risk_config_version: str, prefilter_version: str) -> dict:
-    """EVERY parameter that can change a shadow trade's outcome — so it can rebuild the exact same
-    trade from a persisted decision (crash recovery) and so a config change is a different decision.
+                       risk_config: dict, prefilter_config: dict,
+                       eligibility_policy: dict | None = None,
+                       calendar_version: str | None = None) -> dict:
+    """EVERY parameter that can change a decision's outcome — so it can rebuild the exact same trade
+    from a persisted decision (crash recovery) and so a config change is a DIFFERENT decision.
 
-    Includes the position policy (single_position, cooldown_bars) and the risk/prefilter config
-    versions: `timeout_bars=96` vs `5` MUST hash differently (an earlier version omitted it and
-    they collided). Anything the reconciler or the gate reads goes here."""
-    return {
+    The FULL RiskConfig and PrefilterConfig VALUES are embedded (not just their version strings):
+    changing e.g. `min_confidence` or `max_spread_pct` without bumping a version must still move the
+    fingerprint. Eligibility/freshness policy and the market-calendar version are included too."""
+    manifest = {
         "modeled_spread_pct": modeled_spread_pct,
         "slippage_pct": slippage_pct,
         "commission_pct": config.commission_pct,
@@ -172,9 +174,17 @@ def execution_manifest(*, modeled_spread_pct: float, slippage_pct: float, config
         "timeout_bars": config.timeout_bars,
         "single_position": single_position,
         "cooldown_bars": cooldown_bars,
-        "risk_config_version": risk_config_version,
-        "prefilter_version": prefilter_version,
+        # Full canonical policy — not just the version strings (execution_hash sorts keys).
+        "risk_config": risk_config,
+        "prefilter_config": prefilter_config,
+        "risk_config_version": risk_config.get("version"),
+        "prefilter_version": prefilter_config.get("version"),
     }
+    if eligibility_policy is not None:
+        manifest["eligibility_policy"] = eligibility_policy
+    if calendar_version is not None:
+        manifest["calendar_version"] = calendar_version
+    return manifest
 
 
 def execution_hash(manifest: dict) -> str:

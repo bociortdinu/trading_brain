@@ -160,7 +160,9 @@ async def _backtest_over_windows(
     exec_manifest = execution_manifest(
         modeled_spread_pct=modeled_spread_pct, slippage_pct=slippage_pct, config=shadow_config,
         single_position=single_position, cooldown_bars=cooldown_bars,
-        risk_config_version=risk_config.version, prefilter_version=prefilter_config.version)
+        risk_config=risk_config.model_dump(mode="json"),
+        prefilter_config=prefilter_config.model_dump(mode="json"),
+        calendar_version=calendar_for(provider_name).version)
     from database.operations import git_metadata
     exec_manifest.update({
         "run_kind": "executable_backtest" if single_position else "event_study",

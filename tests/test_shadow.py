@@ -292,7 +292,7 @@ def test_cost_manifest_flags_missing_real_terms_then_clears_when_wired():
 def test_execution_hash_captures_financing_terms():
     from shadow.virtual_broker import execution_hash, execution_manifest
     base = dict(modeled_spread_pct=0.02, slippage_pct=0.005, single_position=True,
-                cooldown_bars=0, risk_config_version="v", prefilter_version="pf")
+                cooldown_bars=0, risk_config={"version": "v"}, prefilter_config={"version": "pf"})
     hashes = {
         execution_hash(execution_manifest(config=ShadowConfig(), **base)),
         execution_hash(execution_manifest(config=ShadowConfig(swap_long_pct_per_night=0.01), **base)),
@@ -361,10 +361,33 @@ def test_covers_window_treats_a_session_break_as_expected_not_a_hole():
 def test_reconcile_timeframe_is_part_of_the_execution_fingerprint():
     from shadow.virtual_broker import execution_hash, execution_manifest
     base = dict(modeled_spread_pct=0.02, slippage_pct=0.005, single_position=True,
-                cooldown_bars=0, risk_config_version="v", prefilter_version="pf")
+                cooldown_bars=0, risk_config={"version": "v"}, prefilter_config={"version": "pf"})
     h15 = execution_hash(execution_manifest(config=ShadowConfig(reconcile_timeframe="15min"), **base))
     h1 = execution_hash(execution_manifest(config=ShadowConfig(reconcile_timeframe="1min"), **base))
     assert h15 != h1
+
+
+def test_full_risk_and_prefilter_values_move_the_fingerprint_not_just_versions():
+    """P0-4: changing a RiskConfig/PrefilterConfig VALUE (min_confidence, max_spread_pct) or an
+    eligibility limit — WITHOUT bumping any version string — must still change the execution hash."""
+    from decision.prefilter import PrefilterConfig
+    from risk.engine import RiskConfig
+    from shadow.virtual_broker import execution_hash, execution_manifest
+
+    def h(*, risk=None, pf=None, elig=None, cal="v1"):
+        return execution_hash(execution_manifest(
+            modeled_spread_pct=0.02, slippage_pct=0.005, config=ShadowConfig(),
+            single_position=True, cooldown_bars=0,
+            risk_config=(risk or RiskConfig()).model_dump(mode="json"),
+            prefilter_config=(pf or PrefilterConfig()).model_dump(mode="json"),
+            eligibility_policy=elig or {"max_feed_lag_seconds": 1800}, calendar_version=cal))
+
+    base = h()
+    # same versions, different min_confidence -> different hash
+    assert h(risk=RiskConfig(min_confidence=0.70)) != base
+    assert h(pf=PrefilterConfig(max_spread_pct=0.20)) != base
+    assert h(elig={"max_feed_lag_seconds": 900}) != base
+    assert h(cal="v2") != base
 
 
 def test_finer_bars_used_only_with_continuous_coverage_else_fall_back():
