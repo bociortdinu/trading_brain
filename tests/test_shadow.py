@@ -300,6 +300,60 @@ def test_execution_hash_captures_financing_terms():
 
 
 # --------------------------------------------------------------------------- #
+# intrabar reconciliation granularity (M1 resolves the M15 both-hit ambiguity)
+# --------------------------------------------------------------------------- #
+def _c(o, h, l, c, start, minutes):
+    return Candle(open_time=start, close_time=start + timedelta(minutes=minutes),
+                  open=o, high=h, low=l, close=c, volume=1.0)
+
+
+def test_m1_bars_resolve_an_m15_both_hit_ambiguity():
+    opened = datetime(2026, 7, 10, 20, 0, tzinfo=UTC)
+    trade = open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6, spread_pct=0.0,
+                               spread_provenance="modeled", opened_at=opened)  # sl 3988, tp 4024
+    # ONE M15 bar whose range spans BOTH the stop and the target -> ambiguous (pessimistic primary).
+    m15 = [_c(4000, 4030, 3980, 4020, opened, 15)]
+    o15 = reconcile(trade, m15, ShadowConfig())
+    assert o15.ambiguous is True
+
+    # The SAME window at M1: price reaches the target FIRST, only later dips to the stop. M1
+    # granularity orders the touches, so the outcome is a definite TP (no ambiguity band).
+    m1 = [
+        _c(4000, 4025, 3999, 4024, opened, 1),                              # TP touched here first
+        _c(4024, 4026, 3980, 3985, opened + timedelta(minutes=5), 1),       # SL only later (already closed)
+    ]
+    o1 = reconcile(trade, m1, ShadowConfig(reconcile_timeframe="1min"))
+    assert o1.ambiguous is False and o1.exit_reason == "tp_hit"
+    assert o1.r_multiple == pytest.approx(2.0)                              # (4024-4000)/12
+
+
+def test_reconcile_timeframe_is_part_of_the_execution_fingerprint():
+    from shadow.virtual_broker import execution_hash, execution_manifest
+    base = dict(modeled_spread_pct=0.02, slippage_pct=0.005, single_position=True,
+                cooldown_bars=0, risk_config_version="v", prefilter_version="pf")
+    h15 = execution_hash(execution_manifest(config=ShadowConfig(reconcile_timeframe="15min"), **base))
+    h1 = execution_hash(execution_manifest(config=ShadowConfig(reconcile_timeframe="1min"), **base))
+    assert h15 != h1
+
+
+def test_choose_reconcile_bars_prefers_fine_else_falls_back():
+    from shadow.reconciler import choose_reconcile_bars
+    fine, coarse = ["m1"], ["m15"]
+    assert choose_reconcile_bars(fine, coarse, want_tf="1min", trigger_tf="15min") == (fine, "1min", False)
+    assert choose_reconcile_bars([], coarse, want_tf="1min", trigger_tf="15min") == (coarse, "15min", True)
+    assert choose_reconcile_bars(fine, coarse, want_tf="15min", trigger_tf="15min") == (coarse, "15min", False)
+
+
+def test_reconcile_timeframe_survives_recovery():
+    from shadow.virtual_broker import cost_manifest, shadow_config_from_costs
+    trade = open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6, spread_pct=0.0,
+                               spread_provenance="modeled", opened_at=datetime(2026, 7, 15, tzinfo=UTC))
+    m = cost_manifest(trade, ShadowConfig(reconcile_timeframe="1min"))
+    assert m["reconcile_timeframe"] == "1min"
+    assert shadow_config_from_costs(m, timeout_bars=96).reconcile_timeframe == "1min"
+
+
+# --------------------------------------------------------------------------- #
 # metrics
 # --------------------------------------------------------------------------- #
 def test_summarize_edge_and_ambiguity_band():

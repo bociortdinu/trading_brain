@@ -45,3 +45,38 @@ def test_shadow_tick_does_not_retry_programming_error(monkeypatch):
     with pytest.raises(KeyError):
         run(_call())
     assert calls == 1
+
+
+# --- finer-bar (M1) reconciliation fetch: best-effort, degrades to the trigger TF --------------
+def test_fetch_finer_bars_falls_back_to_empty_on_provider_error():
+    """A provider that cannot serve M1 must not crash the tick — the caller then reconciles at the
+    trigger timeframe and flags the fallback."""
+    from datetime import datetime, timezone
+    from shadow.online import _fetch_finer_bars
+
+    class BadProvider:
+        async def get_ohlcv(self, symbol, tf, count):
+            raise ProviderError("provider has no M1")
+
+    now = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    assert run(_fetch_finer_bars(BadProvider(), "GOLD", "1min", 96, now)) == []
+
+
+def test_fetch_finer_bars_returns_only_closed_bars():
+    from datetime import datetime, timedelta, timezone
+    from data_collector.providers.base import Candle
+    from shadow.online import _fetch_finer_bars
+
+    now = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+    closed = Candle(open_time=now - timedelta(minutes=2), close_time=now - timedelta(minutes=1),
+                    open=1, high=1, low=1, close=1, volume=1.0)
+    forming = Candle(open_time=now, close_time=now + timedelta(minutes=1),
+                     open=1, high=1, low=1, close=1, volume=1.0)   # not closed yet
+
+    class GoodProvider:
+        async def get_ohlcv(self, symbol, tf, count):
+            assert tf == "1min"
+            return [closed, forming]
+
+    bars = run(_fetch_finer_bars(GoodProvider(), "GOLD", "1min", 10, now))
+    assert closed in bars and forming not in bars     # the still-forming bar is dropped

@@ -112,9 +112,13 @@ iar testele nu mai scriu în baza operațională.
    `shadow_config_from_costs`, parte din execution hash; test dedicat). **Rămâne** doar să se
    *citească specificația reală a contului* și să se seteze ratele (default 0/`unset` → manifestul
    spune onest că R nu e net de finanțare până când sunt cablate).
-2. **Reconciliere M1 sau ticks.** M15 produce multe cazuri în care SL și TP pot fi atinse în aceeași
-   bară. Banda pesimist/optimist este corectă, dar M1/ticks sunt necesare pentru o estimare credibilă
-   a ordinii evenimentelor, latenței și slippage-ului.
+2. **Reconciliere M1 sau ticks.** **Suportat:** `reconcile_timeframe` în `ShadowConfig` (default
+   `15min`, setabil `1min`) — reconciliatorul ordonează atingerile SL/TP la M1 și **rezolvă banda
+   de ambiguitate** când există bare M1 (test dedicat). Bucla online cere M1 doar pentru
+   reconciliere, cu **fallback onest** la M15 (marcat pe trade) dacă providerul nu-l servește;
+   granularitatea reală și `reconcile_fallback` sunt persistate, iar `reconcile_timeframe` intră în
+   fingerprint. **Rămâne:** un provider care servește M1 **continuu** (și *ticks* pentru latență/
+   slippage — încă viitor); backtest-ul rulează încă pe M15 (volumul M1 istoric nu e cablat).
 3. **Track record shadow verificat.** Rulează continuu pe date XTB, cu manifest curat, în mai multe
    regimuri de piață. Raportează număr de trade-uri, expectancy și drawdown cu intervale de
    încredere; nu promova pe baza unui singur punct estimat.

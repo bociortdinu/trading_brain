@@ -46,6 +46,11 @@ class ShadowConfig(BaseModel):
     # tz) to make the rollover DST-aware — the wall-clock hour stays fixed, the UTC instant shifts.
     rollover_hour_utc: int = 22
     rollover_tz: str = "UTC"
+    # Timeframe used for INTRABAR reconciliation (SL/TP touch ordering). Default = the decision
+    # timeframe ("15min"): SL and TP can then both land in one bar -> the both-hit ambiguity band.
+    # Set "1min" to resolve that ordering at M1 granularity (far fewer ambiguous cases). Recorded
+    # in the manifest and the fingerprint; the actual granularity used is stored at close time.
+    reconcile_timeframe: str = "15min"
     # Online entries land MID-BAR (opened_at inside an M15 bar). We only have that bar's full
     # OHLC, which mixes pre- and post-entry movement. Conservative policy: on the partial entry
     # bar a STOP touch counts (pessimistic — the adverse move may be post-entry) but a TP touch
@@ -108,6 +113,7 @@ def cost_manifest(trade: "VirtualTrade", config: ShadowConfig) -> dict:
         "rollover_hour_utc": config.rollover_hour_utc,
         "rollover_tz": config.rollover_tz,
         "conservative_partial_entry": config.conservative_partial_entry,
+        "reconcile_timeframe": config.reconcile_timeframe,
         "modeled": modeled, "not_modeled": not_modeled,
     }
     # Honest caveats: flag whichever real-terms features are still missing.
@@ -146,6 +152,7 @@ def execution_manifest(*, modeled_spread_pct: float, slippage_pct: float, config
         "rollover_hour_utc": config.rollover_hour_utc,
         "rollover_tz": config.rollover_tz,
         "conservative_partial_entry": config.conservative_partial_entry,
+        "reconcile_timeframe": config.reconcile_timeframe,
         "timeout_bars": config.timeout_bars,
         "single_position": single_position,
         "cooldown_bars": cooldown_bars,
@@ -181,6 +188,7 @@ def shadow_config_from_costs(costs: dict | None, *, timeout_bars: int,
         terms_version=costs.get("terms_version", fb.terms_version),
         rollover_hour_utc=costs.get("rollover_hour_utc", fb.rollover_hour_utc),
         rollover_tz=costs.get("rollover_tz", fb.rollover_tz),
+        reconcile_timeframe=costs.get("reconcile_timeframe", fb.reconcile_timeframe),
         conservative_partial_entry=costs.get("conservative_partial_entry",
                                              fb.conservative_partial_entry),
     )
@@ -200,6 +208,7 @@ def shadow_config_from_settings(settings, **overrides) -> ShadowConfig:
         terms_version=getattr(settings, "financing_terms_version", "unset"),
         rollover_hour_utc=getattr(settings, "rollover_hour_utc", 22),
         rollover_tz=getattr(settings, "rollover_tz", "UTC"),
+        reconcile_timeframe=getattr(settings, "reconcile_timeframe", "15min"),
     )
     base.update(overrides)
     return ShadowConfig(**base)

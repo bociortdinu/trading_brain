@@ -29,7 +29,7 @@ from app.collect import (
 from app.jobs import TRANSIENT, next_m15
 from config.settings import Settings, load_settings
 from core.models import Direction
-from data_collector.providers.base import Candle
+from data_collector.providers.base import Candle, only_closed, timeframe_minutes
 from data_collector.providers.factory import build_provider
 from data_collector.session import calendar_for
 from database.feedback import build_feedback
@@ -51,7 +51,7 @@ from decision.prefilter import PrefilterConfig
 from decision.schema import FeedbackContext, build_decision_input, decision_fingerprint
 from features.mtf import TRIGGER_TF
 from risk.engine import RiskConfig
-from shadow.reconciler import reconcile
+from shadow.reconciler import choose_reconcile_bars, reconcile
 from shadow.runner import ConfluenceStrategy
 from shadow.virtual_broker import (
     ShadowConfig,
@@ -78,32 +78,52 @@ def _to_trade(row: dict) -> VirtualTrade:
     )
 
 
-def reconcile_open_trades(dsn: str, m15_bars: list[Candle], *, run_id: str,
-                          shadow_config: ShadowConfig | None = None) -> int:
-    """Reconcile OPEN shadow trades against the latest M15 bars; update (close) those hit in
-    place. Returns how many transitioned out of 'open'.
+def reconcile_open_trades(dsn: str, bars: list[Candle], *, run_id: str,
+                          shadow_config: ShadowConfig | None = None,
+                          reconcile_tf: str = TRIGGER_TF, fell_back: bool = False) -> int:
+    """Reconcile OPEN shadow trades against `bars` (the trigger timeframe, or finer M1 bars for
+    intrabar resolution); update (close) those hit in place. Returns how many left 'open'.
 
     Each trade is reconciled with the ShadowConfig it was OPENED with (rebuilt from its stored
     cost manifest), NOT the current one — a live config change must never silently re-price an
     already-open position's R. `shadow_config` is only the fallback for anything a (legacy)
-    manifest didn't record."""
+    manifest didn't record. `reconcile_tf` is the ACTUAL granularity of `bars`; it (and any
+    `fell_back`) are recorded on the closed trade so the R's provenance is honest."""
     fallback = shadow_config or ShadowConfig()
     closed = 0
     for row in open_shadow_trades(dsn, run_id):
         trade = _to_trade(row)
         cfg = shadow_config_from_costs(row.get("costs"), timeout_bars=row.get("timeout_bars"),
                                        fallback=fallback)
-        outcome = reconcile(trade, m15_bars, cfg)
+        # Record the granularity that ACTUALLY produced this R (may differ from what the trade was
+        # opened intending, if the finer feed was unavailable this tick).
+        cfg = cfg.model_copy(update={"reconcile_timeframe": reconcile_tf})
+        outcome = reconcile(trade, bars, cfg)
         if outcome.status != "open":
+            costs = cost_manifest(trade, cfg)
+            if fell_back:
+                costs["reconcile_fallback"] = True   # wanted finer bars, reconciled at the trigger TF
             upsert_shadow_trade(dsn, decision_id=row["decision_id"], run_id=run_id,
                                 symbol=row["symbol"], trade=trade, outcome=outcome,
                                 timeframe=TRIGGER_TF, timeout_bars=cfg.timeout_bars,
-                                costs=cost_manifest(trade, cfg),
+                                costs=costs,
                                 # WHEN we observed the close (now), not the bar's close_time — so
                                 # a downtime-delayed observation can't be injected retroactively.
                                 observed_at=datetime.now(timezone.utc))
             closed += 1
     return closed
+
+
+async def _fetch_finer_bars(provider, provider_symbol: str, tf: str, timeout_bars: int,
+                            now: datetime) -> list[Candle]:
+    """Best-effort finer (e.g. M1) bars covering a full timeout window, for intrabar reconciliation.
+    Returns [] on ANY provider issue (unsupported timeframe, network, empty) so the caller falls
+    back to the trigger timeframe and records that honestly — a coarser R beats a crash."""
+    try:
+        count = timeout_bars * timeframe_minutes(TRIGGER_TF) + 60   # cover the whole hold window
+        return only_closed(await provider.get_ohlcv(provider_symbol, tf, count), now)
+    except Exception:  # noqa: BLE001 - degrade to the trigger TF, never fail the tick on this
+        return []
 
 
 async def shadow_tick(settings: Settings, provider, provider_name: str, *, decision_maker,
@@ -121,9 +141,23 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     summary: dict = {"as_of": as_of.isoformat()}
 
     # 1) RECONCILE FIRST: close any open trade the new bars just hit, BEFORE considering a new
-    #    entry — so we never stack a new position on one the same bars should have closed.
+    #    entry — so we never stack a new position on one the same bars should have closed. Prefer
+    #    finer (M1) bars for intrabar SL/TP ordering when configured and available; else fall back
+    #    to the trigger timeframe and record that the R was measured coarsely.
+    recon_bars, recon_tf, recon_fell_back = windows[TRIGGER_TF], TRIGGER_TF, False
+    if shadow_config.reconcile_timeframe != TRIGGER_TF:
+        fine = await _fetch_finer_bars(provider, provider_symbol,
+                                       shadow_config.reconcile_timeframe,
+                                       shadow_config.timeout_bars, now)
+        recon_bars, recon_tf, recon_fell_back = choose_reconcile_bars(
+            fine, windows[TRIGGER_TF],
+            want_tf=shadow_config.reconcile_timeframe, trigger_tf=TRIGGER_TF)
+    summary["reconcile_tf"] = recon_tf
+    if recon_fell_back:
+        summary["reconcile_tf_fallback"] = True
     summary["reconciled_closed"] = reconcile_open_trades(
-        settings.db_dsn, windows[TRIGGER_TF], run_id=run_id, shadow_config=shadow_config)
+        settings.db_dsn, recon_bars, run_id=run_id, shadow_config=shadow_config,
+        reconcile_tf=recon_tf, fell_back=recon_fell_back)
 
     # 2) POSITION GATE (matches the backtest): one position per run at a time. If a trade is
     #    still open after reconciliation, do NOT decide or open another (also saves an LLM call).

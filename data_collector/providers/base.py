@@ -14,6 +14,7 @@ from pydantic import BaseModel, field_validator, model_validator
 
 # Canonical timeframe -> duration in minutes. The keys match config.timeframes.
 TIMEFRAME_MINUTES: dict[str, int] = {
+    "1min": 1,        # not a decision timeframe; used only for finer intrabar reconciliation
     "15min": 15,
     "1h": 60,
     "4h": 240,
@@ -53,7 +54,7 @@ _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 # bar at broker midnight (22:00 UTC in summer) and its 4h buckets at 02/06/10/14/18/22 UTC,
 # offset from UTC and shifting with broker DST. For those we require only consistent spacing
 # + monotonicity (determinism from the source's fixed anchor), not a UTC-epoch phase.
-_EPOCH_ALIGNED_TFS = frozenset({"15min", "1h"})
+_EPOCH_ALIGNED_TFS = frozenset({"1min", "15min", "1h"})
 
 
 def floor_to_grid(dt: datetime, timeframe: str) -> datetime:

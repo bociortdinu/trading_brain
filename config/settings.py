@@ -93,6 +93,11 @@ class Settings(BaseSettings):
     financing_terms_version: str = "unset"          # provenance of the terms above
     rollover_hour_utc: int = 22                     # rollover hour, interpreted in rollover_tz
     rollover_tz: str = "UTC"                        # IANA tz for the DST-aware rollover wall-clock
+    # Intrabar reconciliation granularity. "15min" (default) reconciles on the decision bar, so
+    # SL and TP can both land in one bar (the pessimistic/optimistic ambiguity band). "1min"
+    # resolves the touch ordering at M1 — fetched only for reconciliation, and it falls back to
+    # 15min (flagged on the trade) if the provider cannot serve M1.
+    reconcile_timeframe: str = "15min"
 
     def provider_symbol(self, brain_symbol: str) -> str:
         # Only Polygon uses a different ticker (C:XAUUSD); XTB and CSV use the brain symbol

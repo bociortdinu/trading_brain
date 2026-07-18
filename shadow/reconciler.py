@@ -126,6 +126,19 @@ def _post_entry_bars(trade: VirtualTrade, bars: list[Candle]) -> list[Candle]:
     return usable
 
 
+def choose_reconcile_bars(fine: list[Candle], coarse: list[Candle], *, want_tf: str,
+                          trigger_tf: str) -> tuple[list[Candle], str, bool]:
+    """Pick the bars to reconcile against. Prefer the FINER bars (e.g. M1) for intrabar SL/TP
+    ordering when they are actually available; otherwise fall back to the trigger-timeframe bars
+    and flag it, so the stored outcome records the granularity that ACTUALLY produced the R.
+
+    Returns (bars, timeframe_used, fell_back)."""
+    if want_tf != trigger_tf and fine:
+        return fine, want_tf, False
+    fell_back = want_tf != trigger_tf     # wanted finer resolution, didn't get it
+    return coarse, trigger_tf, fell_back
+
+
 def reconcile(trade: VirtualTrade, bars: list[Candle], config: ShadowConfig | None = None) -> Outcome:
     config = config or ShadowConfig()
     for i, bar in enumerate(_post_entry_bars(trade, bars)):
