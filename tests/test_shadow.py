@@ -374,6 +374,30 @@ def test_covers_window_treats_a_session_break_as_expected_not_a_hole():
     assert covers_window(bars, opened, now, "15min", cal) is True
 
 
+def test_covers_window_weekend_winter_and_early_close():
+    """R2-12: coverage across real market closures is not a hole — weekend, XTB winter (EST), and
+    the XTB early-close exception (2026-07-03, 13:00 ET)."""
+    from data_collector.session import calendar_for
+    from shadow.reconciler import covers_window
+    csv, xtb = calendar_for("csv"), calendar_for("xtb")
+
+    def c(s):
+        return _c(4000, 4001, 3999, 4000, s, 15)
+
+    # WEEKEND: opened Fri 16:45 ET (20:45Z), held into the closed weekend -> only the entry bar
+    # is due (Fri close is 17:00 ET); Sat/Sun are closed, so no coverage hole.
+    fri = datetime(2026, 7, 10, 20, 45, tzinfo=UTC)
+    assert covers_window([c(fri)], fri, datetime(2026, 7, 11, 12, 0, tzinfo=UTC), "15min", csv) is True
+    # XTB WINTER (January / EST): contiguous open-market bars are covered.
+    jan = datetime(2026, 1, 14, 14, 0, tzinfo=UTC)
+    assert covers_window([c(jan), c(jan + timedelta(minutes=15))], jan,
+                         jan + timedelta(minutes=30), "15min", xtb) is True
+    # XTB EARLY CLOSE 2026-07-03 (13:00 ET): opened 12:45 ET (16:45Z), held past the early close ->
+    # only the entry bar is due; the post-close hours are market-closed, not a hole.
+    ec = datetime(2026, 7, 3, 16, 45, tzinfo=UTC)
+    assert covers_window([c(ec)], ec, datetime(2026, 7, 3, 18, 0, tzinfo=UTC), "15min", xtb) is True
+
+
 def test_reconcile_timeframe_is_part_of_the_execution_fingerprint():
     from shadow.virtual_broker import execution_hash, execution_manifest
     base = dict(modeled_spread_pct=0.02, slippage_pct=0.005, single_position=True,
