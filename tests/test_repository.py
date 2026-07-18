@@ -1140,6 +1140,40 @@ def test_insert_llm_call_logs_success_and_failure():
         _cleanup(sym)
 
 
+def test_backtest_run_manifest_includes_full_eligibility_policy():
+    """R2-3: the backtest execution manifest must fold in the eligibility policy INCLUDING
+    max_clock_skew_seconds, so two runs with different eligibility can't share a run/fingerprint."""
+    from datetime import timedelta
+
+    from shadow.runner import ConfluenceStrategy, backtest_over_windows
+    from tests.helpers import run as run_async
+    from tests.synthetic import trend
+
+    end = datetime(2026, 7, 1, tzinfo=timezone.utc)
+
+    def w(m):
+        return trend(n=250, step=1.0, tf_min=m, start=end - timedelta(minutes=m * 250))
+
+    windows = {"1day": w(1440), "4h": w(240), "1h": w(60), "15min": w(15)}
+    run_id, sym = "elig-" + os.urandom(3).hex(), "TST_elig_" + os.urandom(3).hex()
+    try:
+        run_async(backtest_over_windows(
+            windows, symbol=sym, provider_name="csv", decision_maker=ConfluenceStrategy(),
+            modeled_spread_pct=0.02, persist_dsn=DSN, run_id=run_id))
+        with psycopg.connect(DSN) as c:
+            manifest = c.execute("SELECT manifest FROM run_manifests WHERE run_id=%s",
+                                 (run_id,)).fetchone()[0]
+        assert "eligibility_policy" in manifest                       # was omitted in the backtest
+        assert "max_clock_skew_seconds" in manifest["eligibility_policy"]   # was omitted in as_policy()
+    finally:
+        with psycopg.connect(DSN) as c:
+            c.execute("DELETE FROM trades WHERE run_id=%s", (run_id,))
+            c.execute("DELETE FROM decisions WHERE run_id=%s", (run_id,))
+            c.execute("DELETE FROM run_manifests WHERE run_id=%s", (run_id,))
+            c.commit()
+        _cleanup(sym)
+
+
 def test_llm_audit_is_atomic_with_the_decision():
     """A paid call must never become invisible: the decision and its llm_calls audit are one
     transaction. If the audit insert fails, the decision rolls back too — never a committed

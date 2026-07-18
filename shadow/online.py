@@ -20,6 +20,7 @@ import socket
 from datetime import datetime, timedelta, timezone
 
 from app.collect import (
+    _eligibility_config,
     build_packet_from_windows,
     compute_eligibility,
     fetch_windows,
@@ -147,17 +148,6 @@ async def _fetch_finer_bars(provider, provider_symbol: str, tf: str, timeout_bar
         return []
 
 
-def _eligibility_policy(settings: Settings) -> dict:
-    """Eligibility/freshness knobs that gate a decision — folded into the fingerprint so changing
-    any of them makes a different decision (not just the risk/prefilter thresholds)."""
-    return {
-        "recent_window_bars": dict(sorted(settings.eligibility_recent_window_bars.items())),
-        "max_feed_lag_seconds": settings.eligibility_max_feed_lag_seconds,
-        "max_quote_lag_seconds": settings.eligibility_max_quote_lag_seconds,
-        "max_basis_lag_seconds": settings.max_basis_lag_seconds,
-    }
-
-
 async def shadow_tick(settings: Settings, provider, provider_name: str, *, decision_maker,
                       run_id: str, model_name: str = "deterministic-confluence",
                       shadow_config: ShadowConfig | None = None) -> dict:
@@ -175,7 +165,7 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
         config=shadow_config, single_position=True, cooldown_bars=0,
         risk_config=RiskConfig().model_dump(mode="json"),
         prefilter_config=PrefilterConfig().model_dump(mode="json"),
-        eligibility_policy=_eligibility_policy(settings),
+        eligibility_policy=_eligibility_config(settings).as_policy(),
         calendar_version=calendar_for(provider_name).version)
     exec_manifest.update({
         "run_kind": "shadow_online",

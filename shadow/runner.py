@@ -167,6 +167,7 @@ async def _backtest_over_windows(
         single_position=single_position, cooldown_bars=cooldown_bars,
         risk_config=risk_config.model_dump(mode="json"),
         prefilter_config=prefilter_config.model_dump(mode="json"),
+        eligibility_policy=eligibility_config.as_policy(),
         calendar_version=calendar_for(provider_name).version)
     from database.operations import git_metadata
     exec_manifest.update({

@@ -52,6 +52,7 @@ class EligibilityConfig(BaseModel):
             "recent_window_bars": dict(sorted(self.recent_window_bars.items())),
             "max_feed_lag_seconds": self.max_feed_lag_seconds,
             "max_quote_lag_seconds": self.max_quote_lag_seconds,
+            "max_clock_skew_seconds": self.max_clock_skew_seconds,   # changes the verdict -> in the policy
         }
 
     def policy_version(self) -> str:
