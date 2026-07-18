@@ -26,23 +26,37 @@ from decision.schema import DecisionOutput
 from shadow.metrics import summarize
 
 
+def _auto_block_size(n: int) -> int:
+    """A simple, deterministic block length ~ n**(1/3) (a common rule of thumb) for the moving-block
+    bootstrap. 1 for tiny samples (falls back to IID)."""
+    return max(1, min(n, round(n ** (1 / 3))))
+
+
 def bootstrap_expectancy_ci(r_multiples: list[float], *, iters: int = 2000, alpha: float = 0.05,
-                            seed: int = 12345) -> dict:
-    """Bootstrap CI for mean R: resample WITH replacement `iters` times, take the alpha/2 and
-    1-alpha/2 percentiles of the resampled means. Deterministic (seeded)."""
+                            seed: int = 12345, block_size: int | None = None) -> dict:
+    """Bootstrap CI for mean R. Trade returns are SERIALLY CORRELATED (regime runs, one-position
+    sequencing), so an IID resample understates the CI. Uses a MOVING-BLOCK bootstrap: resample
+    contiguous blocks of length `block_size` (auto ~ n**(1/3) when None; 1 == IID). Deterministic."""
     rs = [float(x) for x in r_multiples]
     n = len(rs)
     if n == 0:
-        return {"n": 0, "mean": None, "lo": None, "hi": None, "alpha": alpha}
+        return {"n": 0, "mean": None, "lo": None, "hi": None, "alpha": alpha, "block_size": 0}
+    b = _auto_block_size(n) if block_size is None else max(1, min(block_size, n))
+    starts_max = n - b                      # inclusive max start of a full contiguous block
+    n_blocks = -(-n // b)                    # ceil(n / b)
     rng = _random.Random(seed)
     means = []
     for _ in range(iters):
-        means.append(mean(rng.choices(rs, k=n)))
+        sample: list[float] = []
+        for _ in range(n_blocks):
+            s = rng.randint(0, starts_max)
+            sample.extend(rs[s:s + b])
+        means.append(mean(sample[:n]))      # trim to the original length
     means.sort()
     lo = means[int((alpha / 2) * iters)]
     hi = means[min(iters - 1, int((1 - alpha / 2) * iters))]
     return {"n": n, "mean": round(mean(rs), 4), "lo": round(lo, 4), "hi": round(hi, 4),
-            "alpha": alpha}
+            "alpha": alpha, "block_size": b}
 
 
 def max_drawdown_r(r_multiples: list[float]) -> float:
@@ -179,7 +193,7 @@ def _metrics_for(rows: list[dict]) -> dict:
 
 async def evaluate_over_windows(windows, *, symbol, provider_name, modeled_spread_pct,
                                 slippage_pct=0.0, commission_pct=0.0, swap_pct_per_night=0.0,
-                                makers=None, folds=1) -> dict:
+                                shadow_config=None, makers=None, folds=1) -> dict:
     """Run each baseline maker over the FULL window ONCE (in memory, NOTHING persisted), then
     report the full metric bundle overall + per temporal fold. One continuous run preserves
     indicator warm-up and the single-position state; folds are a slice of the OUTPUT, not of the
@@ -194,10 +208,23 @@ async def evaluate_over_windows(windows, *, symbol, provider_name, modeled_sprea
     from shadow.virtual_broker import ShadowConfig
 
     makers = makers or {"confluence": ConfluenceStrategy(), "random": RandomMaker(), "flat": FlatMaker()}
-    cfg = ShadowConfig(commission_pct=commission_pct, swap_pct_per_night=swap_pct_per_night)
-    costs_modeled = commission_pct != 0 or swap_pct_per_night != 0
+    # Use the FULL financing config when given (long/short swap, triple-swap day, DST tz, terms
+    # version, reconcile timeframe) — the same canonical config as online; else the legacy 2 rates.
+    cfg = shadow_config or ShadowConfig(commission_pct=commission_pct,
+                                        swap_pct_per_night=swap_pct_per_night)
+    swap_on = (cfg.swap_pct_per_night != 0 or (cfg.swap_long_pct_per_night or 0) != 0
+               or (cfg.swap_short_pct_per_night or 0) != 0)
+    cost_components = {                              # per-component: is this cost ACTUALLY modeled?
+        "spread": modeled_spread_pct != 0,
+        "slippage": slippage_pct != 0,
+        "commission": cfg.commission_pct != 0,
+        "swap": swap_on,
+    }
+    financing_modeled = cost_components["commission"] or cost_components["swap"]
 
-    report: dict = {"symbol": symbol, "folds": folds, "financing_modeled": costs_modeled, "makers": {}}
+    report: dict = {"symbol": symbol, "folds": folds, "financing_modeled": financing_modeled,
+                    "cost_components": cost_components, "terms_version": cfg.terms_version,
+                    "reconcile_timeframe": cfg.reconcile_timeframe, "makers": {}}
     for name, maker in makers.items():
         rows = await backtest_over_windows(
             windows, symbol=symbol, provider_name=provider_name, modeled_spread_pct=modeled_spread_pct,
@@ -259,10 +286,11 @@ def main() -> int:
             aclose = getattr(provider, "aclose", None)
             if aclose:
                 await aclose()
+        from shadow.virtual_broker import shadow_config_from_settings
         return await evaluate_over_windows(
             windows, symbol=symbol, provider_name=settings.market_data_provider,
             modeled_spread_pct=settings.replay_spread_pct, slippage_pct=settings.slippage_pct,
-            commission_pct=settings.commission_pct, swap_pct_per_night=settings.swap_pct_per_night,
+            shadow_config=shadow_config_from_settings(settings),   # full financing config (same as online)
             folds=args.folds)
 
     print(format_report(asyncio.run(_run())))

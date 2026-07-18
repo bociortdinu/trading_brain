@@ -49,6 +49,16 @@ def test_bootstrap_ci_is_deterministic_and_brackets_the_mean():
     assert bootstrap_expectancy_ci([])["mean"] is None
 
 
+def test_block_bootstrap_widens_ci_for_serially_correlated_returns():
+    """Trade returns are serially correlated; an IID resample understates the CI. The moving-block
+    bootstrap (default) must give a WIDER interval than IID on a strongly-correlated sequence."""
+    rs = [1.0] * 30 + [-1.0] * 30                       # long win run then long loss run
+    iid = bootstrap_expectancy_ci(rs, block_size=1)
+    blk = bootstrap_expectancy_ci(rs)                  # auto block ~ n**(1/3)
+    assert blk["block_size"] > 1
+    assert (blk["hi"] - blk["lo"]) > (iid["hi"] - iid["lo"])
+
+
 # ---- confidence discrimination (ordinal, NOT ECE) ---- #
 def test_confidence_discrimination_ordinal():
     # higher confidence -> higher win rate is MONOTONE and shows a positive spread.
@@ -101,6 +111,22 @@ def test_all_baselines_actually_trade():
         _windows(n=320), symbol="GOLD", provider_name="csv", modeled_spread_pct=0.02,
         makers={"flat": FlatMaker()}))
     assert flat["makers"]["flat"]["overall"]["trades_closed"] == 0       # flat legitimately never trades
+
+
+def test_eval_reports_per_component_costs_and_uses_full_financing_config():
+    """P1: report each cost component separately (a single rate being set is NOT 'full financing
+    modelled'), and accept the SAME canonical financing config the online path uses."""
+    from shadow.virtual_broker import ShadowConfig
+    r0 = run(evaluate_over_windows(_windows(), symbol="GOLD", provider_name="csv",
+                                   modeled_spread_pct=0.02, slippage_pct=0.005))
+    assert r0["cost_components"] == {"spread": True, "slippage": True,
+                                     "commission": False, "swap": False}
+    assert r0["financing_modeled"] is False
+    cfg = ShadowConfig(swap_long_pct_per_night=0.01, triple_swap_weekday=2, terms_version="xtb-2026-07")
+    r1 = run(evaluate_over_windows(_windows(), symbol="GOLD", provider_name="csv",
+                                   modeled_spread_pct=0.02, slippage_pct=0.005, shadow_config=cfg))
+    assert r1["cost_components"]["swap"] is True and r1["financing_modeled"] is True
+    assert r1["terms_version"] == "xtb-2026-07"
 
 
 def test_evaluate_reports_all_baselines_with_full_metrics():
