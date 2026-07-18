@@ -78,20 +78,23 @@ def _to_trade(row: dict) -> VirtualTrade:
     )
 
 
-def reconcile_open_trades(dsn: str, coarse_bars: list[Candle], *, run_id: str,
+def reconcile_open_trades(dsn: str, coarse_bars: list[Candle], *, run_id: str, provider_name: str,
+                          now: datetime | None = None,
                           shadow_config: ShadowConfig | None = None,
                           fine_bars: list[Candle] | None = None) -> int:
     """Reconcile OPEN shadow trades against `coarse_bars` (the trigger timeframe), optionally using
-    the finer `fine_bars` (e.g. M1) PER TRADE when they continuously cover that trade's window.
-    Update (close) those hit in place; returns how many left 'open'.
+    the finer `fine_bars` (e.g. M1) PER TRADE when they calendar-cover that trade's window from
+    entry. Update (close) those hit in place; returns how many left 'open'.
 
     Each trade is reconciled with the ShadowConfig it was OPENED with (rebuilt from its stored cost
     manifest), NOT the current one — a live config change must never silently re-price an already-
-    open position's R. That frozen config also decides the reconcile granularity per trade (its
-    own `reconcile_timeframe`), so the CURRENT settings never drive an old trade's measurement.
-    `shadow_config` is only the fallback for what a (legacy) manifest lacked. The finer feed is
-    used ONLY when it fully covers the trade (else a touch could hide in a gap): the granularity
-    actually used and any fallback are recorded on the closed trade."""
+    open position's R. That frozen config also decides the reconcile granularity per trade.
+
+    FAIL-CLOSED coverage: if neither timeframe calendar-covers [opened_at, now] (e.g. the trade is
+    older than the fetched window), the trade is left UNMODIFIED and a warning is logged — never
+    expired/closed on incomplete data where an earlier SL/TP could hide in an uncovered gap."""
+    now = now or datetime.now(timezone.utc)
+    calendar = calendar_for(provider_name)   # fail-closed for an unknown provider
     fallback = shadow_config or ShadowConfig()
     fine_bars = fine_bars or []
     closed = 0
@@ -100,9 +103,15 @@ def reconcile_open_trades(dsn: str, coarse_bars: list[Candle], *, run_id: str,
         cfg = shadow_config_from_costs(row.get("costs"), timeout_bars=row.get("timeout_bars"),
                                        fallback=fallback)
         # Per-trade FROZEN granularity — not the current settings' reconcile_timeframe.
-        bars, tf_used, fell_back = select_reconcile_bars_for_trade(
-            fine_bars, coarse_bars, opened_at=trade.opened_at,
-            want_tf=cfg.reconcile_timeframe, trigger_tf=TRIGGER_TF)
+        bars, tf_used, fell_back, covered = select_reconcile_bars_for_trade(
+            fine_bars, coarse_bars, opened_at=trade.opened_at, now=now,
+            want_tf=cfg.reconcile_timeframe, trigger_tf=TRIGGER_TF, calendar=calendar)
+        if not covered:
+            # The window from entry is not fully covered by open-market bars — cannot trust any
+            # conclusion (a touch could hide in the gap). Leave the trade open and alert.
+            log.warning("reconcile skipped (uncovered window) run=%s decision=%s opened_at=%s",
+                        run_id, row.get("decision_id"), trade.opened_at.isoformat())
+            continue
         # Record the granularity that ACTUALLY produced this R (per trade; may be a fallback).
         cfg = cfg.model_copy(update={"reconcile_timeframe": tf_used})
         outcome = reconcile(trade, bars, cfg)
@@ -181,8 +190,8 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
                                             shadow_config.reconcile_timeframe,
                                             shadow_config.timeout_bars, now)
     summary["reconciled_closed"] = reconcile_open_trades(
-        settings.db_dsn, windows[TRIGGER_TF], run_id=run_id, shadow_config=shadow_config,
-        fine_bars=fine_bars)
+        settings.db_dsn, windows[TRIGGER_TF], run_id=run_id, provider_name=provider_name,
+        now=now, shadow_config=shadow_config, fine_bars=fine_bars)
 
     # 2) POSITION GATE (matches the backtest): one position per run at a time. If a trade is
     #    still open after reconciliation, do NOT decide or open another (also saves an LLM call).

@@ -330,6 +330,34 @@ def test_m1_bars_resolve_an_m15_both_hit_ambiguity():
     assert o1.r_multiple == pytest.approx(2.0)                              # (4024-4000)/12
 
 
+def test_covers_window_fails_when_trade_is_older_than_the_bar_window():
+    """P0-2: a trade older than the fetched window (bars start after entry, with open-market time
+    in between) is NOT covered -> must not be reconciled (a touch could hide in the gap)."""
+    from data_collector.session import calendar_for
+    from shadow.reconciler import covers_window
+    cal = calendar_for("csv")
+    opened = datetime(2026, 7, 6, 14, 0, tzinfo=UTC)   # Monday, market open
+    now = datetime(2026, 7, 6, 18, 0, tzinfo=UTC)
+    late = [_c(4000, 4001, 3999, 4000, datetime(2026, 7, 6, 17, 30, tzinfo=UTC), 15),
+            _c(4000, 4001, 3999, 4000, datetime(2026, 7, 6, 17, 45, tzinfo=UTC), 15)]
+    assert covers_window(late, opened, now, "15min", cal) is False
+    full = [_c(4000, 4001, 3999, 4000, opened + timedelta(minutes=15 * i), 15) for i in range(16)]
+    assert covers_window(full, opened, now, "15min", cal) is True
+
+
+def test_covers_window_treats_a_session_break_as_expected_not_a_hole():
+    """P0-3: a valid series crossing the daily market break (21:00-22:00 UTC / 17:00-18:00 ET) is
+    still fully covered — a closed-market gap is NOT a coverage hole."""
+    from data_collector.session import calendar_for
+    from shadow.reconciler import covers_window
+    cal = calendar_for("csv")
+    opened = datetime(2026, 7, 6, 20, 45, tzinfo=UTC)
+    now = datetime(2026, 7, 6, 22, 15, tzinfo=UTC)
+    bars = [_c(4000, 4001, 3999, 4000, datetime(2026, 7, 6, 20, 45, tzinfo=UTC), 15),   # ->21:00
+            _c(4000, 4001, 3999, 4000, datetime(2026, 7, 6, 22, 0, tzinfo=UTC), 15)]     # 22:00->
+    assert covers_window(bars, opened, now, "15min", cal) is True
+
+
 def test_reconcile_timeframe_is_part_of_the_execution_fingerprint():
     from shadow.virtual_broker import execution_hash, execution_manifest
     base = dict(modeled_spread_pct=0.02, slippage_pct=0.005, single_position=True,
@@ -342,20 +370,24 @@ def test_reconcile_timeframe_is_part_of_the_execution_fingerprint():
 def test_finer_bars_used_only_with_continuous_coverage_else_fall_back():
     """An M1 series that does not cover the trade from entry (a gap where an SL could hide) must
     NOT be used — fall back to M15. Full contiguous coverage is used."""
+    from data_collector.session import calendar_for
     from shadow.reconciler import select_reconcile_bars_for_trade
-    opened = datetime(2026, 7, 10, 20, 0, tzinfo=UTC)
+    cal = calendar_for("csv")
+    opened = datetime(2026, 7, 6, 14, 0, tzinfo=UTC)   # Monday, market open
+    now = datetime(2026, 7, 6, 14, 15, tzinfo=UTC)
     m15 = [_c(4000, 4030, 3980, 4020, opened, 15)]
     late_m1 = [_c(4000, 4001, 3999, 4000, opened + timedelta(minutes=5), 1)]   # starts AFTER entry
-    bars, tf, fell = select_reconcile_bars_for_trade(late_m1, m15, opened_at=opened,
-                                                     want_tf="1min", trigger_tf="15min")
-    assert (tf, fell) == ("15min", True)                          # gap at start -> fall back
+    bars, tf, fell, covered = select_reconcile_bars_for_trade(
+        late_m1, m15, opened_at=opened, now=now, want_tf="1min", trigger_tf="15min", calendar=cal)
+    assert (tf, fell, covered) == ("15min", True, True)           # M1 not covered -> fall back to M15
     good_m1 = [_c(4000, 4001, 3999, 4000, opened + timedelta(minutes=i), 1) for i in range(15)]
-    bars, tf, fell = select_reconcile_bars_for_trade(good_m1, m15, opened_at=opened,
-                                                     want_tf="1min", trigger_tf="15min")
-    assert (bars, tf, fell) == (good_m1, "1min", False)           # full coverage -> use M1
-    # not wanting finer -> coarse, no fallback
-    assert select_reconcile_bars_for_trade([], m15, opened_at=opened,
-                                           want_tf="15min", trigger_tf="15min") == (m15, "15min", False)
+    bars, tf, fell, covered = select_reconcile_bars_for_trade(
+        good_m1, m15, opened_at=opened, now=now, want_tf="1min", trigger_tf="15min", calendar=cal)
+    assert (bars, tf, fell, covered) == (good_m1, "1min", False, True)   # full coverage -> use M1
+    # not wanting finer -> coarse, covered
+    assert select_reconcile_bars_for_trade(
+        [], m15, opened_at=opened, now=now, want_tf="15min", trigger_tf="15min",
+        calendar=cal) == (m15, "15min", False, True)
 
 
 def test_timeout_is_a_fixed_duration_across_reconcile_granularity():

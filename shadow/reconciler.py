@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel
 
 from core.models import Direction
-from data_collector.providers.base import Candle, timeframe_minutes
+from data_collector.providers.base import Candle, floor_to_grid, timeframe_minutes
 from shadow.virtual_broker import ShadowConfig, VirtualTrade, swap_rate_for
 
 
@@ -135,35 +135,34 @@ def _post_entry_bars(trade: VirtualTrade, bars: list[Candle]) -> list[Candle]:
     return usable
 
 
-def _finer_covers(fine: list[Candle], coarse: list[Candle], opened_at: datetime,
-                  recon_minutes: int) -> bool:
-    """True iff the finer bars CONTINUOUSLY cover a trade's window: starting at/before entry, with
-    no gaps, and reaching at least as far as the coarse bars. If they don't, an SL/TP touch could
-    hide in a gap while the coarse bar would have shown it — so the finer feed must NOT be used."""
-    fpost = [b for b in fine if b.close_time > opened_at]
-    if not fpost:
-        return False
-    if fpost[0].open_time > opened_at:                     # gap between entry and the first finer bar
-        return False
-    step = timedelta(minutes=recon_minutes)
-    for a, b in zip(fpost, fpost[1:]):
-        if b.open_time - a.open_time > step:               # gap in the middle
+def covers_window(bars: list[Candle], opened_at: datetime, now: datetime, timeframe: str,
+                  calendar) -> bool:
+    """CALENDAR-AWARE coverage: True iff every market-OPEN bar between the first fully-post-entry
+    boundary and `now` is present. A gap is allowed ONLY across market-closed time (weekend, daily
+    session break, holiday) per the provider/instrument calendar — so a valid GOLD series crossing
+    a weekend is NOT a coverage hole. False means an open-market bar is missing (e.g. the trade is
+    older than the fetched window): a touch could hide there, so the trade must not be reconciled."""
+    step = timedelta(minutes=timeframe_minutes(timeframe))
+    have = {b.open_time for b in bars if b.close_time > opened_at}
+    t = floor_to_grid(opened_at, timeframe) + step   # first bar fully after the entry bar
+    while t + step <= now:                            # only bars that have fully closed are expected
+        if calendar.is_open(t) and t not in have:
             return False
-    cpost = [b for b in coarse if b.close_time > opened_at]
-    if cpost and fpost[-1].close_time < cpost[-1].close_time:   # finer ends before coarse -> misses the tail
-        return False
+        t += step
     return True
 
 
 def select_reconcile_bars_for_trade(fine: list[Candle], coarse: list[Candle], *, opened_at: datetime,
-                                    want_tf: str, trigger_tf: str) -> tuple[list[Candle], str, bool]:
-    """Choose the bars to reconcile ONE trade against. Use the finer bars only when they actually,
-    continuously cover this trade's window (see `_finer_covers`); otherwise fall back to the
-    trigger timeframe and flag it. Returns (bars, timeframe_used, fell_back)."""
-    if (want_tf != trigger_tf and fine
-            and _finer_covers(fine, coarse, opened_at, timeframe_minutes(want_tf))):
-        return fine, want_tf, False
-    return coarse, trigger_tf, (want_tf != trigger_tf)
+                                    now: datetime, want_tf: str, trigger_tf: str,
+                                    calendar) -> tuple[list[Candle], str, bool, bool]:
+    """Choose the bars to reconcile ONE trade against. Prefer the finer bars when they calendar-
+    cover the trade's window from entry; else fall back to the trigger timeframe. Returns
+    (bars, timeframe_used, fell_back, covered). When `covered` is False NEITHER timeframe covers
+    the window (fail-closed: the caller must not reconcile/mutate the trade)."""
+    if want_tf != trigger_tf and fine and covers_window(fine, opened_at, now, want_tf, calendar):
+        return fine, want_tf, False, True
+    covered = covers_window(coarse, opened_at, now, trigger_tf, calendar)
+    return coarse, trigger_tf, (want_tf != trigger_tf), covered
 
 
 def reconcile(trade: VirtualTrade, bars: list[Candle], config: ShadowConfig | None = None) -> Outcome:

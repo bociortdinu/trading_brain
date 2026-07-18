@@ -987,8 +987,8 @@ def test_open_trade_is_reconciled_with_the_rates_it_was_opened_with():
     from shadow.virtual_broker import ShadowConfig, cost_manifest, open_virtual_trade
 
     sym, run_id = "TST_" + os.urandom(3).hex(), "swap-" + os.urandom(3).hex()
-    opened = datetime(2026, 7, 1, 20, 0, tzinfo=timezone.utc)   # before the 22:00 UTC rollover
-    opened_cfg = ShadowConfig(swap_pct_per_night=0.05, rollover_hour_utc=22)
+    opened = datetime(2026, 7, 2, 1, 45, tzinfo=timezone.utc)   # Thu, before the 02:00 rollover
+    opened_cfg = ShadowConfig(swap_pct_per_night=0.05, rollover_hour_utc=2)
     try:
         dec_id = _seed_decision(sym, run_id=run_id, input_fingerprint="swapfp")
         trade = open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6, spread_pct=0.0,
@@ -997,20 +997,23 @@ def test_open_trade_is_reconciled_with_the_rates_it_was_opened_with():
                             outcome=reconcile(trade, [], opened_cfg), timeframe="15min",
                             timeout_bars=96, costs=cost_manifest(trade, opened_cfg))
 
-        # A TP bar the NEXT day -> the position was held over one rollover (one swap night).
-        tp_bar = Candle(open_time=opened + timedelta(hours=26),
-                        close_time=opened + timedelta(hours=26, minutes=15),
-                        open=4000, high=4030, low=3999, close=4025, volume=1.0)
+        # CONTIGUOUS covered bars crossing the 02:00 rollover (one swap night); TP hits on bar 2.
+        b1 = Candle(open_time=opened, close_time=opened + timedelta(minutes=15),
+                    open=4000, high=4001, low=3999, close=4000, volume=1.0)          # 01:45->02:00
+        tp_bar = Candle(open_time=opened + timedelta(minutes=15),
+                        close_time=opened + timedelta(minutes=30),
+                        open=4000, high=4030, low=3999, close=4025, volume=1.0)        # 02:00->02:15 TP
+        bars, now = [b1, tp_bar], opened + timedelta(minutes=30)
         # CURRENT config says swap=0. The fix must ignore it for this already-open trade.
-        assert reconcile_open_trades(DSN, [tp_bar], run_id=run_id,
+        assert reconcile_open_trades(DSN, bars, run_id=run_id, provider_name="csv", now=now,
                                      shadow_config=ShadowConfig(swap_pct_per_night=0.0)) == 1
         with psycopg.connect(DSN) as c:
             r_stored = float(c.execute("SELECT r_multiple FROM trades WHERE decision_id=%s",
                                        (dec_id,)).fetchone()[0])
 
         # Reference: reconcile the SAME trade directly with the opened config vs a swap-free one.
-        r_with_swap = reconcile(trade, [tp_bar], opened_cfg).r_multiple
-        r_no_swap = reconcile(trade, [tp_bar], ShadowConfig(swap_pct_per_night=0.0)).r_multiple
+        r_with_swap = reconcile(trade, bars, opened_cfg).r_multiple
+        r_no_swap = reconcile(trade, bars, ShadowConfig(swap_pct_per_night=0.0)).r_multiple
         assert r_with_swap < r_no_swap, "the swap must actually move R (test precondition)"
         assert r_stored == pytest.approx(r_with_swap), "closed with the OPENED swap, not current 0"
         assert r_stored != pytest.approx(r_no_swap), "must NOT have used the current swap=0"
@@ -1058,13 +1061,56 @@ def test_reconcile_open_trades_closes_hit_trades_idempotently():
                             outcome=reconcile(trade, []), timeframe="15min", timeout_bars=96)  # open
         tp_bar = Candle(open_time=end, close_time=end + timedelta(minutes=15),
                         open=4000, high=4030, low=3999, close=4025, volume=1.0)
-        assert reconcile_open_trades(DSN, [tp_bar], run_id=run_id) == 1   # closes the open trade
+        now = end + timedelta(minutes=15)
+        assert reconcile_open_trades(DSN, [tp_bar], run_id=run_id, provider_name="csv",
+                                     now=now) == 1   # closes the open trade
         with psycopg.connect(DSN) as c:
             row = c.execute("SELECT status, exit_reason FROM trades WHERE decision_id=%s AND run_id=%s",
                             (dec_id, run_id)).fetchone()
         assert row[0] == "closed" and row[1] == "tp_hit"
-        assert reconcile_open_trades(DSN, [tp_bar], run_id=run_id) == 0   # idempotent: none left open
+        assert reconcile_open_trades(DSN, [tp_bar], run_id=run_id, provider_name="csv",
+                                     now=now) == 0   # idempotent: none left open
     finally:
+        _cleanup(sym)
+
+
+def test_reconcile_open_trades_skips_an_uncovered_trade_fail_closed():
+    """P0-2 fail-closed end to end: an open trade OLDER than the fetched window is NOT expired or
+    closed on incomplete data — even a TP bar cannot close it, because an earlier SL/TP could hide
+    in the uncovered open-market gap. It stays open until coverage is available."""
+    from core.models import Direction
+    from data_collector.providers.base import Candle
+    from database.repository import upsert_shadow_trade
+    from shadow.online import reconcile_open_trades
+    from shadow.reconciler import reconcile
+    from shadow.virtual_broker import ShadowConfig, cost_manifest, open_virtual_trade
+
+    sym, run_id = "TST_" + os.urandom(3).hex(), "cov-" + os.urandom(3).hex()
+    opened = datetime(2026, 7, 6, 14, 0, tzinfo=timezone.utc)   # Monday
+    cfg = ShadowConfig()
+    try:
+        dec_id = _seed_decision(sym, run_id=run_id, input_fingerprint="covfp")
+        trade = open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6, spread_pct=0.0,
+                                   spread_provenance="modeled", opened_at=opened)
+        upsert_shadow_trade(DSN, decision_id=dec_id, run_id=run_id, symbol=sym, trade=trade,
+                            outcome=reconcile(trade, [], cfg), timeframe="15min",
+                            timeout_bars=96, costs=cost_manifest(trade, cfg))
+        # A TP bar TWO DAYS later with `now` two days later: hundreds of open-market M15 bars are
+        # missing between entry and this bar -> uncovered -> the trade must NOT close.
+        tp_bar = Candle(open_time=datetime(2026, 7, 8, 14, 0, tzinfo=timezone.utc),
+                        close_time=datetime(2026, 7, 8, 14, 15, tzinfo=timezone.utc),
+                        open=4000, high=4030, low=3999, close=4025, volume=1.0)
+        now = datetime(2026, 7, 8, 14, 15, tzinfo=timezone.utc)
+        assert reconcile_open_trades(DSN, [tp_bar], run_id=run_id, provider_name="csv", now=now) == 0
+        with psycopg.connect(DSN) as c:
+            status = c.execute("SELECT status FROM trades WHERE decision_id=%s",
+                               (dec_id,)).fetchone()[0]
+        assert status == "open"     # fail-closed: not expired/closed on incomplete data
+    finally:
+        with psycopg.connect(DSN) as c:
+            c.execute("DELETE FROM trades WHERE run_id=%s", (run_id,))
+            c.execute("DELETE FROM decisions WHERE run_id=%s", (run_id,))
+            c.commit()
         _cleanup(sym)
 
 
