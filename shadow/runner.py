@@ -37,7 +37,7 @@ from features.mtf import TRIGGER_TF, build_feature_packet
 from risk.engine import RiskConfig
 from shadow.metrics import summarize
 from shadow.reconciler import reconcile
-from shadow.virtual_broker import ShadowConfig, open_virtual_trade
+from shadow.virtual_broker import ShadowConfig, open_virtual_trade, shadow_config_from_settings
 
 
 class ConfluenceStrategy:
@@ -510,8 +510,7 @@ async def _run(settings, *, count: int, run_id: str | None, maker_kind: str = "d
             decision_maker=maker, modeled_spread_pct=settings.replay_spread_pct,
             slippage_pct=settings.slippage_pct, model_name=model_name,
             max_llm_calls=max_llm_calls if is_paid else None,
-            shadow_config=ShadowConfig(commission_pct=settings.commission_pct,
-                                       swap_pct_per_night=settings.swap_pct_per_night),
+            shadow_config=shadow_config_from_settings(settings),
             persist_dsn=settings.db_dsn if run_id else None, run_id=run_id,
             use_feedback=use_feedback,
         )

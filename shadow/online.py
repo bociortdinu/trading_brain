@@ -61,6 +61,7 @@ from shadow.virtual_broker import (
     execution_manifest,
     open_virtual_trade,
     shadow_config_from_costs,
+    shadow_config_from_settings,
 )
 
 log = logging.getLogger(__name__)
@@ -315,8 +316,7 @@ async def shadow_tick_with_retries(settings: Settings, provider, provider_name: 
 
 
 def _shadow_config(settings: Settings) -> ShadowConfig:
-    return ShadowConfig(commission_pct=settings.commission_pct,
-                        swap_pct_per_night=settings.swap_pct_per_night)
+    return shadow_config_from_settings(settings)
 
 
 def _build_maker(settings: Settings, kind: str):

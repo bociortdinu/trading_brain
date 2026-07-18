@@ -80,12 +80,19 @@ class Settings(BaseSettings):
     # Modeled execution slippage (adverse) applied to every shadow entry AND exit fill, on top
     # of the spread. Keeps shadow R-multiples honest (not over-optimistic).
     slippage_pct: float = 0.005
-    # Real XTB financing terms. Default 0 = NOT modeled (shadow R is then not net of financing;
-    # the persisted cost manifest says so). Set these from xStation5 -> GOLD -> Specification to
-    # make swap/commission real. NOTE: current model uses ONE swap rate (no long/short split),
-    # a fixed 22:00 UTC rollover, and no DST/triple-swap — a coarse approximation, documented.
+    # Real XTB GOLD financing terms. Default = NOT modeled (shadow R is then not net of financing;
+    # the persisted cost manifest says so). Wire these from xStation5 -> GOLD -> Specification. The
+    # MODEL supports a long/short swap split, a triple-swap weekday, and a DST-aware rollover tz;
+    # leaving them unset falls back to the single swap_pct_per_night at a fixed 22:00 UTC rollover.
     commission_pct: float = 0.0
-    swap_pct_per_night: float = 0.0
+    swap_pct_per_night: float = 0.0                 # legacy single rate (both directions) if no split
+    swap_long_pct_per_night: float | None = None    # BUY overnight (%/night of notional)
+    swap_short_pct_per_night: float | None = None   # SELL overnight
+    triple_swap_weekday: int | None = None          # 0=Mon..6=Sun charged 3x (e.g. 2 = Wednesday)
+    swap_currency: str | None = None                # informational: currency the swap is quoted in
+    financing_terms_version: str = "unset"          # provenance of the terms above
+    rollover_hour_utc: int = 22                     # rollover hour, interpreted in rollover_tz
+    rollover_tz: str = "UTC"                        # IANA tz for the DST-aware rollover wall-clock
 
     def provider_symbol(self, brain_symbol: str) -> str:
         # Only Polygon uses a different ticker (C:XAUUSD); XTB and CSV use the brain symbol

@@ -53,7 +53,7 @@ Instantaneu exact al proiectului. (Secțiunile „Status onest / Runda N" de mai
 - **trading_hands** (Go): endpoint `/candles` real-time (paginat), keepalive + **reconnect dovedit**
   cu mock CoreAPI, data race pe `account` reparat.
 
-**Cifre reale:** **275 teste** (241 fără DB + 34 DB-gated pe o bază `_test` izolată), Go
+**Cifre reale:** **282 teste** (248 fără DB + 34 DB-gated pe o bază `_test` izolată), Go
 `-race`/`vet`/`gofmt` curate, launcher Node **8 teste**.
 **23 migrări** (0001–0023). Versiuni: features `1.2.0`, decision-schema `2026.3`, prompt `2026.1`,
 strategy `2026.1`, risk `2026.2`.
@@ -64,8 +64,9 @@ strategy `2026.1`, risk `2026.2`.
 - **Serviciu monitorizat** — `shadow.online`/`app.jobs` nu rulează ca daemon → nu se acumulează
   track record încă.
 - **Faza 4 (ipax)** = SPIKE; **Faza 6 (go-live)** = neînceput (ambele cer execuție/close-uri reale).
-- **Rate reale swap/comision** (cele 2 numere din xStation5); **știri LIVE** (cere sursă/API key);
-  swap long/short + DST/triple; `llm_calls` per-attempt (retry_count făcut, rânduri nu);
+- **Rate reale swap/comision** (numerele din xStation5 — modelul long/short + DST + triple-swap +
+  valută + terms_version e FĂCUT, lipsesc doar ratele reale); **știri LIVE** (cere sursă/API key);
+  `llm_calls` per-attempt (retry_count făcut, rânduri nu);
   exact-once la LLM = **imposibil** (Anthropic nu acceptă cheie de idempotency — închis);
   DELETE într-un rol de retenție separat (acum e UPDATE-protected, nu append-only strict);
   nivel 3 kNN/pgvector pentru feedback.

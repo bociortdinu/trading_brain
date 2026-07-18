@@ -101,9 +101,13 @@ iar testele nu mai scriu în baza operațională.
 
 ### P0 — realismul măsurării
 
-1. **Costuri reale GOLD.** Citește specificația contului și persistă separat swap long/short,
-   comision, ziua de triple-swap, valuta și versiunea termenilor. Modelul trebuie să respecte DST și
-   configul înghețat la deschiderea trade-ului.
+1. **Costuri reale GOLD.** **Modelul e livrat** ([shadow/virtual_broker.py](../shadow/virtual_broker.py)
+   + [shadow/reconciler.py](../shadow/reconciler.py)): swap **long/short** separat, **ziua de
+   triple-swap** (×3), rollover **DST-aware** (oră locală într-un IANA tz), **valuta** și **versiunea
+   termenilor** persistate, totul **înghețat la deschiderea trade-ului** (`cost_manifest` →
+   `shadow_config_from_costs`, parte din execution hash; test dedicat). **Rămâne** doar să se
+   *citească specificația reală a contului* și să se seteze ratele (default 0/`unset` → manifestul
+   spune onest că R nu e net de finanțare până când sunt cablate).
 2. **Reconciliere M1 sau ticks.** M15 produce multe cazuri în care SL și TP pot fi atinse în aceeași
    bară. Banda pesimist/optimist este corectă, dar M1/ticks sunt necesare pentru o estimare credibilă
    a ordinii evenimentelor, latenței și slippage-ului.

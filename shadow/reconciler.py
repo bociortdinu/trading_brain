@@ -14,12 +14,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel
 
 from core.models import Direction
 from data_collector.providers.base import Candle
-from shadow.virtual_broker import ShadowConfig, VirtualTrade
+from shadow.virtual_broker import ShadowConfig, VirtualTrade, swap_rate_for
 
 
 class Outcome(BaseModel):
@@ -33,26 +34,46 @@ class Outcome(BaseModel):
     ambiguous: bool = False
 
 
-def _rollovers(opened_at: datetime, closed_at: datetime, rollover_hour: int) -> int:
-    """Number of daily-rollover boundaries (rollover_hour UTC) strictly between the two
-    instants — i.e. how many nights the position is held over."""
+def _rollovers(opened_at: datetime, closed_at: datetime, rollover_hour: int,
+               tz: str = "UTC", triple_weekday: int | None = None) -> float:
+    """WEIGHTED count of daily-rollover boundaries strictly between the two instants — how many
+    overnight swaps the position is charged.
+
+    - DST-aware: a boundary is `rollover_hour` o'clock in `tz` (default UTC == literal 22:00 UTC,
+      the legacy behaviour). With a real IANA tz the wall-clock hour is fixed and the UTC instant
+      shifts across DST, so we iterate one LOCAL calendar day at a time.
+    - Triple-swap: a boundary whose local date's weekday equals `triple_weekday` (0=Mon..6=Sun)
+      counts 3x — the standard weekend value-date roll (typically Wednesday). Off when None.
+    """
     if closed_at <= opened_at:
-        return 0
-    boundary = opened_at.replace(hour=rollover_hour, minute=0, second=0, microsecond=0)
-    if boundary <= opened_at:
-        boundary += timedelta(days=1)
-    nights = 0
-    while boundary < closed_at:
-        nights += 1
-        boundary += timedelta(days=1)
-    return nights
+        return 0.0
+    zone = ZoneInfo(tz)
+    open_local = opened_at.astimezone(zone)
+    close_local = closed_at.astimezone(zone)
+
+    def boundary_on(d) -> datetime:
+        return datetime(d.year, d.month, d.day, rollover_hour, tzinfo=zone)
+
+    day = open_local.date()
+    b = boundary_on(day)
+    if b <= open_local:                      # today's rollover already passed at open
+        day += timedelta(days=1)
+        b = boundary_on(day)
+    total = 0.0
+    while b < close_local:
+        total += 3.0 if (triple_weekday is not None and b.weekday() == triple_weekday) else 1.0
+        day += timedelta(days=1)
+        b = boundary_on(day)
+    return total
 
 
 def _extra_cost(trade: VirtualTrade, config, closed_at: datetime) -> float:
-    """Commission (round-trip) + overnight swap (per rollover held), in price units."""
+    """Commission (round-trip) + overnight swap (direction-aware, per weighted rollover), in price
+    units. A long pays swapLong, a short pays swapShort; the triple-swap day counts 3x."""
     commission = trade.entry_mid * config.commission_pct / 100.0
-    nights = _rollovers(trade.opened_at, closed_at, config.rollover_hour_utc)
-    swap = nights * trade.entry_mid * config.swap_pct_per_night / 100.0
+    nights = _rollovers(trade.opened_at, closed_at, config.rollover_hour_utc,
+                        tz=config.rollover_tz, triple_weekday=config.triple_swap_weekday)
+    swap = nights * trade.entry_mid * swap_rate_for(config, trade.direction) / 100.0
     return commission + swap
 
 

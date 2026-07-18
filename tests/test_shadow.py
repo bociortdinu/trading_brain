@@ -209,6 +209,97 @@ def test_overnight_swap_reduces_r_for_positions_held_past_rollover():
 
 
 # --------------------------------------------------------------------------- #
+# real GOLD financing terms: long/short split, triple-swap day, DST rollover,
+# frozen-at-open, legacy fallback, honesty
+# --------------------------------------------------------------------------- #
+def _trade(direction, opened):
+    return open_virtual_trade(direction, 4000.0, 0.3, 0.6, spread_pct=0.0,
+                              spread_provenance="modeled", opened_at=opened)
+
+
+def test_swap_long_short_split_charges_by_direction():
+    from shadow.reconciler import _extra_cost
+    opened, closed = datetime(2026, 7, 15, 21, tzinfo=UTC), datetime(2026, 7, 15, 23, tzinfo=UTC)  # 1 night
+    cfg = ShadowConfig(swap_long_pct_per_night=0.01, swap_short_pct_per_night=0.03)
+    assert _extra_cost(_trade(Direction.BUY, opened), cfg, closed) == pytest.approx(4000 * 0.01 / 100)
+    assert _extra_cost(_trade(Direction.SELL, opened), cfg, closed) == pytest.approx(4000 * 0.03 / 100)
+
+
+def test_triple_swap_weekday_counts_triple():
+    from shadow.reconciler import _rollovers
+    o, c = datetime(2026, 7, 15, 21, tzinfo=UTC), datetime(2026, 7, 15, 23, tzinfo=UTC)  # one boundary
+    wd = datetime(2026, 7, 15, 22, tzinfo=UTC).weekday()
+    assert _rollovers(o, c, 22) == 1.0
+    assert _rollovers(o, c, 22, triple_weekday=wd) == 3.0          # that weekday is charged 3x
+    assert _rollovers(o, c, 22, triple_weekday=(wd + 1) % 7) == 1.0  # a different weekday is not
+
+
+def test_rollover_is_dst_aware_in_a_real_timezone():
+    from shadow.reconciler import _rollovers
+    tz = "Europe/Bucharest"  # UTC+3 in summer, UTC+2 in winter; rollover at 00:00 local
+    # summer: local midnight == 21:00Z, so a [20:30Z, 21:30Z] window crosses one boundary
+    assert _rollovers(datetime(2026, 7, 15, 20, 30, tzinfo=UTC),
+                      datetime(2026, 7, 15, 21, 30, tzinfo=UTC), 0, tz) == 1.0
+    # winter: local midnight == 22:00Z, so the SAME wall-clock window does NOT cross it
+    assert _rollovers(datetime(2026, 1, 15, 20, 30, tzinfo=UTC),
+                      datetime(2026, 1, 15, 21, 30, tzinfo=UTC), 0, tz) == 0.0
+
+
+def test_financing_terms_are_frozen_at_open_and_survive_recovery():
+    from shadow.reconciler import _extra_cost
+    from shadow.virtual_broker import cost_manifest, shadow_config_from_costs
+    opened, closed = datetime(2026, 7, 15, 21, tzinfo=UTC), datetime(2026, 7, 15, 23, tzinfo=UTC)  # Wed
+    trade = _trade(Direction.SELL, opened)
+    opened_cfg = ShadowConfig(swap_short_pct_per_night=0.03, triple_swap_weekday=2,
+                              swap_currency="USD", terms_version="xtb-2026-07")
+    manifest = cost_manifest(trade, opened_cfg)
+    # A LATER live config (different terms) must NOT re-price this open trade.
+    rebuilt = shadow_config_from_costs(manifest, timeout_bars=96,
+                                       fallback=ShadowConfig(swap_short_pct_per_night=0.99))
+    assert rebuilt.swap_short_pct_per_night == 0.03      # frozen, not the live fallback 0.99
+    assert rebuilt.triple_swap_weekday == 2
+    assert rebuilt.terms_version == "xtb-2026-07" and rebuilt.swap_currency == "USD"
+    # SELL over a Wednesday boundary pays 3x swapShort; frozen terms reproduce it exactly.
+    assert _extra_cost(trade, rebuilt, closed) == pytest.approx(3 * 4000 * 0.03 / 100)
+    assert _extra_cost(trade, rebuilt, closed) == _extra_cost(trade, opened_cfg, closed)
+
+
+def test_legacy_cost_manifest_reconciles_as_single_rate():
+    from shadow.virtual_broker import shadow_config_from_costs, swap_rate_for
+    legacy = {"commission_pct": 0.0, "swap_pct_per_night": 0.02, "rollover_hour_utc": 22}  # no new keys
+    cfg = shadow_config_from_costs(legacy, timeout_bars=96)
+    assert cfg.swap_pct_per_night == 0.02
+    assert cfg.swap_long_pct_per_night is None and cfg.swap_short_pct_per_night is None
+    assert cfg.triple_swap_weekday is None and cfg.rollover_tz == "UTC"
+    assert swap_rate_for(cfg, Direction.BUY) == 0.02 == swap_rate_for(cfg, Direction.SELL)
+
+
+def test_cost_manifest_flags_missing_real_terms_then_clears_when_wired():
+    from shadow.virtual_broker import cost_manifest
+    trade = _trade(Direction.BUY, datetime(2026, 7, 15, 21, tzinfo=UTC))
+    bare = cost_manifest(trade, ShadowConfig())
+    assert "swap" in bare["not_modeled"] and "note" in bare and "terms_version unset" in bare["note"]
+    wired = cost_manifest(trade, ShadowConfig(commission_pct=0.02, swap_long_pct_per_night=0.01,
+                                              triple_swap_weekday=2, rollover_tz="Europe/Bucharest",
+                                              terms_version="xtb-2026-07"))
+    assert "swap" in wired["modeled"] and "commission" in wired["modeled"] and "note" not in wired
+    assert wired["swap_effective_pct_per_night"] == 0.01   # BUY -> the long rate
+
+
+def test_execution_hash_captures_financing_terms():
+    from shadow.virtual_broker import execution_hash, execution_manifest
+    base = dict(modeled_spread_pct=0.02, slippage_pct=0.005, single_position=True,
+                cooldown_bars=0, risk_config_version="v", prefilter_version="pf")
+    hashes = {
+        execution_hash(execution_manifest(config=ShadowConfig(), **base)),
+        execution_hash(execution_manifest(config=ShadowConfig(swap_long_pct_per_night=0.01), **base)),
+        execution_hash(execution_manifest(config=ShadowConfig(triple_swap_weekday=2), **base)),
+        execution_hash(execution_manifest(config=ShadowConfig(rollover_tz="Europe/Bucharest"), **base)),
+    }
+    assert len(hashes) == 4      # every financing term moves the decision fingerprint
+
+
+# --------------------------------------------------------------------------- #
 # metrics
 # --------------------------------------------------------------------------- #
 def test_summarize_edge_and_ambiguity_band():
