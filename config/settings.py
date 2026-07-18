@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     # Asset under analysis. `symbol_query` is the XTB symbol; the data feed uses a
     # provider-specific symbol resolved via `provider_symbol_map`.
     symbol_query: str = "GOLD"
+    # Experiment identity for Shadow Online. A run_id pins ONE frozen config (run manifest); set
+    # this to a release/build id whenever the config or strategy changes, so a legitimate upgrade
+    # starts a NEW run instead of hitting RunConfigMismatch. If unset, the default embeds the
+    # strategy version (so at least a strategy change forces a new run).
+    run_id: str | None = None
     timeframes: list[str] = Field(default_factory=lambda: ["1day", "4h", "1h", "15min"])
 
     # Market-data provider selection (composition via config; interface is MarketDataProvider).

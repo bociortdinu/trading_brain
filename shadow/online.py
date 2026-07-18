@@ -48,7 +48,12 @@ from database.repository import (
 )
 from decision.pipeline import run_decision
 from decision.prefilter import PrefilterConfig
-from decision.schema import FeedbackContext, build_decision_input, decision_fingerprint
+from decision.schema import (
+    STRATEGY_VERSION,
+    FeedbackContext,
+    build_decision_input,
+    decision_fingerprint,
+)
 from features.mtf import TRIGGER_TF
 from risk.engine import RiskConfig
 from shadow.reconciler import reconcile, select_reconcile_bars_for_trade
@@ -65,7 +70,6 @@ from shadow.virtual_broker import (
 )
 
 log = logging.getLogger(__name__)
-DEFAULT_RUN_ID = "shadow-online-confluence"
 
 
 def _to_trade(row: dict) -> VirtualTrade:
@@ -460,21 +464,37 @@ async def _loop(settings: Settings, run_id: str, maker, model_name: str,
                 await aclose()
 
 
+def resolve_run_id(cli_run_id: str | None, settings: Settings) -> str:
+    """Explicit --run-id wins; else BRAIN_RUN_ID (settings.run_id); else a default that embeds the
+    strategy version so a strategy change forces a new run rather than a silent RunConfigMismatch."""
+    if cli_run_id:
+        return cli_run_id
+    if settings.run_id:
+        return settings.run_id
+    log.warning("no --run-id / BRAIN_RUN_ID set; using the strategy-versioned default. Set "
+                "BRAIN_RUN_ID to a release/build id when the config changes, to avoid mixing "
+                "an upgraded config into the old run (RunConfigMismatch).")
+    return f"shadow-online-{STRATEGY_VERSION}"
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Continuous shadow-online (no execution).")
     parser.add_argument("--once", action="store_true", help="run one tick then exit")
-    parser.add_argument("--run-id", default=DEFAULT_RUN_ID, help="experiment id for shadow trades")
+    parser.add_argument("--run-id", default=None,
+                        help="experiment id (else BRAIN_RUN_ID, else a strategy-versioned default)")
     parser.add_argument("--maker", choices=["deterministic", "claude"], default="deterministic",
                         help="decision maker: deterministic (free) or claude (paid API)")
     args = parser.parse_args()
     settings = load_settings()
+    run_id = resolve_run_id(args.run_id, settings)
+    log.info("shadow online run_id=%s", run_id)
     maker, model_name = _build_maker(settings, args.maker)
     try:
         if args.once:
-            asyncio.run(_once(settings, args.run_id, maker, model_name))
+            asyncio.run(_once(settings, run_id, maker, model_name))
         else:
-            asyncio.run(_loop(settings, args.run_id, maker, model_name))
+            asyncio.run(_loop(settings, run_id, maker, model_name))
     except KeyboardInterrupt:
         log.info("shadow online stopped by operator")
         return 130

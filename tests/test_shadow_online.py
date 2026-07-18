@@ -48,6 +48,18 @@ def test_shadow_tick_does_not_retry_programming_error(monkeypatch):
 
 
 # --- finer-bar (M1) reconciliation fetch: best-effort, degrades to the trigger TF --------------
+def test_resolve_run_id_prefers_cli_then_env_then_strategy_versioned_default():
+    """P0-7: a static default run_id makes a legitimate config upgrade hit RunConfigMismatch. The
+    CLI wins, else BRAIN_RUN_ID, else a default that embeds the strategy version."""
+    from config.settings import Settings
+    from decision.schema import STRATEGY_VERSION
+    from shadow.online import resolve_run_id
+    assert resolve_run_id("cli-x", Settings(run_id="env-y")) == "cli-x"
+    assert resolve_run_id(None, Settings(run_id="env-y")) == "env-y"
+    default = resolve_run_id(None, Settings(run_id=None))
+    assert default == f"shadow-online-{STRATEGY_VERSION}" and STRATEGY_VERSION in default
+
+
 def test_fetch_finer_bars_falls_back_to_empty_on_provider_error():
     """A provider that cannot serve M1 must not crash the tick — the caller then reconciles at the
     trigger timeframe and flags the fallback."""
