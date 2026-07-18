@@ -16,17 +16,18 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from core.models import Direction
 
 SpreadProvenance = Literal["observed_xtb", "modeled", "historical"]
+Timeframe = Literal["1min", "15min", "1h", "4h", "1day"]
 
 
 class ShadowConfig(BaseModel):
     # Close the trade if neither SL nor TP is hit within this many bars (of whatever
     # timeframe is fed to the reconciler). ~1 trading day of M15 bars by default.
-    timeout_bars: int = 96
+    timeout_bars: int = Field(96, gt=0)
     # Round-trip commission as % of notional. XTB gold CFD is typically commission-free;
     # default 0 (set from the real account terms — do not invent a rate).
     commission_pct: float = 0.0
@@ -38,27 +39,37 @@ class ShadowConfig(BaseModel):
     # so behaviour is IDENTICAL to the single-rate model until they are wired — no invented rates.
     swap_long_pct_per_night: float | None = None   # BUY held overnight; None -> swap_pct_per_night
     swap_short_pct_per_night: float | None = None  # SELL held overnight; None -> swap_pct_per_night
-    triple_swap_weekday: int | None = None         # 0=Mon..6=Sun charged 3x (weekend value roll); None=off
+    triple_swap_weekday: int | None = Field(None, ge=0, le=6)   # 0=Mon..6=Sun charged 3x; None=off
     swap_currency: str | None = None               # informational: currency the swap is quoted in
     terms_version: str = "unset"                   # provenance of the financing terms above
     # The daily rollover is `rollover_hour_utc` o'clock in `rollover_tz`. With the default tz="UTC"
     # this is literally 22:00 UTC (legacy behaviour). Set a real IANA tz (e.g. the broker server
     # tz) to make the rollover DST-aware — the wall-clock hour stays fixed, the UTC instant shifts.
-    rollover_hour_utc: int = 22
+    rollover_hour_utc: int = Field(22, ge=0, le=23)
     rollover_tz: str = "UTC"
     # The decision cadence: `timeout_bars` is counted in THIS timeframe, so the hold horizon is a
     # fixed DURATION (timeout_bars * trigger_timeframe) regardless of the reconcile granularity.
-    trigger_timeframe: str = "15min"
+    trigger_timeframe: Timeframe = "15min"
     # Timeframe used for INTRABAR reconciliation (SL/TP touch ordering). Default = the decision
     # timeframe ("15min"): SL and TP can then both land in one bar -> the both-hit ambiguity band.
     # Set "1min" to resolve that ordering at M1 granularity (far fewer ambiguous cases). Recorded
     # in the manifest and the fingerprint; the actual granularity used is stored at close time.
-    reconcile_timeframe: str = "15min"
+    reconcile_timeframe: Timeframe = "15min"
     # Online entries land MID-BAR (opened_at inside an M15 bar). We only have that bar's full
     # OHLC, which mixes pre- and post-entry movement. Conservative policy: on the partial entry
     # bar a STOP touch counts (pessimistic — the adverse move may be post-entry) but a TP touch
     # does NOT (we can't confirm it happened after entry). Proper fix later = M1/tick reconcile.
     conservative_partial_entry: bool = True
+
+    @field_validator("rollover_tz")
+    @classmethod
+    def _validate_tz(cls, v: str) -> str:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"invalid rollover_tz {v!r}: {exc}") from exc
+        return v
 
 
 class VirtualTrade(BaseModel):

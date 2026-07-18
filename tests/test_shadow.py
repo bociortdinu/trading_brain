@@ -372,6 +372,20 @@ def test_timeout_is_a_fixed_duration_across_reconcile_granularity():
     assert o15.status == "expired" and o15.exit_reason == "timeout"   # M15 behaviour unchanged
 
 
+def test_shadow_config_rejects_invalid_values():
+    """Strict bounds/enums: bad timeframe/hour/weekday/tz must fail at construction, not silently
+    produce a wrong-outcome config downstream."""
+    from pydantic import ValidationError
+    for bad in (dict(timeout_bars=0), dict(rollover_hour_utc=24), dict(rollover_hour_utc=-1),
+                dict(triple_swap_weekday=7), dict(reconcile_timeframe="5min"),
+                dict(trigger_timeframe="2h"), dict(rollover_tz="Not/AZone")):
+        with pytest.raises(ValidationError):
+            ShadowConfig(**bad)
+    # valid boundary values still construct
+    ShadowConfig(timeout_bars=1, rollover_hour_utc=0, triple_swap_weekday=6,
+                 reconcile_timeframe="1min", trigger_timeframe="15min", rollover_tz="Europe/Bucharest")
+
+
 def test_reconcile_timeframe_survives_recovery():
     from shadow.virtual_broker import cost_manifest, shadow_config_from_costs
     trade = open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6, spread_pct=0.0,
