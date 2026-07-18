@@ -14,7 +14,7 @@ WORKDIR /app
 # `database.migrate` (which reads __file__/migrations) resolves them without relying
 # on package-data being wired correctly.
 COPY . .
-RUN pip install --upgrade pip && pip install -e '.[db]'
+RUN pip install --upgrade pip && pip install -e '.[db]' -c requirements.lock
 
 # Git provenance: the .git tree is NOT in the image (.dockerignore), so inject the commit/branch/
 # dirty state at build time. git_metadata() reads these; a run without them reports provenance
