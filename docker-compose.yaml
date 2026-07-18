@@ -5,18 +5,24 @@ name: trading_brain
 # (a running trading_hands, or Polygon/CSV), so it lives behind the `data` profile — enable it
 # with `docker compose --profile data up -d` once a provider is configured.
 #
-# All connection strings are assembled here from a handful of vars (see .env.compose.example);
-# the admin role does DDL, the app role only ever gets DML.
+# CREDENTIAL SCOPING (least privilege):
+#   - the ADMIN DSN (postgres superuser) reaches ONLY the one-shot `migrate` service;
+#   - dashboard/collector/online get ONLY the least-privilege APP DSN;
+#   - the Polygon key reaches only the data services; the Anthropic key only `online`;
+#   - non-secret runtime settings (costs, reconcile tf, run id, ...) come from .env.brain (env_file);
+#   - secrets (passwords, API keys) live in .env.compose and are used for SUBSTITUTION only —
+#     they are NOT blanket-injected into every container.
 
-x-brain-env: &brain-env
+x-app-env: &app-env
+  # Least-privilege application role (DML only), reachable by every app service.
   BRAIN_DB_DSN: postgresql://${BRAIN_APP_USER:-trading_brain_app}:${BRAIN_APP_PASSWORD:?set BRAIN_APP_PASSWORD in .env.compose}@db:5432/${BRAIN_DB_NAME:-trading_brain}
-  BRAIN_ADMIN_DB_DSN: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.compose}@db:5432/postgres
-  BRAIN_MARKET_DATA_PROVIDER: ${BRAIN_MARKET_DATA_PROVIDER:-xtb}
-  BRAIN_TRADING_HANDS_URL: ${BRAIN_TRADING_HANDS_URL:-http://host.docker.internal:4000}
-  BRAIN_POLYGON_API_KEY: ${BRAIN_POLYGON_API_KEY:-}
-  BRAIN_CSV_DIR: ${BRAIN_CSV_DIR:-}
 
-x-brain-service: &brain-service
+x-runtime-file: &runtime-file
+  # Non-secret runtime settings (never secrets) passed into app containers.
+  - path: .env.brain
+    required: false
+
+x-build: &build
   build:
     context: .
     args:
@@ -24,13 +30,6 @@ x-brain-service: &brain-service
       BRAIN_GIT_BRANCH: ${BRAIN_GIT_BRANCH:-unknown}
       BRAIN_GIT_DIRTY: ${BRAIN_GIT_DIRTY:-unknown}
   image: trading_brain:local
-  # Pass EVERY BRAIN_* the operator sets in .env.compose into the container (costs, reconcile
-  # timeframe, model, eligibility, run id, ...). The assembled DSNs in `environment` below win
-  # over anything in the file (compose precedence), so db:5432 wiring is preserved.
-  env_file:
-    - path: .env.compose
-      required: false
-  environment: *brain-env
 
 services:
   db:
@@ -50,10 +49,13 @@ services:
       timeout: 3s
       retries: 20
 
-  # One-shot: create the app role + runtime DB (admin), then apply migrations from scratch.
-  # Every other service waits for this to succeed.
+  # One-shot: create the app role + runtime DB (admin DDL), then apply migrations. The ADMIN DSN
+  # is scoped to THIS service only. Every other service waits for it to succeed.
   migrate:
-    <<: *brain-service
+    <<: *build
+    environment:
+      <<: *app-env
+      BRAIN_ADMIN_DB_DSN: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.compose}@db:5432/postgres
     command: ["sh", "-c", "python -m database.bootstrap && python -m database.migrate"]
     depends_on:
       db:
@@ -61,7 +63,10 @@ services:
     restart: "no"
 
   dashboard:
-    <<: *brain-service
+    <<: *build
+    environment:
+      <<: *app-env                       # app DSN only — no admin, no API keys
+    env_file: *runtime-file
     command: ["python", "-m", "dashboard", "--host", "0.0.0.0", "--port", "8080"]
     depends_on:
       migrate:
@@ -81,7 +86,11 @@ services:
 
   # --- data loop (opt-in: `--profile data`) — needs a reachable market-data source ----------
   collector:
-    <<: *brain-service
+    <<: *build
+    environment:
+      <<: *app-env
+      BRAIN_POLYGON_API_KEY: ${BRAIN_POLYGON_API_KEY:-}   # data service may fetch from Polygon
+    env_file: *runtime-file
     command: ["python", "-m", "app.jobs"]
     profiles: ["data"]
     depends_on:
@@ -92,7 +101,12 @@ services:
     restart: unless-stopped
 
   online:
-    <<: *brain-service
+    <<: *build
+    environment:
+      <<: *app-env
+      BRAIN_POLYGON_API_KEY: ${BRAIN_POLYGON_API_KEY:-}
+      BRAIN_ANTHROPIC_API_KEY: ${BRAIN_ANTHROPIC_API_KEY:-}   # ONLY the maker service gets the key
+    env_file: *runtime-file
     command: ["python", "-m", "shadow.online"]
     profiles: ["data"]
     depends_on:

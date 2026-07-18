@@ -6,6 +6,7 @@ __pycache__/
 .env.*
 !.env.example
 !.env.compose.example
+!.env.brain.example
 # Local DB dumps written by `make backup`.
 backups/
 *.dump
