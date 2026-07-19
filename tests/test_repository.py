@@ -652,7 +652,7 @@ def test_backtest_rerun_resumes_without_repeating_decisions_or_paid_calls():
         assert _counts(run_id) == (decisions1, trades1)             # no duplicated chain
         assert any(r["stage"] == "resumed" for r in rows2)
     finally:
-        with psycopg.connect(DSN) as c:
+        with psycopg.connect(_cleanup_dsn()) as c:   # facts are append-only for the app role
             c.execute("DELETE FROM trades WHERE run_id = %s", (run_id,))
             c.execute("DELETE FROM decisions WHERE run_id = %s", (run_id,))
             c.commit()
@@ -722,7 +722,7 @@ def test_a_stateful_run_refuses_a_second_concurrent_worker():
         assert sorted(outcomes.values()) == ["ran", "refused"], f"got {outcomes}"
         assert _overlapping_pairs(run_id) == 0, "a serialised run must never hold two positions"
     finally:
-        with psycopg.connect(DSN) as c:
+        with psycopg.connect(_cleanup_dsn()) as c:   # facts are append-only for the app role
             for t in ("trades", "decisions", "decision_reservations"):
                 c.execute(f"DELETE FROM {t} WHERE run_id = %s", (run_id,))
             c.commit()
@@ -793,7 +793,7 @@ def test_interrupted_run_resumes_to_the_same_result_as_an_uninterrupted_one():
         assert _report_shape(resumed_rows) == _report_shape(clean_rows), (
             "the resumed run's per-bar report must equal the uninterrupted one")
     finally:
-        with psycopg.connect(DSN) as c:
+        with psycopg.connect(_cleanup_dsn()) as c:   # facts are append-only for the app role
             for r in (interrupted, clean):
                 c.execute("DELETE FROM trades WHERE run_id = %s", (r,))
                 c.execute("DELETE FROM decisions WHERE run_id = %s", (r,))
@@ -896,7 +896,7 @@ def test_recovery_reuses_the_stored_decision_and_never_recalls_the_maker():
         assert side is not None and side[0] == "buy", "trade must match the PERSISTED decision, not NO_TRADE"
         assert done == ("done", dec[0]), "the recovered chain must be terminal against its decision"
     finally:
-        with psycopg.connect(DSN) as c:
+        with psycopg.connect(_cleanup_dsn()) as c:   # facts are append-only for the app role
             for t in ("trades", "decisions", "decision_reservations"):
                 c.execute(f"DELETE FROM {t} WHERE run_id = %s", (run_id,))
             c.commit()
@@ -944,7 +944,7 @@ def test_resume_after_a_crash_between_trade_and_release_validates_the_chain():
         assert len(after) == 1 and after[0] == before, "the existing trade must be untouched, not duplicated"
         assert done[0] == "done"
     finally:
-        with psycopg.connect(DSN) as c:
+        with psycopg.connect(_cleanup_dsn()) as c:   # facts are append-only for the app role
             for t in ("trades", "decisions", "decision_reservations"):
                 c.execute(f"DELETE FROM {t} WHERE run_id = %s", (run_id,))
             c.commit()
@@ -1010,7 +1010,7 @@ def test_resume_reconstructs_a_trade_after_a_crash_between_decision_and_trade():
         assert _trades_of(crashed) == _trades_of(clean)
     finally:
         runner._persist_trade = real_persist_trade
-        with psycopg.connect(DSN) as c:
+        with psycopg.connect(_cleanup_dsn()) as c:   # facts are append-only for the app role
             for r in (crashed, clean):
                 c.execute("DELETE FROM trades WHERE run_id = %s", (r,))
                 c.execute("DELETE FROM decisions WHERE run_id = %s", (r,))
@@ -1062,7 +1062,7 @@ def test_open_trade_is_reconciled_with_the_rates_it_was_opened_with():
         assert r_stored == pytest.approx(r_with_swap), "closed with the OPENED swap, not current 0"
         assert r_stored != pytest.approx(r_no_swap), "must NOT have used the current swap=0"
     finally:
-        with psycopg.connect(DSN) as c:
+        with psycopg.connect(_cleanup_dsn()) as c:   # facts are append-only for the app role
             c.execute("DELETE FROM trades WHERE run_id=%s", (run_id,))
             c.execute("DELETE FROM decisions WHERE run_id=%s", (run_id,))
             c.commit()
@@ -1151,7 +1151,7 @@ def test_reconcile_open_trades_skips_an_uncovered_trade_fail_closed():
                                (dec_id,)).fetchone()[0]
         assert status == "open"     # fail-closed: not expired/closed on incomplete data
     finally:
-        with psycopg.connect(DSN) as c:
+        with psycopg.connect(_cleanup_dsn()) as c:   # facts are append-only for the app role
             c.execute("DELETE FROM trades WHERE run_id=%s", (run_id,))
             c.execute("DELETE FROM decisions WHERE run_id=%s", (run_id,))
             c.commit()
@@ -1189,7 +1189,7 @@ def test_reconcile_drains_open_trades_from_a_previous_run():
                            (dec_id,)).fetchone()
         assert row[0] == "closed" and row[1] == old_run   # closed under ITS OWN run, not the new one
     finally:
-        with psycopg.connect(DSN) as c:
+        with psycopg.connect(_cleanup_dsn()) as c:   # facts are append-only for the app role
             c.execute("DELETE FROM trades WHERE run_id=%s", (old_run,))
             c.execute("DELETE FROM decisions WHERE run_id=%s", (old_run,))
             c.commit()
@@ -1237,7 +1237,7 @@ def test_reconcile_skips_a_trade_frozen_under_a_different_provider():
         assert poly_status == "open"     # cross-provider trade NOT reconciled with foreign bars
         assert csv_status == "closed"    # same-provider trade closed normally
     finally:
-        with psycopg.connect(DSN) as c:
+        with psycopg.connect(_cleanup_dsn()) as c:   # facts are append-only for the app role
             c.execute("DELETE FROM trades WHERE run_id=%s", (run,))
             c.execute("DELETE FROM decisions WHERE run_id=%s", (run,))
             c.commit()
@@ -1372,25 +1372,56 @@ def test_llm_audit_is_atomic_with_the_decision():
         assert (d, l) == (0, 0), "audit failure must roll the decision back too, not leave it committed"
     finally:
         repo._llm_call_row = real
-        with psycopg.connect(DSN) as c:
+        with psycopg.connect(_cleanup_dsn()) as c:   # facts are append-only for the app role
             c.execute("DELETE FROM decisions WHERE run_id=%s", (run_id,))
             c.commit()
         _cleanup(sym)
 
 
+_FACT_TABLES = ("decisions", "run_manifests", "llm_calls", "spread_observations",
+                "snapshot_evaluations", "snapshot_conflicts")
+
+
 def test_fact_tables_are_append_only_for_the_app_role():
-    """R2-16b: the app role can neither UPDATE nor DELETE the immutable fact tables — closing the
-    delete+reinsert loophole that could rewrite history. Retention/cleanup is an ADMIN operation.
-    Requires the append-only grant (re-run `migrate`); skips if DELETE is still granted (older DB)."""
-    for table in ("run_manifests", "llm_calls", "spread_observations", "snapshot_evaluations"):
+    """R3-3 (was R2-16b): as the APP role, DELETE on an immutable fact table is refused at the DB —
+    the delete+reinsert history-rewrite loophole is closed, now including `decisions`. HARD
+    guarantee: it FAILS (never SKIPS) if the append-only grant is missing, so a privilege
+    regression cannot pass unnoticed. Pruning aged facts is the separate trading_brain_retention
+    role's job (migration 0026)."""
+    for table in _FACT_TABLES:
         with psycopg.connect(DSN) as c:
-            try:
-                with pytest.raises(psycopg.errors.InsufficientPrivilege):
-                    c.execute(f"DELETE FROM {table}")     # app role must NOT be able to delete facts
-            except pytest.fail.Exception:
-                pytest.skip(f"{table}: DELETE still granted (re-run migrate to apply append-only)")
-            finally:
-                c.rollback()
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                c.execute(f"DELETE FROM {table}")         # app role must NOT be able to delete facts
+            c.rollback()
+
+
+def test_privilege_model_is_append_only_app_and_prune_only_retention():
+    """R3-3: verify the WHOLE privilege model straight from the catalog — deterministic, never
+    skips. The app role can neither UPDATE nor DELETE any fact table; market_snapshots is
+    app-writable ONLY on data_quality; the mutable operational tables stay updatable; and a
+    SEPARATE retention role can DELETE facts but can neither INSERT nor UPDATE them (prune, not
+    rewrite)."""
+    appuser = psycopg.conninfo.conninfo_to_dict(DSN)["user"]
+    with psycopg.connect(DSN) as c:
+        tp = lambda r, t, p: c.execute("SELECT has_table_privilege(%s,%s,%s)", (r, t, p)).fetchone()[0]
+        cp = lambda r, t, col, p: c.execute(
+            "SELECT has_column_privilege(%s,%s,%s,%s)", (r, t, col, p)).fetchone()[0]
+        # App role: append-only on every fact table (no UPDATE, no DELETE) — incl. decisions.
+        for table in _FACT_TABLES:
+            assert not tp(appuser, table, "UPDATE"), f"app must NOT update fact table {table}"
+            assert not tp(appuser, table, "DELETE"), f"app must NOT delete fact table {table}"
+        assert not tp(appuser, "market_snapshots", "DELETE"), "app must NOT delete snapshots"
+        # market_snapshots: ONLY the data_quality column is app-writable (one-way back-fill).
+        assert cp(appuser, "market_snapshots", "data_quality", "UPDATE")
+        assert not cp(appuser, "market_snapshots", "features", "UPDATE")
+        # Mutable operational/lifecycle tables stay updatable by the app role.
+        assert tp(appuser, "trades", "UPDATE")
+        assert tp(appuser, "decision_reservations", "UPDATE")
+        # Separate retention role: may prune (DELETE) facts, may NOT forge/rewrite (no INSERT/UPDATE).
+        assert tp("trading_brain_retention", "llm_calls", "DELETE")
+        assert tp("trading_brain_retention", "decisions", "DELETE")
+        assert not tp("trading_brain_retention", "llm_calls", "INSERT")
+        assert not tp("trading_brain_retention", "llm_calls", "UPDATE")
 
 
 def test_run_manifest_pins_a_run_to_one_config():
@@ -1499,7 +1530,7 @@ def test_online_decision_and_open_trade_are_one_atomic_chain():
             n = c.execute("SELECT count(*) FROM trades WHERE decision_id=%s", (dec_id,)).fetchone()[0]
         assert n == 1, "a reclaimed re-run must not open a second trade"
     finally:
-        with psycopg.connect(DSN) as c:
+        with psycopg.connect(_cleanup_dsn()) as c:   # facts are append-only for the app role
             c.execute("DELETE FROM trades WHERE run_id=%s", (run_id,))
             c.execute("DELETE FROM decisions WHERE run_id=%s", (run_id,))
             c.commit()
@@ -1572,7 +1603,7 @@ def test_feedback_is_as_of_safe_only_trades_closed_before_the_decision():
         assert len(later["recent_trades"]) == 2
         assert len(recent_closed_trades(DSN, run_id=run_id, before=as_of, k=5)) == 1
     finally:
-        with psycopg.connect(DSN) as c:
+        with psycopg.connect(_cleanup_dsn()) as c:   # facts are append-only for the app role
             c.execute("DELETE FROM trades WHERE run_id=%s", (run_id,))
             c.execute("DELETE FROM decisions WHERE run_id=%s", (run_id,))
             c.commit()
