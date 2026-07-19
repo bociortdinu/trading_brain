@@ -43,7 +43,7 @@ def _db_ok() -> bool:
 pytestmark = pytest.mark.skipif(not _db_ok(), reason="no reachable BRAIN_TEST_DB_DSN (..._test)")
 
 
-def _packet(symbol: str, *, spread=None, provider="csv"):
+def _packet(symbol: str, *, spread=None, provider="csv", provider_symbol="C:XAUUSD"):
     end = datetime(2026, 7, 1, tzinfo=timezone.utc)
     tf = {
         name: trend(step=1.0, tf_min=m, start=end - timedelta(minutes=m * 250))
@@ -52,7 +52,7 @@ def _packet(symbol: str, *, spread=None, provider="csv"):
     # spread and basis are observed together (same XTB /quote) -> set both or neither.
     basis = {"feed_price": 2000.0, "xtb_spread_pct": spread} if spread is not None else None
     return build_feature_packet(
-        symbol, tf, as_of=end, provider=provider, provider_symbol="C:XAUUSD",
+        symbol, tf, as_of=end, provider=provider, provider_symbol=provider_symbol,
         ingested_at=datetime.now(timezone.utc), spread_pct=spread, basis_observed=basis,
     )
 
@@ -166,6 +166,37 @@ def test_different_providers_coexist_as_distinct_observations():
         assert upsert_snapshot(DSN, _packet(sym, provider="csv"))[0] in ("unchanged", "enriched")
         # provider-scoped latest is source-specific
         assert latest_snapshot_bar_close(DSN, sym, "csv") is not None
+    finally:
+        _cleanup(sym)
+
+
+def test_snapshot_identity_includes_provider_symbol_and_rejects_a_null_source():
+    """R3-1: the SOURCE identity is (symbol, provider, provider_symbol, pipeline_version, bar_close)
+    and every part is NOT NULL. Same provider but a DIFFERENT instrument (provider_symbol) is a
+    distinct observation, and a NULL source can no longer be inserted to defeat the unique key."""
+    import psycopg
+    from psycopg import errors
+
+    from database.repository import upsert_snapshot
+
+    sym = "TST_" + os.urandom(3).hex()
+    try:
+        # Same provider, DIFFERENT provider_symbol -> two distinct observations (not a collision).
+        s1, id_a = upsert_snapshot(DSN, _packet(sym, provider="polygon", provider_symbol="C:XAUUSD"))
+        s2, id_b = upsert_snapshot(DSN, _packet(sym, provider="polygon", provider_symbol="X:XAUUSD"))
+        assert s1 == "inserted" and s2 == "inserted" and id_a != id_b
+        # Re-observing the SAME source (same provider_symbol) stays idempotent.
+        assert upsert_snapshot(DSN, _packet(sym, provider="polygon",
+                                            provider_symbol="C:XAUUSD"))[0] in ("unchanged", "enriched")
+        # NOT NULL is live: a raw INSERT with a NULL source part is rejected (can't defeat the key).
+        with psycopg.connect(DSN) as c:
+            with pytest.raises(errors.NotNullViolation):
+                c.execute(
+                    "INSERT INTO market_snapshots (bar_close, symbol, regime, features, provider, "
+                    "provider_symbol, pipeline_version) VALUES (%s,%s,'range','{}'::jsonb, NULL, %s, %s)",
+                    (datetime(2026, 7, 2, tzinfo=timezone.utc), sym, "C:XAUUSD", "1.0"),
+                )
+            c.rollback()
     finally:
         _cleanup(sym)
 
@@ -1558,10 +1589,12 @@ def test_spread_status_tracks_a_bar_with_no_observation_yet():
     sym = "TST_" + os.urandom(3).hex()
     bar_close = datetime(2026, 7, 1, tzinfo=timezone.utc)
     try:
-        _, snap_id = upsert_snapshot(DSN, _packet(sym, spread=None))   # XTB was down
-        assert snapshot_spread_status(DSN, sym, bar_close) == (True, True)
+        _, snap_id = upsert_snapshot(DSN, _packet(sym, spread=None))   # csv snapshot, XTB was down
+        assert snapshot_spread_status(DSN, sym, bar_close, provider="csv") == (True, True)
+        # R3-1: a DIFFERENT provider's status for the same bar is independent (no snapshot yet).
+        assert snapshot_spread_status(DSN, sym, bar_close, provider="polygon") == (False, False)
         insert_spread_observation(DSN, snapshot_id=snap_id, spread_pct=0.05,
                                   provenance="observed_xtb", observed_at=bar_close)
-        assert snapshot_spread_status(DSN, sym, bar_close) == (True, False)  # XTB recovered
+        assert snapshot_spread_status(DSN, sym, bar_close, provider="csv") == (True, False)  # recovered
     finally:
         _cleanup(sym)

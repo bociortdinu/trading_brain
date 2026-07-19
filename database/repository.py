@@ -45,7 +45,7 @@ def upsert_snapshot(dsn: str, packet: FeaturePacket) -> tuple[str, int | None]:
                  news_digest, provider, provider_symbol, ingested_at, intervals,
                  pipeline_version, data_quality)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (symbol, provider, pipeline_version, bar_close) DO NOTHING
+            ON CONFLICT (symbol, provider, provider_symbol, pipeline_version, bar_close) DO NOTHING
             RETURNING id
             """,
             (
@@ -59,13 +59,15 @@ def upsert_snapshot(dsn: str, packet: FeaturePacket) -> tuple[str, int | None]:
             conn.commit()
             return "inserted", row[0]
 
-        # 2. SAME-SOURCE re-observation (identity = symbol+provider+pipeline_version+bar_close):
-        #    a DIFFERENT provider/pipeline is now a distinct row (inserted above), never reaches
-        #    here. Lock the existing row and only back-fill data_quality.
+        # 2. SAME-SOURCE re-observation (identity = symbol+provider+provider_symbol+pipeline_version
+        #    +bar_close): a DIFFERENT source (provider / instrument / pipeline) is now a distinct row
+        #    (inserted above), never reaches here. Lock the existing row and only back-fill
+        #    data_quality. The WHERE must match the uq_snap_source key exactly.
         existing = conn.execute(
             "SELECT id, data_quality FROM market_snapshots WHERE symbol=%s AND provider=%s "
-            "AND pipeline_version=%s AND bar_close=%s FOR UPDATE",
-            (packet.symbol, packet.provider, packet.pipeline_version, packet.bar_close),
+            "AND provider_symbol=%s AND pipeline_version=%s AND bar_close=%s FOR UPDATE",
+            (packet.symbol, packet.provider, packet.provider_symbol, packet.pipeline_version,
+             packet.bar_close),
         ).fetchone()
         if existing is None:  # extremely rare: deleted between insert-conflict and select
             conn.rollback()
@@ -668,17 +670,23 @@ def find_shadow_trade_by_input(dsn: str, *, input_hash: str, model: str, run_id:
     return row[0] if row else None
 
 
-def snapshot_spread_status(dsn: str, symbol: str, bar_close) -> tuple[bool, bool]:
+def snapshot_spread_status(dsn: str, symbol: str, bar_close,
+                           provider: str | None = None) -> tuple[bool, bool]:
     """(snapshot_exists, has_no_spread_observation) — lets the ONLINE scheduler retry the XTB
     quote only for a bar that still has no contextual spread recorded. The snapshot itself is
-    never mutated; a retry appends a new spread_observations row."""
+    never mutated; a retry appends a new spread_observations row.
+
+    SOURCE-SCOPED: since a bar can now be observed by several providers (0024/0025), the caller
+    passes the CURRENT `provider` so we answer for THAT source's snapshot, never another feed's.
+    When two same-source rows exist for a bar (e.g. a pipeline upgrade), the most recent wins."""
     import psycopg
 
     with psycopg.connect(dsn) as conn:
         row = conn.execute(
             "SELECT s.id, EXISTS (SELECT 1 FROM spread_observations o WHERE o.snapshot_id = s.id) "
-            "FROM market_snapshots s WHERE s.symbol = %s AND s.bar_close = %s",
-            (symbol, bar_close),
+            "FROM market_snapshots s WHERE s.symbol = %s AND s.bar_close = %s "
+            "AND (%s::text IS NULL OR s.provider = %s) ORDER BY s.id DESC LIMIT 1",
+            (symbol, bar_close, provider, provider),
         ).fetchone()
     if row is None:
         return False, False

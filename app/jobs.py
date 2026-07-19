@@ -174,7 +174,8 @@ async def catch_up(settings: Settings, provider: MarketDataProvider, provider_na
     # Retry the quote for a latest bar that is stored but still has NO spread observation.
     # Online only — same rule as above.
     if should_observe_spread(settings.market_mode, True) and latest is not None and latest not in targets:
-        exists, needs = snapshot_spread_status(settings.db_dsn, brain_symbol, latest)
+        exists, needs = snapshot_spread_status(settings.db_dsn, brain_symbol, latest,
+                                               provider=provider_name)
         if exists and needs:
             status = await _finalize_and_store(
                 settings, windows, latest, brain_symbol=brain_symbol, provider_name=provider_name,
