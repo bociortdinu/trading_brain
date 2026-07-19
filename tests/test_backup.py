@@ -93,16 +93,26 @@ def test_restore_allows_a_test_database(tmp_path):
     dump.write_text("d")
     marker = tmp_path / "ran"
     r = _run(RESTORE, ["postgresql://u:p@h:5432/trading_brain_test", str(dump)], tmp_path,
-             pg_restore=f'echo ok > "{marker}"; exit 0')
+             env_extra={"ALLOW_NO_CHECKSUM": "1"}, pg_restore=f'echo ok > "{marker}"; exit 0')
     assert r.returncode == 0, r.stderr
     assert marker.exists()                                 # pg_restore actually invoked
+
+
+def test_restore_refuses_when_no_checksum_present(tmp_path):
+    """R3-6: fail-closed — a dump with no .sha256 is refused (unless ALLOW_NO_CHECKSUM)."""
+    dump = tmp_path / "x_test.dump"
+    dump.write_text("d")
+    ran = tmp_path / "ran"
+    r = _run(RESTORE, ["postgresql://u:p@h:5432/trading_brain_test", str(dump)], tmp_path,
+             pg_restore=f'echo ok > "{ran}"; exit 0')
+    assert r.returncode == 4 and not ran.exists()          # refused, pg_restore NOT run
 
 
 def test_restore_force_overrides_the_guard(tmp_path):
     dump = tmp_path / "x.dump"
     dump.write_text("d")
     r = _run(RESTORE, ["--force", "postgresql://u:p@h:5432/trading_brain", str(dump)], tmp_path,
-             pg_restore="exit 0")
+             env_extra={"ALLOW_NO_CHECKSUM": "1"}, pg_restore="exit 0")
     assert r.returncode == 0, r.stderr
 
 

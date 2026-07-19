@@ -38,17 +38,22 @@ case "$dbname" in
     ;;
 esac
 
-# Verify the integrity checksum BEFORE touching the target: a corrupt dump must never overwrite a
-# database. (If no .sha256 is present we proceed but warn.)
-if [ -f "$DUMP.sha256" ]; then
-  if command -v sha256sum >/dev/null 2>&1; then
-    if ! ( cd "$(dirname "$DUMP")" && sha256sum -c "$(basename "$DUMP").sha256" >/dev/null 2>&1 ); then
-      echo "db_restore: checksum FAILED for $DUMP — refusing to restore a corrupt dump." >&2
-      exit 4
-    fi
+# FAIL-CLOSED integrity check BEFORE touching the target: a corrupt/unverifiable dump must never
+# overwrite a database. The checksum file AND the sha256sum utility are BOTH mandatory (use
+# ALLOW_NO_CHECKSUM=1 only for a dump produced before checksums existed, at your own risk).
+if [ "${ALLOW_NO_CHECKSUM:-0}" != "1" ]; then
+  if [ ! -f "$DUMP.sha256" ]; then
+    echo "db_restore: no $DUMP.sha256 — refusing (set ALLOW_NO_CHECKSUM=1 to override)." >&2
+    exit 4
   fi
-else
-  echo "db_restore: WARNING no $DUMP.sha256 — cannot verify integrity" >&2
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    echo "db_restore: sha256sum not found — cannot verify integrity, refusing." >&2
+    exit 4
+  fi
+  if ! ( cd "$(dirname "$DUMP")" && sha256sum -c "$(basename "$DUMP").sha256" >/dev/null 2>&1 ); then
+    echo "db_restore: checksum FAILED for $DUMP — refusing to restore a corrupt dump." >&2
+    exit 4
+  fi
 fi
 
 # --clean --if-exists so an existing schema is replaced idempotently; --no-owner to avoid role

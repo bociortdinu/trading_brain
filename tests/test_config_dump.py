@@ -30,6 +30,21 @@ def test_settings_reject_invalid_values():
     Settings(reconcile_timeframe="1min", eligibility_max_feed_lag_seconds=60, rollover_tz="Europe/Bucharest")
 
 
+def test_settings_reject_nonfinite_and_bad_eligibility_windows():
+    """R3-7: NaN/inf floats, a non-positive token cap, and empty/zero/negative/unknown-tf
+    eligibility windows must be rejected."""
+    from pydantic import ValidationError
+
+    from config.settings import Settings
+    for bad in (dict(decision_max_tokens=0), dict(commission_pct=float("nan")),
+                dict(slippage_pct=float("inf")), dict(eligibility_recent_window_bars={"15min": 0}),
+                dict(eligibility_recent_window_bars={"15min": -1}),
+                dict(eligibility_recent_window_bars={"bad_tf": 5}),
+                dict(eligibility_recent_window_bars={})):
+        with pytest.raises(ValidationError):
+            Settings(**bad)
+
+
 def test_shadow_config_reconcile_timeframe_restricted_to_fine():
     """R2-8: reconcile only makes sense at a FINE timeframe; 4h/1day must be rejected, and the
     reconcile timeframe may not be coarser than the trigger."""

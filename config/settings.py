@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -78,7 +78,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = None
     decision_model: str = "claude-sonnet-5"
     benchmark_model: str = "claude-opus-4-8"
-    decision_max_tokens: int = 1024
+    decision_max_tokens: int = Field(1024, gt=0)
 
     # Shadow backtest: a MODELED spread for historical (replay) bars — we never borrow the
     # current live quote for a past bar. ~XTB gold spread observed live (~0.018-0.02%).
@@ -114,6 +114,27 @@ class Settings(BaseSettings):
         except (ZoneInfoNotFoundError, ValueError) as exc:
             raise ValueError(f"invalid BRAIN_ROLLOVER_TZ {v!r}: {exc}") from exc
         return v
+
+    @field_validator("eligibility_recent_window_bars")
+    @classmethod
+    def _validate_eligibility_windows(cls, v: dict[str, int]) -> dict[str, int]:
+        valid = {"1min", "15min", "1h", "4h", "1day"}
+        if not v:
+            raise ValueError("eligibility_recent_window_bars must not be empty")
+        for tf, n in v.items():
+            if tf not in valid:
+                raise ValueError(f"eligibility_recent_window_bars: unknown timeframe {tf!r}")
+            if not isinstance(n, int) or n <= 0:
+                raise ValueError(f"eligibility_recent_window_bars[{tf!r}] must be a positive int, got {n!r}")
+        return v
+
+    @model_validator(mode="after")
+    def _reject_nonfinite_floats(self) -> "Settings":
+        import math
+        for name, val in self.__dict__.items():
+            if isinstance(val, float) and not math.isfinite(val):
+                raise ValueError(f"{name} must be a finite number, got {val!r} (NaN/inf rejected)")
+        return self
 
     def provider_symbol(self, brain_symbol: str) -> str:
         # Only Polygon uses a different ticker (C:XAUUSD); XTB and CSV use the brain symbol

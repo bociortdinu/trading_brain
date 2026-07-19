@@ -56,7 +56,8 @@ psql: ## Open a psql shell on the runtime DB (admin, via local trust inside the 
 
 backup: ## pg_dump the runtime DB to backups/ (custom format; keeps newest $(BACKUP_KEEP)). For scheduled backups use deploy/systemd + scripts/db_backup.sh
 	@umask 077; mkdir -p backups; chmod 700 backups
-	@umask 077; out="backups/$(BRAIN_DB_NAME)_$$(date -u +%Y%m%dT%H%M%SZ).dump"; \
+	@umask 077; exec 9>backups/.backup.lock; flock -n 9 || { echo "another backup is running (lock held); skipping"; exit 0; }; \
+	  out="backups/$(BRAIN_DB_NAME)_$$(date -u +%Y%m%dT%H%M%SZ).dump"; \
 	  $(COMPOSE) exec -T db pg_dump -U $(POSTGRES_USER) -Fc $(BRAIN_DB_NAME) > "$$out.partial" \
 	  && mv -f "$$out.partial" "$$out" \
 	  && ( cd backups && sha256sum "$$(basename "$$out")" > "$$(basename "$$out").sha256" ) \
@@ -70,6 +71,8 @@ restore: ## Restore a dump into the runtime DB (DESTRUCTIVE): make restore FILE=
 	  echo "Stop the app services first (make down keeps the volume; or stop collector/online/dashboard),"; \
 	  echo "then re-run with CONFIRM=yes. For a SAFE verification restore into a _test DB use scripts/db_restore.sh."; \
 	  exit 3; }
+	@test -f "$(FILE).sha256" || { echo "REFUSING: no $(FILE).sha256 (cannot verify integrity)"; exit 4; }
+	@( cd "$(dir $(FILE))" && sha256sum -c "$(notdir $(FILE)).sha256" ) || { echo "checksum FAILED for $(FILE)"; exit 4; }
 	$(COMPOSE) exec -T db pg_restore -U $(POSTGRES_USER) -d $(BRAIN_DB_NAME) \
 	  --clean --if-exists < $(FILE)
 	@echo "restored $(FILE) -> $(BRAIN_DB_NAME)"
