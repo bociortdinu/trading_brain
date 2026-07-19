@@ -148,20 +148,24 @@ def test_spread_observation_is_append_only_and_never_touches_the_snapshot():
         _cleanup(sym)
 
 
-def test_different_provider_is_conflict_and_persisted():
-    from database.repository import upsert_snapshot
+def test_different_providers_coexist_as_distinct_observations():
+    """R2-16d: a bar observed via two providers is TWO observations (different venue/feed), not a
+    collision. Both are stored; `latest_snapshot_bar_close` is provider-scoped."""
+    from database.repository import latest_snapshot_bar_close, upsert_snapshot
 
     sym = "TST_" + os.urandom(3).hex()
     try:
-        assert upsert_snapshot(DSN, _packet(sym, provider="csv"))[0] == "inserted"
-        status, _ = upsert_snapshot(DSN, _packet(sym, provider="polygon"))
-        assert status == "conflict"  # not silently blocked, not overwritten
+        s1, id_csv = upsert_snapshot(DSN, _packet(sym, provider="csv"))
+        s2, id_poly = upsert_snapshot(DSN, _packet(sym, provider="polygon"))
+        assert s1 == "inserted" and s2 == "inserted"     # NOT a conflict — they coexist
+        assert id_csv != id_poly
         with psycopg.connect(DSN) as c:
-            row = c.execute(
-                "SELECT existing_provider, incoming_provider FROM snapshot_conflicts WHERE symbol=%s",
-                (sym,),
-            ).fetchone()
-        assert row == ("csv", "polygon")  # conflict is durably persisted, not just logged
+            n = c.execute("SELECT count(*) FROM market_snapshots WHERE symbol=%s", (sym,)).fetchone()[0]
+        assert n == 2                                     # two distinct source observations
+        # same source re-observed -> idempotent (still one row for that provider)
+        assert upsert_snapshot(DSN, _packet(sym, provider="csv"))[0] in ("unchanged", "enriched")
+        # provider-scoped latest is source-specific
+        assert latest_snapshot_bar_close(DSN, sym, "csv") is not None
     finally:
         _cleanup(sym)
 

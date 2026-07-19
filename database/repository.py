@@ -45,7 +45,7 @@ def upsert_snapshot(dsn: str, packet: FeaturePacket) -> tuple[str, int | None]:
                  news_digest, provider, provider_symbol, ingested_at, intervals,
                  pipeline_version, data_quality)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (symbol, bar_close) DO NOTHING
+            ON CONFLICT (symbol, provider, pipeline_version, bar_close) DO NOTHING
             RETURNING id
             """,
             (
@@ -59,31 +59,19 @@ def upsert_snapshot(dsn: str, packet: FeaturePacket) -> tuple[str, int | None]:
             conn.commit()
             return "inserted", row[0]
 
-        # 2. Existing row: lock it and decide enrich vs conflict.
+        # 2. SAME-SOURCE re-observation (identity = symbol+provider+pipeline_version+bar_close):
+        #    a DIFFERENT provider/pipeline is now a distinct row (inserted above), never reaches
+        #    here. Lock the existing row and only back-fill data_quality.
         existing = conn.execute(
-            "SELECT id, provider, pipeline_version, data_quality "
-            "FROM market_snapshots WHERE symbol = %s AND bar_close = %s FOR UPDATE",
-            (packet.symbol, packet.bar_close),
+            "SELECT id, data_quality FROM market_snapshots WHERE symbol=%s AND provider=%s "
+            "AND pipeline_version=%s AND bar_close=%s FOR UPDATE",
+            (packet.symbol, packet.provider, packet.pipeline_version, packet.bar_close),
         ).fetchone()
         if existing is None:  # extremely rare: deleted between insert-conflict and select
             conn.rollback()
             return "conflict", None
 
-        snap_id, provider, version, ex_dq = existing
-        if provider != packet.provider or version != packet.pipeline_version:
-            conn.execute(
-                """
-                INSERT INTO snapshot_conflicts
-                    (symbol, bar_close, existing_snapshot_id, existing_provider,
-                     existing_pipeline_version, incoming_provider, incoming_pipeline_version)
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
-                """,
-                (packet.symbol, packet.bar_close, snap_id, provider, version,
-                 packet.provider, packet.pipeline_version),
-            )
-            conn.commit()
-            return "conflict", snap_id
-
+        snap_id, ex_dq = existing
         # Only data_quality may be back-filled (and only when it is still NULL). Features are
         # never touched; the spread is not here at all any more.
         if ex_dq is not None or dq is None:
@@ -695,26 +683,29 @@ def snapshot_spread_status(dsn: str, symbol: str, bar_close) -> tuple[bool, bool
     return True, not row[1]
 
 
-def latest_snapshot_bar_close(dsn: str, symbol: str):
-    """Most recent snapshot bar_close for `symbol`, or None. Used by the scheduler
-    to detect missed bars on restart."""
+def latest_snapshot_bar_close(dsn: str, symbol: str, provider: str | None = None):
+    """Most recent snapshot bar_close for `symbol` (optionally for one `provider` — a snapshot is
+    now source-specific, so mixing providers here would skip bars). Used to detect missed bars."""
     import psycopg
 
     with psycopg.connect(dsn) as conn:
         row = conn.execute(
-            "SELECT max(bar_close) FROM market_snapshots WHERE symbol = %s", (symbol,)
+            "SELECT max(bar_close) FROM market_snapshots "
+            "WHERE symbol = %s AND (%s::text IS NULL OR provider = %s)",
+            (symbol, provider, provider),
         ).fetchone()
     return row[0] if row and row[0] else None
 
 
-def last_decision_as_of(dsn: str, run_id: str, symbol: str):
-    """The as_of of the most recent decision recorded for this run+symbol, or None — the bar the
-    online loop last decided on. Used to detect (and log) how many bars a downtime gap skipped."""
+def last_decision_as_of(dsn: str, run_id: str, symbol: str, provider: str | None = None):
+    """The as_of of the most recent decision for this run+symbol (optionally one `provider`) — the
+    bar the online loop last decided on. Used to detect/log how many bars a downtime gap skipped."""
     import psycopg
 
     with psycopg.connect(dsn) as conn:
         row = conn.execute(
             "SELECT max(s.bar_close) FROM decisions d JOIN market_snapshots s ON s.id=d.snapshot_id "
-            "WHERE d.run_id = %s AND s.symbol = %s", (run_id, symbol),
+            "WHERE d.run_id = %s AND s.symbol = %s AND (%s::text IS NULL OR s.provider = %s)",
+            (run_id, symbol, provider, provider),
         ).fetchone()
     return row[0] if row and row[0] else None

@@ -124,7 +124,7 @@ BRAIN_TEST_DB_DSN='postgresql://user:pw@127.0.0.1:5433/trading_brain_test' pytho
 | `brokers_bridge/` | async HTTP client for the 8 trading_hands endpoints (incl. `/candles`) |
 | `data_collector/` | `MarketDataProvider` (XTB real-time, Polygon/Massive, CSV) + strict candle/series validation + session calendars + news (`as_of`) |
 | `features/` | indicators (numpy), regime/S-R engineering, MTF `FeaturePacket`, eligibility |
-| `database/` | versioned `migrations/` (0001–0023), admin-run DDL, isolated test-DB bootstrap, repository/feedback and operational telemetry |
+| `database/` | versioned `migrations/` (0001–0024), admin-run DDL, isolated test-DB bootstrap, repository/feedback and operational telemetry |
 | `app/` | `smoke`, `collect`, `decide`, `jobs` (M15 scheduler) |
 | `decision/` | `schema` (strict I/O contract, incl. news + feedback), `prefilter`, `llm_client` (Anthropic, fail-closed), `pipeline` |
 | `risk/` | `engine.py` — rigid gate + deterministic ATR-based SL/TP (never the LLM's job) |

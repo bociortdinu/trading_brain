@@ -36,13 +36,13 @@ Risk Engine -> gate-uri stateful -> router live -> /purchase -> poziție XTB
 | XTB demo: login, quote, instrumente, poziții, lumânări | Implementat | API `trading_hands`; candles M15/H1/H4/D1 validate live anterior |
 | Sesiune CoreAPI | Implementat cu limită | keepalive și reconnect testate cu mock WebSocket; expirarea TGT cere reautentificare în browser |
 | Colectare și features MTF | Implementat | bare închise, validare temporală, indicatori, quality/eligibility, calendare per provider |
-| Persistență și audit | Implementat | migrări 0001–0023; snapshot, spread, evaluare, decizie, apel LLM, trade și manifest separate |
+| Persistență și audit | Implementat | migrări 0001–0024; snapshot, spread, evaluare, decizie, apel LLM, trade și manifest separate |
 | Risk Engine | Implementat pentru shadow | fail-closed, spread/sesiune/confidence, SL/TP determinist; execuția rămâne explicit blocată |
 | Backtest/shadow | Implementat ca motor | o poziție per run, resume, deduplicare, benzi pentru ambiguitate intrabar, metrici |
 | Dashboard operator | Implementat | read-only, arată sănătatea, traseul deciziei, run-uri, cost/audit și alerte |
-| Teste curente | Verzi (local) | Python: **287 passed, 38 skipped** fără DB și **325 passed** cu baza `_test` izolată; Go: `go test -race ./...` + `vet` (repo `trading_hands`); launcher Node: **8 passed**. Categorii NErulate încă: **live Compose**, **live XTB**, **CI remote**. |
+| Teste curente | Verzi (local) | Python: **288 passed, 39 skipped** fără DB și **327 passed** cu baza `_test` izolată; Go: `go test -race ./...` + `vet` (repo `trading_hands`); launcher Node: **8 passed**. Categorii NErulate încă: **live Compose**, **live XTB**, **CI remote**. |
 
-Schema bazei active este la versiunea `0023_operational_observability` și corespunde codului.
+Schema bazei active este la versiunea `0024_snapshot_source_identity` și corespunde codului.
 
 ## 3. Starea reală observată la audit
 
@@ -265,15 +265,16 @@ teste de acoperire weekend/iarnă/early-close (`a86d161`); run_id derivat din co
 trade-urilor deschise din run-ul anterior (`93babb2`).
 
 **Rămâne (trading_brain, necesită sesiune dedicată):** identitatea snapshotului per
-**dependency lock** (`requirements.lock`, wired în CI/Docker — versiuni; hash-urile rămân
-follow-up, `349fd37`) și **detecția gap-ului de downtime** (calendar-aware, logat + în summary,
-`6c21fd0`) sunt FĂCUTE. Rămân două **migrări dedicate** (risc de regresie dacă sunt grăbite):
-**(a) identitatea snapshotului** per provider/dataset (schimbare de cheie + backfill;
-`latest_snapshot_bar_close` devine provider-specific); **(b) append-only real** — revocarea DELETE
-de la app-role pe cele 4 tabele de fapte (niciun cod de producție nu le șterge, dar ~8 curățări de
-test folosesc app-role DELETE → cer rol de retenție/curățare pe admin + verificarea FK CASCADE).
-Plus: persistarea DURABILĂ a gap-ului (tabel dedicat), fixtures live de calendar iarnă/DST,
-wiring știri live sau scoaterea din DoD-ul v1, rate reale GOLD din specificația contului.
+**Toate cele 4 datorii brain-doable sunt FĂCUTE cu teste:** dependency lock (`requirements.lock`,
+CI/Docker — versiuni; hash-uri = follow-up, `349fd37`); detecția gap-ului de downtime (calendar-aware,
+`6c21fd0`); **append-only real** — UPDATE+DELETE revocate pe cele 4 tabele de fapte, retenția pe
+admin, `BRAIN_TEST_ADMIN_DB_DSN` pentru curățare (`62e4445`); **identitatea snapshotului** include
+sursa — `UNIQUE(symbol, provider, pipeline_version, bar_close)`, providerele coexistă, lookup
+provider-scoped (migrarea 0024).
+
+**Rămâne (follow-up, mai mic):** hash-uri în lock; persistarea DURABILĂ a gap-ului (tabel dedicat);
+un **job de retenție** admin; fixtures live de calendar iarnă/DST; wiring știri live sau scoaterea
+din DoD-ul v1; rate reale GOLD din specificația contului.
 
 **Blocat (NU în acest repo / neconstruit):** execuția demo (idempotency `/purchase`, state machine
 de ordine, atomicitate order↔DB, garduri, close/PnL autoritativ, client ipax) și testele/keepalive

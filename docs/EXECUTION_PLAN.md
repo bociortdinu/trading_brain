@@ -48,16 +48,17 @@ Instantaneu exact al proiectului. (Secțiunile „Status onest / Runda N" de mai
   chiar tranzacționează (confluence + random; flat = linia zero care nu tranzacționează niciodată),
   bootstrap CI, drawdown, **discriminare** confidence (ordinal, NU ECE), acoperire pe regimuri.
 - **Persistență + audit**: `decisions`/`trades`/`snapshot_evaluations`/`spread_observations`/
-  `llm_calls`/`decision_reservations`; tabele de fapte **UPDATE-protected**; `schema_migrations`
-  read-only pentru app-role.
+  `llm_calls`/`decision_reservations`; tabelele de fapte **append-only pentru app-role**
+  (UPDATE+DELETE revocate; retenția = admin); identitatea snapshotului include **sursa**
+  (symbol+provider+pipeline+bar_close); `schema_migrations` read-only pentru app-role.
 - **trading_hands** (Go): endpoint `/candles` real-time (paginat), keepalive + **reconnect dovedit**
   cu mock CoreAPI, data race pe `account` reparat.
 
-**Cifre reale:** **325 teste** (287 fără DB + 38 DB-gated pe o bază `_test` izolată). Categorii de
+**Cifre reale:** **327 teste** (288 fără DB + 39 DB-gated pe o bază `_test` izolată). Categorii de
 verificare: *fără-infra* și *DB-gated* rulate local; *live Compose*, *live XTB* și *CI remote* încă
 NErulate (Docker daemon indisponibil în mediu; CI-ul n-a rulat verde încă). Go
 `-race`/`vet`/`gofmt` curate, launcher Node **8 teste**.
-**23 migrări** (0001–0023). Versiuni: features `1.2.0`, decision-schema `2026.3`, prompt `2026.1`,
+**24 migrări** (0001–0024). Versiuni: features `1.2.0`, decision-schema `2026.3`, prompt `2026.1`,
 strategy `2026.1`, risk `2026.2`.
 
 **NU e făcut / deferit (onest):**
@@ -70,7 +71,7 @@ strategy `2026.1`, risk `2026.2`.
   valută + terms_version e FĂCUT, lipsesc doar ratele reale); **știri LIVE** (cere sursă/API key);
   `llm_calls` per-attempt (retry_count făcut, rânduri nu);
   exact-once la LLM = **imposibil** (Anthropic nu acceptă cheie de idempotency — închis);
-  DELETE într-un rol de retenție separat (acum e UPDATE-protected, nu append-only strict);
+  un **job de retenție** dedicat (admin) — tabelele de fapte sunt acum append-only pentru app-role;
   nivel 3 kNN/pgvector pentru feedback.
 
 ---

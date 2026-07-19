@@ -154,7 +154,7 @@ async def catch_up(settings: Settings, provider: MarketDataProvider, provider_na
                    for tf in settings.timeframes}
 
     closes = m15_closes(windows)
-    last_done = latest_snapshot_bar_close(settings.db_dsn, brain_symbol)
+    last_done = latest_snapshot_bar_close(settings.db_dsn, brain_symbol, settings.market_data_provider)
     targets = select_targets(closes, last_done, max_backfill)
     latest = closes[-1] if closes else None
 

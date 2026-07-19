@@ -191,7 +191,7 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     # DOWNTIME CATCH-UP (visibility): each tick decides only the LATEST bar, so after downtime the
     # bars between the last decision and now are skipped. Count and record the gap (calendar-aware,
     # so a weekend is not a gap) — the track record is only "continuous" if this stays 0.
-    prev = last_decision_as_of(settings.db_dsn, run_id, brain_symbol)
+    prev = last_decision_as_of(settings.db_dsn, run_id, brain_symbol, provider_name)
     missed = count_missed_open_bars(prev, as_of, calendar_for(provider_name))
     if missed:
         summary["missed_bars"] = missed
