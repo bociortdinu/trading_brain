@@ -36,13 +36,13 @@ Risk Engine -> gate-uri stateful -> router live -> /purchase -> poziție XTB
 | XTB demo: login, quote, instrumente, poziții, lumânări | Implementat | API `trading_hands`; candles M15/H1/H4/D1 validate live anterior |
 | Sesiune CoreAPI | Implementat cu limită | keepalive și reconnect testate cu mock WebSocket; expirarea TGT cere reautentificare în browser |
 | Colectare și features MTF | Implementat | bare închise, validare temporală, indicatori, quality/eligibility, calendare per provider |
-| Persistență și audit | Implementat | migrări 0001–0024; snapshot, spread, evaluare, decizie, apel LLM, trade și manifest separate |
+| Persistență și audit | Implementat | migrări 0001–0027; snapshot, spread, evaluare, decizie, apel LLM, trade și manifest separate |
 | Risk Engine | Implementat pentru shadow | fail-closed, spread/sesiune/confidence, SL/TP determinist; execuția rămâne explicit blocată |
 | Backtest/shadow | Implementat ca motor | o poziție per run, resume, deduplicare, benzi pentru ambiguitate intrabar, metrici |
 | Dashboard operator | Implementat | read-only, arată sănătatea, traseul deciziei, run-uri, cost/audit și alerte |
-| Teste curente | Verzi (local) | Python: **288 passed, 39 skipped** fără DB și **327 passed** cu baza `_test` izolată; Go: `go test -race ./...` + `vet` (repo `trading_hands`); launcher Node: **8 passed**. Categorii NErulate încă: **live Compose**, **live XTB**, **CI remote**. |
+| Teste curente | Verzi (local) | Python: **291 passed, 45 skipped** fără DB și **336 passed** cu baza `_test` izolată (necesită `BRAIN_TEST_DB_DSN` + `BRAIN_TEST_ADMIN_DB_DSN`); Go: `go test -race ./...` + `vet` (repo `trading_hands`, nerulat în această sesiune); launcher Node: **8 passed** (nerulat în această sesiune). Categorii NErulate încă: **live Compose**, **live XTB**, **CI remote**. |
 
-Schema bazei active este la versiunea `0024_snapshot_source_identity` și corespunde codului.
+Schema bazei active este la versiunea `0027_downtime_gaps` și corespunde codului.
 
 ## 3. Starea reală observată la audit
 
@@ -264,17 +264,33 @@ test `test_compose.py`); eligibility (incl. `max_clock_skew_seconds`) în finger
 teste de acoperire weekend/iarnă/early-close (`a86d161`); run_id derivat din config + drenarea
 trade-urilor deschise din run-ul anterior (`93babb2`).
 
-**Rămâne (trading_brain, necesită sesiune dedicată):** identitatea snapshotului per
-**Toate cele 4 datorii brain-doable sunt FĂCUTE cu teste:** dependency lock (`requirements.lock`,
-CI/Docker — versiuni; hash-uri = follow-up, `349fd37`); detecția gap-ului de downtime (calendar-aware,
-`6c21fd0`); **append-only real** — UPDATE+DELETE revocate pe cele 4 tabele de fapte, retenția pe
-admin, `BRAIN_TEST_ADMIN_DB_DSN` pentru curățare (`62e4445`); **identitatea snapshotului** include
-sursa — `UNIQUE(symbol, provider, pipeline_version, bar_close)`, providerele coexistă, lookup
-provider-scoped (migrarea 0024).
+**Runda 3 de review — constatările R3-1..9 sunt FĂCUTE cu teste:**
+- **R3-1 identitatea snapshotului** completă + impusă: `UNIQUE(symbol, provider, provider_symbol,
+  pipeline_version, bar_close)` cu `provider`/`provider_symbol`/`pipeline_version` **NOT NULL** (+
+  backfill), iar lookup-urile sunt source-scoped, inclusiv `snapshot_spread_status(provider=...)`
+  (migrarea 0025, o completează pe 0024).
+- **R3-2 reconciliere per-trade** cu providerul + granularitatea **înghețate**: un trade deschis pe
+  Polygon nu e reconciliat cu bare csv/XTB (rămâne deschis, „source mismatch"), iar un trade frozen-M1
+  nu e degradat la M15 doar fiindcă procesul curent rulează M15.
+- **R3-3 append-only real, per-tabel + rol de retenție separat:** app-role are DOAR SELECT+INSERT pe
+  tabelele de fapte (inclusiv `decisions`), UPDATE doar pe coloana `data_quality` la `market_snapshots`,
+  și **niciun DELETE** pe fapte; tabelele operaționale (`trades`, `decision_reservations`,
+  `service_heartbeats`, `pipeline_runs`) rămân mutabile. Un rol `trading_brain_retention` (NOLOGIN,
+  migrarea 0026) poate DOAR să **curețe** (SELECT+DELETE), niciodată INSERT/UPDATE. Testul de garanție
+  **PICĂ, nu se auto-skip-uiește** dacă app-role recapătă UPDATE/DELETE pe fapte.
+- **R3-4 run_id** derivat din manifestul executabil COMPLET (simbol, provider_symbol, timeframes,
+  model, commit) — orice schimbare de config forțează un run nou.
+- **R3-5 gap de downtime** ca **fapt persistent + auditabil** (`downtime_gaps`, migrarea 0027), cu
+  continuitate **peste schimbarea de run** (`last_decision_bar_across_runs`) și o politică explicită
+  (`DOWNTIME_POLICY = "skip"`), nu doar un log.
+- **R3-6 restore fail-closed** (checksum obligatoriu; `make restore` verifică; `make backup` cu lock);
+  **R3-7** validare `Settings` (finit/NaN, plafon token >0, ferestre de eligibilitate);
+  **R3-8** lock-ul de dependențe **NU e declarat complet** — versiuni pinuite, dar hash-urile + baza
+  Docker digest-pinned + pip pinuit sunt follow-up (pip self-upgrade nepinuit a fost eliminat).
 
-**Rămâne (follow-up, mai mic):** hash-uri în lock; persistarea DURABILĂ a gap-ului (tabel dedicat);
-un **job de retenție** admin; fixtures live de calendar iarnă/DST; wiring știri live sau scoaterea
-din DoD-ul v1; rate reale GOLD din specificația contului.
+**Rămâne (follow-up onest):** hash-uri (`--hash`) în lock + baza Docker digest-pinned (R3-8); un **job**
+de retenție care chiar rulează pe rolul `trading_brain_retention`; fixtures live de calendar iarnă/DST;
+wiring știri live sau scoaterea din DoD-ul v1.
 
 **Blocat (NU în acest repo / neconstruit):** execuția demo (idempotency `/purchase`, state machine
 de ordine, atomicitate order↔DB, garduri, close/PnL autoritativ, client ipax) și testele/keepalive

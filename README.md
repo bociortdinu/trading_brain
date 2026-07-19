@@ -110,8 +110,10 @@ python -m pytest -q                     # no-infra tests (repository tests skip 
 BRAIN_TEST_DB_DSN='postgresql://user:pw@127.0.0.1:5433/trading_brain_test' \
 BRAIN_TEST_ADMIN_DB_DSN='postgresql://admin:pw@127.0.0.1:5433/trading_brain_test' python -m pytest -q
 # Repository tests refuse a database whose name does not end in `_test`. BRAIN_TEST_ADMIN_DB_DSN is
-# the admin/owner used for cleanup — the fact tables are append-only, so the app role cannot DELETE
-# them (an append-only assertion test skips if the DB predates that grant).
+# the admin/owner used for cleanup (facts are append-only for the app role, so cleanup deletes must
+# run as admin). The app role has NO UPDATE/DELETE on fact tables incl. decisions; pruning is a
+# separate retention role (migration 0026). The append-only assertion test FAILS (never skips) if
+# that guarantee regresses, so BRAIN_TEST_ADMIN_DB_DSN is required for the DB suite to clean up.
 # One-time setup (creates only the named `_test` DB, then applies the normal migrations):
 BRAIN_TEST_DB_DSN='postgresql://user:pw@127.0.0.1:5433/trading_brain_test' python -m database.bootstrap_test
 ```
@@ -124,7 +126,7 @@ BRAIN_TEST_DB_DSN='postgresql://user:pw@127.0.0.1:5433/trading_brain_test' pytho
 | `brokers_bridge/` | async HTTP client for the 8 trading_hands endpoints (incl. `/candles`) |
 | `data_collector/` | `MarketDataProvider` (XTB real-time, Polygon/Massive, CSV) + strict candle/series validation + session calendars + news (`as_of`) |
 | `features/` | indicators (numpy), regime/S-R engineering, MTF `FeaturePacket`, eligibility |
-| `database/` | versioned `migrations/` (0001–0024), admin-run DDL, isolated test-DB bootstrap, repository/feedback and operational telemetry |
+| `database/` | versioned `migrations/` (0001–0027), admin-run DDL, isolated test-DB bootstrap, repository/feedback and operational telemetry |
 | `app/` | `smoke`, `collect`, `decide`, `jobs` (M15 scheduler) |
 | `decision/` | `schema` (strict I/O contract, incl. news + feedback), `prefilter`, `llm_client` (Anthropic, fail-closed), `pipeline` |
 | `risk/` | `engine.py` — rigid gate + deterministic ATR-based SL/TP (never the LLM's job) |

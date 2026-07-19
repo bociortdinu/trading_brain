@@ -48,17 +48,22 @@ Instantaneu exact al proiectului. (Secțiunile „Status onest / Runda N" de mai
   chiar tranzacționează (confluence + random; flat = linia zero care nu tranzacționează niciodată),
   bootstrap CI, drawdown, **discriminare** confidence (ordinal, NU ECE), acoperire pe regimuri.
 - **Persistență + audit**: `decisions`/`trades`/`snapshot_evaluations`/`spread_observations`/
-  `llm_calls`/`decision_reservations`; tabelele de fapte **append-only pentru app-role**
-  (UPDATE+DELETE revocate; retenția = admin); identitatea snapshotului include **sursa**
-  (symbol+provider+pipeline+bar_close); `schema_migrations` read-only pentru app-role.
+  `llm_calls`/`decision_reservations`/`downtime_gaps`; **append-only per-tabel** — app-role are
+  SELECT+INSERT pe fapte (inclusiv `decisions`), UPDATE doar pe `data_quality` la `market_snapshots`,
+  **niciun DELETE** pe fapte; tabelele operaționale (`trades`, `decision_reservations`,
+  `service_heartbeats`, `pipeline_runs`) rămân mutabile; curățarea = rol `trading_brain_retention`
+  (SELECT+DELETE, migrarea 0026). Identitatea snapshotului include **sursa** completă +
+  NOT NULL — `UNIQUE(symbol, provider, provider_symbol, pipeline_version, bar_close)` (0025);
+  `schema_migrations` read-only pentru app-role.
 - **trading_hands** (Go): endpoint `/candles` real-time (paginat), keepalive + **reconnect dovedit**
   cu mock CoreAPI, data race pe `account` reparat.
 
-**Cifre reale:** **327 teste** (288 fără DB + 39 DB-gated pe o bază `_test` izolată). Categorii de
-verificare: *fără-infra* și *DB-gated* rulate local; *live Compose*, *live XTB* și *CI remote* încă
-NErulate (Docker daemon indisponibil în mediu; CI-ul n-a rulat verde încă). Go
-`-race`/`vet`/`gofmt` curate, launcher Node **8 teste**.
-**24 migrări** (0001–0024). Versiuni: features `1.2.0`, decision-schema `2026.3`, prompt `2026.1`,
+**Cifre reale:** **336 teste** (291 fără DB + 45 DB-gated pe o bază `_test` izolată; DB-gated cer
+`BRAIN_TEST_DB_DSN` + `BRAIN_TEST_ADMIN_DB_DSN`). Categorii de verificare: *fără-infra* și *DB-gated*
+rulate local; *live Compose*, *live XTB* și *CI remote* încă NErulate (Docker daemon indisponibil în
+mediu; CI-ul n-a rulat verde încă). Go `-race`/`vet`/`gofmt` și launcher Node **8 teste** — nerulate
+în această sesiune (neatinse).
+**27 migrări** (0001–0027). Versiuni: features `1.2.0`, decision-schema `2026.3`, prompt `2026.1`,
 strategy `2026.1`, risk `2026.2`.
 
 **NU e făcut / deferit (onest):**
@@ -71,8 +76,8 @@ strategy `2026.1`, risk `2026.2`.
   valută + terms_version e FĂCUT, lipsesc doar ratele reale); **știri LIVE** (cere sursă/API key);
   `llm_calls` per-attempt (retry_count făcut, rânduri nu);
   exact-once la LLM = **imposibil** (Anthropic nu acceptă cheie de idempotency — închis);
-  un **job de retenție** dedicat (admin) — tabelele de fapte sunt acum append-only pentru app-role;
-  nivel 3 kNN/pgvector pentru feedback.
+  un **job de retenție** care chiar rulează (rolul `trading_brain_retention` există — 0026 —, dar
+  nimic nu-l invocă încă periodic); nivel 3 kNN/pgvector pentru feedback.
 
 ---
 
@@ -257,10 +262,11 @@ Reviewer-ul a avut dreptate; fiecare afirmație a fost reprodusă local înainte
    toate cele 47 de rânduri deveniseră `basis IS NOT NULL` — exact opusul regulii pe care o
    documentasem („`basis NOT NULL` ⟺ quote real"). 0017 pune `basis = NULL` la cele modelate; nota
    stă în comentariul migrării, nu într-o coloană de date. Verificat: invariantul ține din nou.
-6. **„Append-only" era impropriu.** E **UPDATE-protected**, nu append-only: DELETE rămâne acordat
-   (retenție + CASCADE), deci delete+reinsert poate emula un update. Documentat ca atare, nu
-   pretins rezolvat. `schema_migrations` e acum **read-only** pentru app-role (nu mai poate falsifica
-   istoricul migrărilor).
+6. **„Append-only" era impropriu.** *(La momentul acestei runde)* era **UPDATE-protected**, nu
+   append-only: DELETE rămânea acordat (retenție + CASCADE), deci delete+reinsert putea emula un
+   update. Documentat ca atare la acel moment, nu pretins rezolvat. **REZOLVAT ulterior în R3-3**:
+   app-role nu mai are DELETE pe fapte, iar retenția e un rol separat (`trading_brain_retention`,
+   0026). `schema_migrations` e read-only pentru app-role (nu mai poate falsifica istoricul migrărilor).
 7. **Docs**: ASK/BID → mid + cost plat; `execution/reconciler.py` (inexistent) → `shadow/reconciler.py`;
    `record_shadow_trade` → `upsert_shadow_trade`; concluzia „toate sl_hit" marcată ca **superseded**
    (event-study fără position gate, fereastră îngustă, manifest greșit).
@@ -422,9 +428,10 @@ sursa feature-urilor tf; restul (anchor, data_quality, confluence, assembly) e a
 fiecare bară (toate ramurile de regim + pivoți S/R); backtestul fast == slow (rânduri + metrici
 identice). **12× speedup** măsurat (2500 bare: 26.7s → 2.25s), scalare liniară.
 
-**Datorii rămase (oneste):** exact-once (imposibil la Anthropic — închis ca „nu se poate"); DELETE
-într-un rol separat de retenție (append-only real); swap long/short + DST/triple; `llm_calls`
-per-attempt (retry_count făcut, rânduri per-attempt nu); Faza 4 = spike; edge real = nemăsurat.
+**Datorii rămase (oneste):** exact-once (imposibil la Anthropic — închis ca „nu se poate");
+~~DELETE într-un rol separat de retenție (append-only real)~~ **REZOLVAT în R3-3** (rol
+`trading_brain_retention`, migrarea 0026; app-role fără DELETE pe fapte); `llm_calls` per-attempt
+(retry_count făcut, rânduri per-attempt nu); Faza 4 = spike; edge real = nemăsurat.
 
 ## Faza 0 — Fundație
 
