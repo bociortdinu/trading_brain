@@ -107,8 +107,11 @@ Alertele operaționale (ex. trade-uri rămase open) pot include **run-uri legacy
 ```bash
 pip install -e '.[dev]'                 # pytest + pandas (indicator cross-check)
 python -m pytest -q                     # no-infra tests (repository tests skip without a test DB)
-BRAIN_TEST_DB_DSN='postgresql://user:pw@127.0.0.1:5433/trading_brain_test' python -m pytest -q
-# Repository tests refuse a database whose name does not end in `_test`.
+BRAIN_TEST_DB_DSN='postgresql://user:pw@127.0.0.1:5433/trading_brain_test' \
+BRAIN_TEST_ADMIN_DB_DSN='postgresql://admin:pw@127.0.0.1:5433/trading_brain_test' python -m pytest -q
+# Repository tests refuse a database whose name does not end in `_test`. BRAIN_TEST_ADMIN_DB_DSN is
+# the admin/owner used for cleanup — the fact tables are append-only, so the app role cannot DELETE
+# them (an append-only assertion test skips if the DB predates that grant).
 # One-time setup (creates only the named `_test` DB, then applies the normal migrations):
 BRAIN_TEST_DB_DSN='postgresql://user:pw@127.0.0.1:5433/trading_brain_test' python -m database.bootstrap_test
 ```

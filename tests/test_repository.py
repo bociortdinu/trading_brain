@@ -57,16 +57,25 @@ def _packet(symbol: str, *, spread=None, provider="csv"):
     )
 
 
+# The fact tables are APPEND-ONLY for the app role (no DELETE) — cleanup/retention is an ADMIN
+# operation. Use BRAIN_TEST_ADMIN_DB_DSN when provided (CI + local re-grant); fall back to the app
+# DSN so the suite still runs against a DB whose grants predate the append-only revoke.
+_ADMIN_DSN = os.environ.get("BRAIN_TEST_ADMIN_DB_DSN")
+
+
+def _cleanup_dsn() -> str:
+    return _ADMIN_DSN or DSN
+
+
 def _cleanup(symbol):
-    with psycopg.connect(DSN) as c:
+    with psycopg.connect(_cleanup_dsn()) as c:
         snaps = "(SELECT id FROM market_snapshots WHERE symbol = %s)"
         decs = f"(SELECT id FROM decisions WHERE snapshot_id IN {snaps})"
         c.execute(f"DELETE FROM trades WHERE decision_id IN {decs}", (symbol,))
         c.execute(f"DELETE FROM llm_calls WHERE snapshot_id IN {snaps}", (symbol,))
         c.execute(f"DELETE FROM decisions WHERE snapshot_id IN {snaps}", (symbol,))
         c.execute("DELETE FROM snapshot_conflicts WHERE symbol = %s", (symbol,))
-        # snapshot_evaluations cascade on snapshot delete, but be explicit for clarity.
-        c.execute(f"DELETE FROM snapshot_evaluations WHERE snapshot_id IN {snaps}", (symbol,))
+        # spread_observations + snapshot_evaluations CASCADE on the snapshot delete below.
         c.execute("DELETE FROM market_snapshots WHERE symbol = %s", (symbol,))
         c.commit()
 
@@ -1201,7 +1210,7 @@ def test_verified_scope_requires_a_real_commit_not_just_clean():
         assert good in verified
         assert bad not in verified and ukn not in verified   # clean flag alone is not enough
     finally:
-        with psycopg.connect(DSN) as c:
+        with psycopg.connect(_cleanup_dsn()) as c:
             c.execute("DELETE FROM run_manifests WHERE run_id = ANY(%s)", ([good, bad, ukn],))
             c.commit()
 
@@ -1232,7 +1241,7 @@ def test_backtest_run_manifest_includes_full_eligibility_policy():
         assert "eligibility_policy" in manifest                       # was omitted in the backtest
         assert "max_clock_skew_seconds" in manifest["eligibility_policy"]   # was omitted in as_policy()
     finally:
-        with psycopg.connect(DSN) as c:
+        with psycopg.connect(_cleanup_dsn()) as c:
             c.execute("DELETE FROM trades WHERE run_id=%s", (run_id,))
             c.execute("DELETE FROM decisions WHERE run_id=%s", (run_id,))
             c.execute("DELETE FROM run_manifests WHERE run_id=%s", (run_id,))
@@ -1286,6 +1295,21 @@ def test_llm_audit_is_atomic_with_the_decision():
         _cleanup(sym)
 
 
+def test_fact_tables_are_append_only_for_the_app_role():
+    """R2-16b: the app role can neither UPDATE nor DELETE the immutable fact tables — closing the
+    delete+reinsert loophole that could rewrite history. Retention/cleanup is an ADMIN operation.
+    Requires the append-only grant (re-run `migrate`); skips if DELETE is still granted (older DB)."""
+    for table in ("run_manifests", "llm_calls", "spread_observations", "snapshot_evaluations"):
+        with psycopg.connect(DSN) as c:
+            try:
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                    c.execute(f"DELETE FROM {table}")     # app role must NOT be able to delete facts
+            except pytest.fail.Exception:
+                pytest.skip(f"{table}: DELETE still granted (re-run migrate to apply append-only)")
+            finally:
+                c.rollback()
+
+
 def test_run_manifest_pins_a_run_to_one_config():
     """A run_id is ONE frozen setup. The first use records its execution-manifest hash; a later
     use with a different config is REFUSED (else two configs mix into one experiment)."""
@@ -1302,7 +1326,7 @@ def test_run_manifest_pins_a_run_to_one_config():
                 c.execute("UPDATE run_manifests SET manifest_hash='x' WHERE run_id=%s", (run_id,))
             c.rollback()
     finally:
-        with psycopg.connect(DSN) as c:
+        with psycopg.connect(_cleanup_dsn()) as c:
             c.execute("DELETE FROM run_manifests WHERE run_id=%s", (run_id,))
             c.commit()
 
@@ -1333,7 +1357,7 @@ def test_online_verifies_run_manifest_before_any_fetch_or_mutation():
                 settings, ExplodingProvider(), "csv", decision_maker=object(),
                 run_id=run_id, shadow_config=ShadowConfig(commission_pct=0.07)))
     finally:
-        with psycopg.connect(DSN) as c:
+        with psycopg.connect(_cleanup_dsn()) as c:
             c.execute("DELETE FROM run_manifests WHERE run_id=%s", (run_id,))
             c.commit()
 
@@ -1423,7 +1447,7 @@ def test_llm_call_records_retry_count_and_links_the_decision():
         assert got[ok_id] == (2, dec_id), "successful call: retry_count + linked decision"
         assert got[fail_id] == (3, None), "failed call: retry_count recorded, decision NULL"
     finally:
-        with psycopg.connect(DSN) as c:
+        with psycopg.connect(_cleanup_dsn()) as c:
             c.execute("DELETE FROM llm_calls WHERE snapshot_id=%s", (snap_id,))
             c.execute("DELETE FROM decisions WHERE run_id=%s", (run_id,))
             c.commit()

@@ -48,6 +48,8 @@ jobs:
       BRAIN_ADMIN_DB_DSN: postgresql://postgres:postgres@localhost:5432/postgres
       BRAIN_DB_DSN: postgresql://trading_brain_app:ci_app_password@localhost:5432/trading_brain
       BRAIN_TEST_DB_DSN: postgresql://trading_brain_app:ci_app_password@localhost:5432/trading_brain_test
+      # admin/owner for append-only cleanup (the app role cannot DELETE the immutable fact tables)
+      BRAIN_TEST_ADMIN_DB_DSN: postgresql://postgres:postgres@localhost:5432/trading_brain_test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

@@ -77,13 +77,14 @@ def main() -> int:
                 # the app role UPDATE on everything, so the REVOKE must come AFTER it (and a
                 # REVOKE inside a migration would be undone by this block on the next run).
                 #
-                # HONEST LIMIT: this is UPDATE-protected, NOT true append-only. DELETE stays
-                # granted (retention is legitimate and the FK CASCADE from market_snapshots needs
-                # it), and delete+reinsert can still emulate an update. A real audit guarantee
-                # needs DELETE moved to a separate retention role — not done, and not claimed.
+                # APPEND-ONLY for the app role: neither UPDATE nor DELETE. This closes the
+                # delete+reinsert loophole that could rewrite history. Retention/cleanup is an ADMIN
+                # (owner) operation, and FK CASCADE from market_snapshots still deletes the children
+                # (cascade runs with owner privileges, not the app role's). No production code
+                # deletes these tables; only admin-run maintenance/retention may.
                 for table in ("spread_observations", "snapshot_evaluations", "llm_calls",
                               "run_manifests"):
-                    conn.execute(pgsql.SQL("REVOKE UPDATE ON {} FROM {}").format(
+                    conn.execute(pgsql.SQL("REVOKE UPDATE, DELETE ON {} FROM {}").format(
                         pgsql.Identifier(table), role))
 
                 # The app role must never be able to rewrite migration history: faking a version
@@ -93,7 +94,7 @@ def main() -> int:
                     "REVOKE INSERT, UPDATE, DELETE ON schema_migrations FROM {}").format(role))
                 conn.commit()
                 print(f"granted DML on {target_db} to app role {app_user} "
-                      f"(UPDATE revoked on fact tables; schema_migrations read-only)")
+                      f"(fact tables append-only: UPDATE+DELETE revoked; schema_migrations read-only)")
     except Exception as exc:  # noqa: BLE001
         print(f"migration failed: {exc}", file=sys.stderr)
         return 1
