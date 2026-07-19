@@ -331,7 +331,7 @@ def test_online_and_replay_decisions_share_a_bar_without_contradiction():
 
 def _seed_decision(sym, *, input_hash="h", model="fake", end=None, snapshot_id=None,
                    spread_pct=None, provenance=None, spread_observation_id=None,
-                   run_id=None, input_fingerprint=None, blocked_reason=None):
+                   run_id=None, input_fingerprint=None, blocked_reason=None, data_provider="csv"):
     """Snapshot -> evaluation -> decision; returns (dec_id). Shared by the idempotency tests."""
     from database.repository import insert_decision, insert_evaluation, upsert_snapshot
     from decision.pipeline import DecisionRecord
@@ -341,7 +341,7 @@ def _seed_decision(sym, *, input_hash="h", model="fake", end=None, snapshot_id=N
 
     end = end or datetime(2026, 7, 1, tzinfo=timezone.utc)
     if snapshot_id is None:
-        _, snapshot_id = upsert_snapshot(DSN, _packet(sym, spread=0.03))
+        _, snapshot_id = upsert_snapshot(DSN, _packet(sym, spread=0.03, provider=data_provider))
     eval_id = insert_evaluation(DSN, snapshot_id, _eval("replay", True, []))
     decision = DecisionOutput(direction="BUY", confidence=0.8, rationale="x")
     risk = RiskVerdict(approved=True, reason=None, direction="BUY", confidence=0.8,
@@ -358,7 +358,7 @@ def _seed_decision(sym, *, input_hash="h", model="fake", end=None, snapshot_id=N
     dec_id, _ = insert_decision(DSN, snapshot_id=snapshot_id, evaluation_id=eval_id, model=model,
                                 record=rec, ai_input=ai_input,
                                 ai_output=decision.model_dump(mode="json"),
-                                mode="shadow", data_provider="csv",
+                                mode="shadow", data_provider=data_provider,
                                 spread_observation_id=spread_observation_id,
                                 run_id=run_id, input_fingerprint=input_fingerprint,
                                 blocked_reason=blocked_reason)
@@ -1161,6 +1161,54 @@ def test_reconcile_drains_open_trades_from_a_previous_run():
         with psycopg.connect(DSN) as c:
             c.execute("DELETE FROM trades WHERE run_id=%s", (old_run,))
             c.execute("DELETE FROM decisions WHERE run_id=%s", (old_run,))
+            c.commit()
+        _cleanup(sym)
+
+
+def test_reconcile_skips_a_trade_frozen_under_a_different_provider():
+    """R3-2: a trade opened with polygon bars must NOT be reconciled by a csv tick — the two feeds
+    are different price series. The cross-provider trade stays OPEN (skipped as source mismatch);
+    only the same-provider trade is closed. This proves reconcile uses each trade's FROZEN provider,
+    not the current process's provider."""
+    from core.models import Direction
+    from data_collector.providers.base import Candle
+    from database.repository import upsert_shadow_trade
+    from shadow.online import reconcile_open_trades
+    from shadow.reconciler import reconcile
+    from shadow.virtual_broker import ShadowConfig, cost_manifest, open_virtual_trade
+
+    sym = "TST_" + os.urandom(3).hex()
+    run = "run-" + os.urandom(3).hex()
+    end = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    cfg = ShadowConfig()
+    try:
+        # One trade frozen under polygon, one under csv, same symbol.
+        poly_dec = _seed_decision(sym, run_id=run, input_fingerprint="polyfp",
+                                  data_provider="polygon")
+        csv_dec = _seed_decision(sym, run_id=run, input_fingerprint="csvfp",
+                                 data_provider="csv")
+        for dec_id in (poly_dec, csv_dec):
+            trade = open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6, spread_pct=0.0,
+                                       spread_provenance="modeled", opened_at=end)
+            upsert_shadow_trade(DSN, decision_id=dec_id, run_id=run, symbol=sym, trade=trade,
+                                outcome=reconcile(trade, [], cfg), timeframe="15min",
+                                timeout_bars=96, costs=cost_manifest(trade, cfg))
+        tp_bar = Candle(open_time=end, close_time=end + timedelta(minutes=15),
+                        open=4000, high=4030, low=3999, close=4025, volume=1.0)
+        now = end + timedelta(minutes=15)
+        # A csv tick: closes ONLY the csv-frozen trade; the polygon trade is skipped, stays open.
+        assert reconcile_open_trades(DSN, [tp_bar], symbol=sym, provider_name="csv", now=now) == 1
+        with psycopg.connect(DSN) as c:
+            poly_status = c.execute("SELECT status FROM trades WHERE decision_id=%s",
+                                    (poly_dec,)).fetchone()[0]
+            csv_status = c.execute("SELECT status FROM trades WHERE decision_id=%s",
+                                   (csv_dec,)).fetchone()[0]
+        assert poly_status == "open"     # cross-provider trade NOT reconciled with foreign bars
+        assert csv_status == "closed"    # same-provider trade closed normally
+    finally:
+        with psycopg.connect(DSN) as c:
+            c.execute("DELETE FROM trades WHERE run_id=%s", (run,))
+            c.execute("DELETE FROM decisions WHERE run_id=%s", (run,))
             c.commit()
         _cleanup(sym)
 

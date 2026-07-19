@@ -522,18 +522,20 @@ def open_shadow_trades(dsn: str, run_id: str | None = None, *, symbol: str | Non
 
     from psycopg.rows import dict_row
 
-    where = ["mode = 'shadow'", "status = 'open'"]
+    where = ["t.mode = 'shadow'", "t.status = 'open'"]
     params: list = []
     if run_id is not None:
-        where.append("run_id = %s")
+        where.append("t.run_id = %s")
         params.append(run_id)
     if symbol is not None:
-        where.append("symbol = %s")
+        where.append("t.symbol = %s")
         params.append(symbol)
     with psycopg.connect(dsn, row_factory=dict_row) as conn:
         return conn.execute(
-            "SELECT decision_id, run_id, symbol, side, entry_price, sl_price, tp_price, opened_at, "
-            "spread_pct, spread_provenance, slippage_pct, timeout_bars, costs FROM trades "
+            "SELECT t.decision_id, t.run_id, t.symbol, t.side, t.entry_price, t.sl_price, "
+            "t.tp_price, t.opened_at, t.spread_pct, t.spread_provenance, t.slippage_pct, "
+            "t.timeout_bars, t.costs, d.data_provider "   # the FROZEN provider the trade was opened under
+            "FROM trades t JOIN decisions d ON d.id = t.decision_id "
             "WHERE " + " AND ".join(where),
             tuple(params),
         ).fetchall()

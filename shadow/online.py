@@ -84,6 +84,18 @@ def _to_trade(row: dict) -> VirtualTrade:
     )
 
 
+def _any_open_trade_wants_finer(dsn: str, symbol: str, provider_name: str) -> bool:
+    """True if any OPEN trade for this symbol+provider was opened wanting a finer reconcile
+    timeframe — so we fetch M1 to honour its FROZEN granularity, not just the current config's."""
+    for row in open_shadow_trades(dsn, symbol=symbol):
+        if row.get("data_provider") and row["data_provider"] != provider_name:
+            continue
+        cfg = shadow_config_from_costs(row.get("costs"), timeout_bars=row.get("timeout_bars"))
+        if cfg.reconcile_timeframe != TRIGGER_TF:
+            return True
+    return False
+
+
 def reconcile_open_trades(dsn: str, coarse_bars: list[Candle], *, symbol: str, provider_name: str,
                           now: datetime | None = None,
                           shadow_config: ShadowConfig | None = None,
@@ -106,6 +118,14 @@ def reconcile_open_trades(dsn: str, coarse_bars: list[Candle], *, symbol: str, p
     fine_bars = fine_bars or []
     closed = 0
     for row in open_shadow_trades(dsn, symbol=symbol):     # ACROSS runs, not just the current one
+        # FROZEN SOURCE: a trade opened under provider X must be reconciled with X's bars + calendar,
+        # never the current provider's (closing a Polygon trade with XTB bars would be wrong). This
+        # tick only holds the current provider's bars, so a mismatched-source trade is left OPEN.
+        if row.get("data_provider") and row["data_provider"] != provider_name:
+            log.warning("reconcile skipped (source mismatch): trade run=%s decision=%s opened under "
+                        "provider=%s, current provider=%s", row.get("run_id"),
+                        row.get("decision_id"), row["data_provider"], provider_name)
+            continue
         trade = _to_trade(row)
         trade_run_id = row["run_id"]                       # close under the trade's OWN run
         cfg = shadow_config_from_costs(row.get("costs"), timeout_bars=row.get("timeout_bars"),
@@ -187,16 +207,16 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
                     prev.isoformat() if prev else "?", as_of.isoformat(), run_id)
 
     # 1) RECONCILE FIRST: close any open trade the new bars just hit, BEFORE considering a new
-    #    entry — so we never stack a new position on one the same bars should have closed. Prefer
-    #    finer (M1) bars for intrabar SL/TP ordering when configured and available; else fall back
-    #    to the trigger timeframe and record that the R was measured coarsely.
-    # Best-effort provisioning of finer bars (current settings decide whether to fetch M1); the
-    # PER-TRADE decision to actually use them is made against each trade's frozen config inside
-    # reconcile_open_trades. A frozen-M1 trade under a now-M15 config simply falls back (flagged).
+    #    entry — so we never stack a new position on one the same bars should have closed.
+    #    Fetch finer (M1) bars when the current config wants them OR any open (same-provider) trade
+    #    was OPENED wanting M1 — so a frozen-M1 trade is NOT artificially degraded to M15 just
+    #    because the current process runs M15. The per-trade decision to use them is still made
+    #    against each trade's frozen config inside reconcile_open_trades.
     fine_bars: list[Candle] = []
-    if shadow_config.reconcile_timeframe != TRIGGER_TF:
-        fine_bars = await _fetch_finer_bars(provider, provider_symbol,
-                                            shadow_config.reconcile_timeframe,
+    want_fine = (shadow_config.reconcile_timeframe != TRIGGER_TF
+                 or _any_open_trade_wants_finer(settings.db_dsn, brain_symbol, provider_name))
+    if want_fine:
+        fine_bars = await _fetch_finer_bars(provider, provider_symbol, "1min",
                                             shadow_config.timeout_bars, now)
     summary["reconciled_closed"] = reconcile_open_trades(
         settings.db_dsn, windows[TRIGGER_TF], symbol=brain_symbol, provider_name=provider_name,
