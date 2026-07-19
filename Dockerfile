@@ -1,6 +1,10 @@
 # Single image for every trading_brain service; the container's `command` selects which one
 # (migrate / collector / online / dashboard). psycopg[binary] and numpy ship wheels, so the
 # slim base needs no apt build chain.
+#
+# REPRODUCIBILITY (NOT complete — see docs/PROJECT_COMPLETION_REPORT.md): this tag FLOATS. For a
+# byte-reproducible build the base must be DIGEST-pinned (FROM python:3.12-slim@sha256:<digest>);
+# obtaining the digest needs registry access, so it is a tracked follow-up, not done here.
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -14,7 +18,10 @@ WORKDIR /app
 # `database.migrate` (which reads __file__/migrations) resolves them without relying
 # on package-data being wired correctly.
 COPY . .
-RUN pip install --upgrade pip && pip install -e '.[db]' -c requirements.lock
+# Use the base image's own (tag-pinned) pip rather than an UNPINNED pip self-upgrade, which would
+# pull a non-deterministic pip on every build. Deps resolve to requirements.lock (version pins;
+# --hash pinning is a tracked follow-up — see the lock header).
+RUN pip install -e '.[db]' -c requirements.lock
 
 # Git provenance: the .git tree is NOT in the image (.dockerignore), so inject the commit/branch/
 # dirty state at build time. git_metadata() reads these; a run without them reports provenance
