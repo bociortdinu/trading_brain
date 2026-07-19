@@ -48,18 +48,27 @@ def test_shadow_tick_does_not_retry_programming_error(monkeypatch):
 
 
 # --- finer-bar (M1) reconciliation fetch: best-effort, degrades to the trigger TF --------------
-def test_resolve_run_id_prefers_cli_then_env_then_config_digest_default():
-    """R2-5/P0-7: CLI wins, else BRAIN_RUN_ID, else a default that embeds the strategy version AND
-    a CONFIG DIGEST — so a cost/RiskConfig/eligibility/calendar change forces a new run."""
+def test_resolve_run_id_derives_from_the_full_manifest():
+    """R3-4/R2-5/P0-7: CLI wins, else BRAIN_RUN_ID, else a default hashed from the FULL executable
+    manifest — so symbol / timeframes / cost / model / commit changes each force a new run."""
     from config.settings import Settings
     from decision.schema import STRATEGY_VERSION
     from shadow.online import resolve_run_id
-    assert resolve_run_id("cli-x", Settings(run_id="env-y")) == "cli-x"
-    assert resolve_run_id(None, Settings(run_id="env-y")) == "env-y"
-    default = resolve_run_id(None, Settings(run_id=None))
-    assert default.startswith(f"shadow-online-{STRATEGY_VERSION}-")
-    # a cost change must change the default (was static before)
-    assert resolve_run_id(None, Settings(run_id=None)) != resolve_run_id(None, Settings(commission_pct=0.05))
+
+    def rid(model="deterministic-confluence", **kw):
+        s = Settings(**kw)
+        return resolve_run_id(None, s, model_name=model, provider_name=s.market_data_provider)
+
+    assert resolve_run_id("cli-x", Settings(run_id="env-y"),
+                          model_name="m", provider_name="csv") == "cli-x"
+    assert resolve_run_id(None, Settings(run_id="env-y"),
+                          model_name="m", provider_name="csv") == "env-y"
+    base = rid()
+    assert base.startswith(f"shadow-online-{STRATEGY_VERSION}-")
+    assert rid(commission_pct=0.05) != base           # cost
+    assert rid(symbol_query="SILVER") != base          # symbol
+    assert rid(timeframes=["1day", "1h", "15min"]) != base   # timeframes
+    assert rid(model="claude-opus-4-8") != base        # maker model
 
 
 def test_fetch_finer_bars_falls_back_to_empty_on_provider_error():

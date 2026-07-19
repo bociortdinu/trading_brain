@@ -163,21 +163,8 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     # incompatible with this run_id must abort with ZERO side effects; the old order reconciled
     # (mutating open trades) and could return at the position gate without ever checking the
     # manifest. The execution manifest depends only on config/versions, so it is known here.
-    exec_manifest = execution_manifest(
-        modeled_spread_pct=settings.replay_spread_pct, slippage_pct=settings.slippage_pct,
-        config=shadow_config, single_position=True, cooldown_bars=0,
-        risk_config=RiskConfig().model_dump(mode="json"),
-        prefilter_config=PrefilterConfig().model_dump(mode="json"),
-        eligibility_policy=_eligibility_config(settings).as_policy(),
-        calendar_version=calendar_for(provider_name).version)
-    exec_manifest.update({
-        "run_kind": "shadow_online",
-        "maker": model_name,
-        "provider": provider_name,
-        "symbol": brain_symbol,
-        "feedback": True,
-        **git_metadata(),
-    })
+    exec_manifest = build_online_exec_manifest(settings, shadow_config=shadow_config,
+                                               model_name=model_name, provider_name=provider_name)
     exec_hash = execution_hash(exec_manifest)
     assert_run_manifest(settings.db_dsn, run_id, exec_manifest, exec_hash)   # raises on mismatch
 
@@ -469,40 +456,51 @@ async def _loop(settings: Settings, run_id: str, maker, model_name: str,
                 await aclose()
 
 
-def config_digest(settings: Settings) -> str:
-    """Short, stable hash of the config that determines a shadow run's OUTCOMES — cost/financing
-    config, eligibility policy, risk/prefilter config, calendar (provider) and strategy version.
-    A change to ANY of these yields a new default run_id, so an incompatible config never silently
-    lands in an old run (RunConfigMismatch)."""
-    import hashlib
-    import json
+def build_online_exec_manifest(settings: Settings, *, shadow_config: ShadowConfig,
+                               model_name: str, provider_name: str) -> dict:
+    """The FULL executable manifest that identifies (and pins) a shadow-online run: financing/cost
+    config, risk + prefilter + eligibility policy, the market calendar, the SYMBOL and its provider
+    mapping, the timeframes, the maker/provider, and the git provenance. resolve_run_id() hashes
+    THIS so the default run_id changes with ANY of them — a new build/config never lands in an
+    incompatible old run."""
+    brain_symbol = settings.symbol_query
+    manifest = execution_manifest(
+        modeled_spread_pct=settings.replay_spread_pct, slippage_pct=settings.slippage_pct,
+        config=shadow_config, single_position=True, cooldown_bars=0,
+        risk_config=RiskConfig().model_dump(mode="json"),
+        prefilter_config=PrefilterConfig().model_dump(mode="json"),
+        eligibility_policy=_eligibility_config(settings).as_policy(),
+        calendar_version=calendar_for(provider_name).version)
+    manifest.update({
+        "run_kind": "shadow_online",
+        "maker": model_name,
+        "provider": provider_name,
+        "symbol": brain_symbol,
+        "provider_symbol": settings.provider_symbol(brain_symbol),   # provider_symbol_map identity
+        "timeframes": list(settings.timeframes),
+        "strategy_version": STRATEGY_VERSION,
+        "feedback": True,
+        **git_metadata(),                                            # commit/branch/dirty -> release id
+    })
+    return manifest
 
-    from app.collect import _eligibility_config
-    from decision.prefilter import PrefilterConfig
-    from risk.engine import RiskConfig
-    blob = {
-        "shadow": shadow_config_from_settings(settings).model_dump(mode="json"),
-        "risk": RiskConfig().model_dump(mode="json"),
-        "prefilter": PrefilterConfig().model_dump(mode="json"),
-        "eligibility": _eligibility_config(settings).as_policy(),
-        "provider": settings.market_data_provider,   # picks the market calendar
-        "strategy": STRATEGY_VERSION,
-    }
-    return hashlib.sha256(json.dumps(blob, sort_keys=True).encode()).hexdigest()[:10]
 
-
-def resolve_run_id(cli_run_id: str | None, settings: Settings) -> str:
-    """Explicit --run-id wins; else BRAIN_RUN_ID (settings.run_id); else a default that embeds the
-    strategy version AND a config digest — so changing costs/RiskConfig/eligibility/calendar forces
-    a NEW run rather than a silent RunConfigMismatch against an incompatible old run."""
+def resolve_run_id(cli_run_id: str | None, settings: Settings, *, model_name: str,
+                   provider_name: str) -> str:
+    """Explicit --run-id wins; else BRAIN_RUN_ID (settings.run_id); else a default derived from the
+    FULL executable manifest hash (config + symbol + provider mapping + timeframes + model + git),
+    so any material change — including a new build — starts a NEW run instead of colliding with an
+    incompatible old one (RunConfigMismatch)."""
     if cli_run_id:
         return cli_run_id
     if settings.run_id:
         return settings.run_id
-    digest = config_digest(settings)
-    log.warning("no --run-id / BRAIN_RUN_ID set; using the config-derived default "
-                "shadow-online-%s-%s. Set BRAIN_RUN_ID to a release/build id for a stable "
-                "experiment identity across code changes.", STRATEGY_VERSION, digest)
+    cfg = shadow_config_from_settings(settings)
+    digest = execution_hash(build_online_exec_manifest(
+        settings, shadow_config=cfg, model_name=model_name, provider_name=provider_name))
+    log.warning("no --run-id / BRAIN_RUN_ID set; using the manifest-derived default "
+                "shadow-online-%s-%s. Set BRAIN_RUN_ID to a stable release id to keep one "
+                "experiment identity across builds.", STRATEGY_VERSION, digest)
     return f"shadow-online-{STRATEGY_VERSION}-{digest}"
 
 
@@ -517,9 +515,10 @@ def main() -> int:
     args = parser.parse_args()
     settings = load_settings()            # Settings validators run here (bad config -> hard exit)
     _shadow_config(settings)              # build+validate the ShadowConfig ONCE at startup, not per tick
-    run_id = resolve_run_id(args.run_id, settings)
-    log.info("shadow online run_id=%s", run_id)
     maker, model_name = _build_maker(settings, args.maker)
+    run_id = resolve_run_id(args.run_id, settings, model_name=model_name,
+                            provider_name=settings.market_data_provider)
+    log.info("shadow online run_id=%s", run_id)
     try:
         if args.once:
             asyncio.run(_once(settings, run_id, maker, model_name))
