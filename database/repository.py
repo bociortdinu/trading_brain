@@ -719,3 +719,48 @@ def last_decision_as_of(dsn: str, run_id: str, symbol: str, provider: str | None
             (run_id, symbol, provider, provider),
         ).fetchone()
     return row[0] if row and row[0] else None
+
+
+def last_decision_bar_across_runs(dsn: str, symbol: str, provider: str | None = None):
+    """(bar_close, run_id) of the most recent decision for this symbol+provider ACROSS ALL RUNS —
+    NOT scoped to the current run. Downtime-gap detection uses this so a gap that spans a run/config
+    change is still seen (continuity): a new run_id must not reset the 'last decided bar' to nothing
+    and thereby hide the gap. Returns (None, None) if there is no prior decision at all."""
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        row = conn.execute(
+            "SELECT s.bar_close, d.run_id "
+            "FROM decisions d JOIN market_snapshots s ON s.id=d.snapshot_id "
+            "WHERE s.symbol = %s AND (%s::text IS NULL OR s.provider = %s) "
+            "ORDER BY s.bar_close DESC LIMIT 1",
+            (symbol, provider, provider),
+        ).fetchone()
+    return (row[0], row[1]) if row else (None, None)
+
+
+def record_downtime_gap(dsn: str, *, symbol: str, provider: str, prev_bar_close, prev_run_id,
+                        resumed_bar_close, run_id: str, missed_bars: int, policy: str) -> int | None:
+    """Persist a downtime gap as an AUDITABLE FACT (append-only; not just a log line): how many
+    open-market decision bars were skipped between the last decided bar and the resume bar, which
+    runs sat on either side of the gap (prev_run_id may differ from run_id — a gap across a config
+    change), and how it was handled (`policy`: 'skip' | 'backfill'). Idempotent on
+    (symbol, provider, resumed_bar_close, run_id): re-ticking the same resume never duplicates it.
+    Returns the row id, or None if the gap was already recorded."""
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        row = conn.execute(
+            """
+            INSERT INTO downtime_gaps
+                (symbol, provider, prev_bar_close, prev_run_id, resumed_bar_close, run_id,
+                 missed_bars, policy)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (symbol, provider, resumed_bar_close, run_id) DO NOTHING
+            RETURNING id
+            """,
+            (symbol, provider, prev_bar_close, prev_run_id, resumed_bar_close, run_id,
+             missed_bars, policy),
+        ).fetchone()
+        conn.commit()
+    return row[0] if row else None

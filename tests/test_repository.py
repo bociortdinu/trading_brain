@@ -43,8 +43,8 @@ def _db_ok() -> bool:
 pytestmark = pytest.mark.skipif(not _db_ok(), reason="no reachable BRAIN_TEST_DB_DSN (..._test)")
 
 
-def _packet(symbol: str, *, spread=None, provider="csv", provider_symbol="C:XAUUSD"):
-    end = datetime(2026, 7, 1, tzinfo=timezone.utc)
+def _packet(symbol: str, *, spread=None, provider="csv", provider_symbol="C:XAUUSD", end=None):
+    end = end or datetime(2026, 7, 1, tzinfo=timezone.utc)
     tf = {
         name: trend(step=1.0, tf_min=m, start=end - timedelta(minutes=m * 250))
         for name, m in (("1day", 1440), ("4h", 240), ("1h", 60), ("15min", 15))
@@ -362,8 +362,11 @@ def test_online_and_replay_decisions_share_a_bar_without_contradiction():
 
 def _seed_decision(sym, *, input_hash="h", model="fake", end=None, snapshot_id=None,
                    spread_pct=None, provenance=None, spread_observation_id=None,
-                   run_id=None, input_fingerprint=None, blocked_reason=None, data_provider="csv"):
-    """Snapshot -> evaluation -> decision; returns (dec_id). Shared by the idempotency tests."""
+                   run_id=None, input_fingerprint=None, blocked_reason=None, data_provider="csv",
+                   bar_close=None):
+    """Snapshot -> evaluation -> decision; returns (dec_id). Shared by the idempotency tests.
+    `bar_close` controls the snapshot's bar_close (default keeps the historical fixed value, so
+    existing callers are unchanged); pass it to seed decisions on distinct bars."""
     from database.repository import insert_decision, insert_evaluation, upsert_snapshot
     from decision.pipeline import DecisionRecord
     from decision.prefilter import PrefilterResult
@@ -371,8 +374,10 @@ def _seed_decision(sym, *, input_hash="h", model="fake", end=None, snapshot_id=N
     from risk.engine import RiskVerdict
 
     end = end or datetime(2026, 7, 1, tzinfo=timezone.utc)
+    snap_end = bar_close or datetime(2026, 7, 1, tzinfo=timezone.utc)
     if snapshot_id is None:
-        _, snapshot_id = upsert_snapshot(DSN, _packet(sym, spread=0.03, provider=data_provider))
+        _, snapshot_id = upsert_snapshot(
+            DSN, _packet(sym, spread=0.03, provider=data_provider, end=snap_end))
     eval_id = insert_evaluation(DSN, snapshot_id, _eval("replay", True, []))
     decision = DecisionOutput(direction="BUY", confidence=0.8, rationale="x")
     risk = RiskVerdict(approved=True, reason=None, direction="BUY", confidence=0.8,
@@ -1242,6 +1247,66 @@ def test_reconcile_skips_a_trade_frozen_under_a_different_provider():
             c.execute("DELETE FROM decisions WHERE run_id=%s", (run,))
             c.commit()
         _cleanup(sym)
+
+
+def test_last_decision_bar_is_tracked_across_runs_for_continuity():
+    """R3-5: downtime-gap detection must see the last decided bar for a symbol+provider ACROSS runs,
+    so a gap that spans a config/run change is not hidden. last_decision_bar_across_runs ignores
+    run_id and returns the latest bar together with the run that decided it."""
+    from database.repository import last_decision_bar_across_runs
+
+    sym = "TST_" + os.urandom(3).hex()
+    run_a, run_b = "rA-" + os.urandom(3).hex(), "rB-" + os.urandom(3).hex()
+    # Midnight-aligned so the synthetic 15m/1h/4h/1day windows are all on-grid.
+    t0 = datetime(2026, 7, 6, tzinfo=timezone.utc)
+    t1 = datetime(2026, 7, 7, tzinfo=timezone.utc)               # newer bar, other run
+    try:
+        _seed_decision(sym, run_id=run_a, input_fingerprint="ca", bar_close=t0)
+        _seed_decision(sym, run_id=run_b, input_fingerprint="cb", bar_close=t1)  # newer, other run
+        bar, run = last_decision_bar_across_runs(DSN, sym, "csv")
+        assert bar == t1 and run == run_b            # latest bar + the run that decided it
+        # provider-scoped: a different provider has no decision here.
+        assert last_decision_bar_across_runs(DSN, sym, "polygon") == (None, None)
+    finally:
+        with psycopg.connect(_cleanup_dsn()) as c:
+            for r in (run_a, run_b):
+                c.execute("DELETE FROM decisions WHERE run_id=%s", (r,))
+            c.commit()
+        _cleanup(sym)
+
+
+def test_downtime_gap_is_persisted_across_a_run_change_and_is_idempotent():
+    """R3-5: a real downtime gap is recorded as an APPEND-ONLY FACT (not just a log line) — with the
+    runs on either side (prev_run_id may differ: a gap ACROSS a run change), the missed-bar count,
+    and the explicit handling policy. Re-ticking the same resume does not duplicate it."""
+    from database.repository import record_downtime_gap
+
+    sym = "TST_" + os.urandom(3).hex()
+    prev_run, run = "old-" + os.urandom(3).hex(), "new-" + os.urandom(3).hex()
+    prev_close = datetime(2026, 7, 6, 14, 0, tzinfo=timezone.utc)
+    resumed = datetime(2026, 7, 6, 14, 45, tzinfo=timezone.utc)     # 14:15 + 14:30 skipped
+    try:
+        gid = record_downtime_gap(DSN, symbol=sym, provider="csv", prev_bar_close=prev_close,
+                                  prev_run_id=prev_run, resumed_bar_close=resumed, run_id=run,
+                                  missed_bars=2, policy="skip")
+        assert gid is not None
+        # Idempotent: the same resume for the same run does not create a second fact.
+        again = record_downtime_gap(DSN, symbol=sym, provider="csv", prev_bar_close=prev_close,
+                                    prev_run_id=prev_run, resumed_bar_close=resumed, run_id=run,
+                                    missed_bars=2, policy="skip")
+        assert again is None
+        with psycopg.connect(DSN) as c:
+            rows = c.execute(
+                "SELECT prev_run_id, run_id, missed_bars, policy, prev_bar_close, resumed_bar_close "
+                "FROM downtime_gaps WHERE symbol=%s", (sym,)).fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == prev_run and rows[0][1] == run     # spans a run change (continuity)
+        assert rows[0][2] == 2 and rows[0][3] == "skip"
+        assert rows[0][4] == prev_close and rows[0][5] == resumed
+    finally:
+        with psycopg.connect(_cleanup_dsn()) as c:
+            c.execute("DELETE FROM downtime_gaps WHERE symbol=%s", (sym,))
+            c.commit()
 
 
 def test_insert_llm_call_logs_success_and_failure():

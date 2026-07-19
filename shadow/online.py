@@ -42,8 +42,9 @@ from database.repository import (
     insert_evaluation,
     insert_llm_call,
     insert_spread_observation,
-    last_decision_as_of,
+    last_decision_bar_across_runs,
     open_shadow_trades,
+    record_downtime_gap,
     reserve_decision,
     upsert_shadow_trade,
     upsert_snapshot,
@@ -72,6 +73,11 @@ from shadow.virtual_broker import (
 )
 
 log = logging.getLogger(__name__)
+
+# How the online loop handles bars missed during downtime. Each tick decides only the LATEST closed
+# bar, so missed bars are SKIPPED (not replayed) — recorded explicitly per gap so the choice is
+# auditable, not implicit. A future backfill mode would record 'backfill' instead.
+DOWNTIME_POLICY = "skip"
 
 
 def _to_trade(row: dict) -> VirtualTrade:
@@ -195,16 +201,24 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     as_of = closes[-1]
     summary: dict = {"as_of": as_of.isoformat()}
 
-    # DOWNTIME CATCH-UP (visibility): each tick decides only the LATEST bar, so after downtime the
-    # bars between the last decision and now are skipped. Count and record the gap (calendar-aware,
-    # so a weekend is not a gap) — the track record is only "continuous" if this stays 0.
-    prev = last_decision_as_of(settings.db_dsn, run_id, brain_symbol, provider_name)
+    # DOWNTIME GAP (auditable POLICY, not just a log line): each tick decides only the LATEST bar,
+    # so after downtime the open-market bars between the last decision and now are SKIPPED. The gap
+    # is measured against the last decision for this SYMBOL+PROVIDER across ALL RUNS — so a gap that
+    # spans a run/config change is still seen (continuity), not reset to zero by a new run_id — and
+    # a real gap is PERSISTED as a fact (who sat on each side, how many bars, how it was handled),
+    # not merely logged. The track record is "continuous" only if downtime_gaps stays empty.
+    prev, prev_run = last_decision_bar_across_runs(settings.db_dsn, brain_symbol, provider_name)
     missed = count_missed_open_bars(prev, as_of, calendar_for(provider_name))
     if missed:
         summary["missed_bars"] = missed
-        log.warning("downtime gap: %d open-market bar(s) skipped between %s and %s (run=%s) — the "
-                    "track record is not continuous over this gap", missed,
-                    prev.isoformat() if prev else "?", as_of.isoformat(), run_id)
+        summary["downtime_policy"] = DOWNTIME_POLICY
+        record_downtime_gap(settings.db_dsn, symbol=brain_symbol, provider=provider_name,
+                            prev_bar_close=prev, prev_run_id=prev_run, resumed_bar_close=as_of,
+                            run_id=run_id, missed_bars=missed, policy=DOWNTIME_POLICY)
+        log.warning("downtime gap: %d open-market bar(s) skipped between %s and %s "
+                    "(prev_run=%s, run=%s), recorded (policy=%s) — the track record is NOT "
+                    "continuous over this gap", missed, prev.isoformat() if prev else "?",
+                    as_of.isoformat(), prev_run, run_id, DOWNTIME_POLICY)
 
     # 1) RECONCILE FIRST: close any open trade the new bars just hit, BEFORE considering a new
     #    entry — so we never stack a new position on one the same bars should have closed.
