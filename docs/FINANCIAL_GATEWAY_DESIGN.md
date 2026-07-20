@@ -12,11 +12,17 @@ persist/run_id + cap pe încercări HTTP + rezervare buget + estimare pe input r
 `shadow.runner --maker claude`, `app.decide --paid`, `app.llm_smoke` (toate cer persist+run_id);
 teste cu fake transport (refuz buget/gate/allowlist, stări timeout/error, fără apel real).
 
-**Rămâne (follow-up onest):** (a) rânduri per-încercare HTTP pentru retry-uri >1 (azi o încercare
-logică = un rând, cu estimarea care acoperă bugetul de retry; la canary attempts=1 rândul ESTE
-încercarea HTTP); (b) reconcilierea automată cu consola Anthropic (acum manuală: setezi
-`reconciled_console=true`); (c) un reconciler pentru rândurile orfane rămase la `started` (proces
-mort în timpul request-ului). Restul secțiunilor de mai jos rămân ca referință de design.
+**Follow-up-uri închise ulterior:**
+- (a) **rânduri per-încercare HTTP** pentru retry-uri >1 — FĂCUT (`d888858`): gateway-ul deține
+  bucla de retry (inner `max_retries=0`), fiecare încercare rezervă buget + scrie propriul rând.
+- (c) **reconciler pentru orfani** `started` + flux manual de reconciliere cu consola — FĂCUT
+  (`058c819`): `stale_started_attempts` / `sweep_started_attempts_to_unknown`, plus CLI
+  `python -m app.paid_report` (spend pe run/zi/lună, listă nereconciliate + orfani, `--reconcile ID`,
+  `--sweep-orphans`).
+
+**Rămâne (opțional):** (b) reconcilierea **automată** cu API-ul de usage al consolei Anthropic —
+deliberat amânată; fluxul manual acoperit de `app.paid_report` e suficient pentru canary + lot mic.
+Restul secțiunilor de mai jos rămân ca referință de design.
 
 ---
 
