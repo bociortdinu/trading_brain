@@ -1201,14 +1201,16 @@ def test_reconcile_drains_open_trades_from_a_previous_run():
         _cleanup(sym)
 
 
-def test_reconcile_skips_a_trade_frozen_under_a_different_provider():
-    """R3-2: a trade opened with polygon bars must NOT be reconciled by a csv tick — the two feeds
-    are different price series. The cross-provider trade stays OPEN (skipped as source mismatch);
-    only the same-provider trade is closed. This proves reconcile uses each trade's FROZEN provider,
-    not the current process's provider."""
+def test_reconcile_quarantines_a_trade_frozen_under_a_different_provider():
+    """R3-2 + P0-C2: a trade opened with polygon bars must NOT be reconciled by a csv tick (different
+    price series). Instead of leaving it 'open' (which would block the symbol-wide position gate
+    forever), it is QUARANTINED — removed from the gate, visible for a manual drain, NOT claimed
+    reconciled. The same-provider trade is still closed normally."""
     from core.models import Direction
     from data_collector.providers.base import Candle
-    from database.repository import upsert_shadow_trade
+    from database.repository import (
+        open_shadow_trades, quarantined_shadow_trades, upsert_shadow_trade,
+    )
     from shadow.online import reconcile_open_trades
     from shadow.reconciler import reconcile
     from shadow.virtual_broker import ShadowConfig, cost_manifest, open_virtual_trade
@@ -1232,15 +1234,21 @@ def test_reconcile_skips_a_trade_frozen_under_a_different_provider():
         tp_bar = Candle(open_time=end, close_time=end + timedelta(minutes=15),
                         open=4000, high=4030, low=3999, close=4025, volume=1.0)
         now = end + timedelta(minutes=15)
-        # A csv tick: closes ONLY the csv-frozen trade; the polygon trade is skipped, stays open.
+        # A csv tick: closes ONLY the csv-frozen trade (return counts CLOSED, not quarantined).
         assert reconcile_open_trades(DSN, [tp_bar], symbol=sym, provider_name="csv", now=now) == 1
         with psycopg.connect(DSN) as c:
-            poly_status = c.execute("SELECT status FROM trades WHERE decision_id=%s",
-                                    (poly_dec,)).fetchone()[0]
+            poly = c.execute("SELECT status, quarantine_reason, exit_price FROM trades "
+                             "WHERE decision_id=%s", (poly_dec,)).fetchone()
             csv_status = c.execute("SELECT status FROM trades WHERE decision_id=%s",
                                    (csv_dec,)).fetchone()[0]
-        assert poly_status == "open"     # cross-provider trade NOT reconciled with foreign bars
-        assert csv_status == "closed"    # same-provider trade closed normally
+        assert poly[0] == "quarantined"      # cross-provider trade removed from 'open'
+        assert poly[1] and "polygon" in poly[1] and poly[2] is None   # reason set, NOT reconciled
+        assert csv_status == "closed"        # same-provider trade closed normally
+        # The gate no longer sees the quarantined trade -> no deadlock; it stays visible for a drain.
+        assert all(t["decision_id"] != poly_dec for t in open_shadow_trades(DSN, symbol=sym))
+        assert any(t["decision_id"] == poly_dec for t in quarantined_shadow_trades(DSN, symbol=sym))
+        # Idempotent: a second csv tick does not re-quarantine or crash.
+        assert reconcile_open_trades(DSN, [tp_bar], symbol=sym, provider_name="csv", now=now) == 0
     finally:
         with psycopg.connect(_cleanup_dsn()) as c:   # facts are append-only for the app role
             c.execute("DELETE FROM trades WHERE run_id=%s", (run,))

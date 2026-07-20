@@ -44,6 +44,7 @@ from database.repository import (
     insert_spread_observation,
     last_decision_bar_across_runs,
     open_shadow_trades,
+    quarantine_shadow_trade,
     record_downtime_gap,
     reserve_decision,
     upsert_shadow_trade,
@@ -123,14 +124,23 @@ def reconcile_open_trades(dsn: str, coarse_bars: list[Candle], *, symbol: str, p
     fallback = shadow_config or ShadowConfig()
     fine_bars = fine_bars or []
     closed = 0
+    quarantined = 0
     for row in open_shadow_trades(dsn, symbol=symbol):     # ACROSS runs, not just the current one
         # FROZEN SOURCE: a trade opened under provider X must be reconciled with X's bars + calendar,
         # never the current provider's (closing a Polygon trade with XTB bars would be wrong). This
-        # tick only holds the current provider's bars, so a mismatched-source trade is left OPEN.
+        # tick only holds the current provider's bars, so a mismatched-source trade CANNOT be
+        # reconciled here. QUARANTINE it (P0-C2): move it out of 'open' so it stops blocking the
+        # symbol-wide position gate forever, WITHOUT pretending it was reconciled — it stays visible
+        # for a manual drain/migration on its own provider.
         if row.get("data_provider") and row["data_provider"] != provider_name:
-            log.warning("reconcile skipped (source mismatch): trade run=%s decision=%s opened under "
-                        "provider=%s, current provider=%s", row.get("run_id"),
-                        row.get("decision_id"), row["data_provider"], provider_name)
+            reason = (f"source mismatch: opened under provider={row['data_provider']}, current "
+                      f"process provider={provider_name}; cannot reconcile with foreign bars")
+            n = quarantine_shadow_trade(dsn, decision_id=row["decision_id"],
+                                        run_id=row["run_id"], reason=reason)
+            log.warning("reconcile QUARANTINED (source mismatch): trade run=%s decision=%s opened "
+                        "under provider=%s, current provider=%s (rows=%d)", row.get("run_id"),
+                        row.get("decision_id"), row["data_provider"], provider_name, n)
+            quarantined += n
             continue
         trade = _to_trade(row)
         trade_run_id = row["run_id"]                       # close under the trade's OWN run
@@ -161,6 +171,9 @@ def reconcile_open_trades(dsn: str, coarse_bars: list[Candle], *, symbol: str, p
                                 # a downtime-delayed observation can't be injected retroactively.
                                 observed_at=datetime.now(timezone.utc))
             closed += 1
+    if quarantined:
+        log.warning("reconcile quarantined %d cross-provider trade(s) for %s (now excluded from the "
+                    "position gate; awaiting manual drain)", quarantined, symbol)
     return closed
 
 

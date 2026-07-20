@@ -543,6 +543,44 @@ def open_shadow_trades(dsn: str, run_id: str | None = None, *, symbol: str | Non
         ).fetchall()
 
 
+def quarantine_shadow_trade(dsn: str, *, decision_id: int, run_id: str, reason: str) -> int:
+    """Move an OPEN trade into 'quarantined' — it cannot be managed by the current process (e.g. it
+    was opened under a different data provider), so it is removed from the position gate WITHOUT
+    claiming it was reconciled. Idempotent: only an 'open' row transitions (a re-tick is a no-op).
+    Returns the number of rows quarantined (0 or 1)."""
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        cur = conn.execute(
+            "UPDATE trades SET status='quarantined', quarantine_reason=%s, quarantined_at=now() "
+            "WHERE decision_id=%s AND run_id=%s AND status='open'",
+            (reason, decision_id, run_id),
+        )
+        conn.commit()
+        return cur.rowcount
+
+
+def quarantined_shadow_trades(dsn: str, symbol: str | None = None) -> list[dict]:
+    """Quarantined trades awaiting a manual drain/migration — enough to identify and resolve each.
+    Filter by `symbol` for the dashboard/operator view."""
+    import psycopg
+
+    from psycopg.rows import dict_row
+
+    where = ["t.status = 'quarantined'"]
+    params: list = []
+    if symbol is not None:
+        where.append("t.symbol = %s")
+        params.append(symbol)
+    with psycopg.connect(dsn, row_factory=dict_row) as conn:
+        return conn.execute(
+            "SELECT t.decision_id, t.run_id, t.symbol, t.opened_at, t.quarantined_at, "
+            "t.quarantine_reason, d.data_provider FROM trades t JOIN decisions d ON d.id=t.decision_id "
+            "WHERE " + " AND ".join(where) + " ORDER BY t.quarantined_at DESC",
+            tuple(params),
+        ).fetchall()
+
+
 def insert_llm_call(dsn: str, result, *, snapshot_id: int | None = None,
                     decision_id: int | None = None) -> int:
     """Audit-log one LLM call (success OR failure) with its full manifest + cost. `result`
