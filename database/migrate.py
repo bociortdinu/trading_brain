@@ -94,7 +94,7 @@ def main() -> int:
                 #   service_heartbeats    -> liveness upsert
                 #   pipeline_runs         -> run start -> finish
                 for table in ("trades", "decision_reservations", "service_heartbeats",
-                              "pipeline_runs"):
+                              "pipeline_runs", "processed_bars"):
                     conn.execute(pgsql.SQL("GRANT UPDATE, DELETE ON {} TO {}").format(
                         pgsql.Identifier(table), role))
 

@@ -777,6 +777,46 @@ def last_decision_bar_across_runs(dsn: str, symbol: str, provider: str | None = 
     return (row[0], row[1]) if row else (None, None)
 
 
+def record_processed_bar(dsn: str, *, symbol: str, provider: str, bar_close, run_id: str,
+                         outcome: str, ok: bool) -> None:
+    """Record that the online loop PROCESSED `bar_close` for this symbol+provider, with its outcome.
+    `ok` marks a cleanly-handled bar (decided / position_open / ineligible / ...) vs a failure
+    (llm_failed / error). Upsert on (symbol, provider, bar_close): the latest tick wins, so a retry
+    that succeeds can upgrade an earlier failure. This is the reference downtime is measured against,
+    so a bar the position gate skipped is still recorded as processed and is NOT seen as downtime."""
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        conn.execute(
+            """
+            INSERT INTO processed_bars (symbol, provider, bar_close, run_id, outcome, ok)
+            VALUES (%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (symbol, provider, bar_close) DO UPDATE SET
+                run_id = EXCLUDED.run_id, outcome = EXCLUDED.outcome, ok = EXCLUDED.ok,
+                processed_at = now()
+            """,
+            (symbol, provider, bar_close, run_id, outcome, ok),
+        )
+        conn.commit()
+
+
+def last_processed_bar(dsn: str, symbol: str, provider: str | None = None):
+    """(bar_close, run_id) of the most recent CLEANLY-PROCESSED (ok=true) bar for this
+    symbol+provider — the reference for downtime detection. NOT the last decision: a bar the
+    position gate skipped is still processed, so it advances this marker and is not false downtime.
+    Returns (None, None) if nothing has been processed yet."""
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        row = conn.execute(
+            "SELECT bar_close, run_id FROM processed_bars "
+            "WHERE symbol = %s AND (%s::text IS NULL OR provider = %s) AND ok "
+            "ORDER BY bar_close DESC LIMIT 1",
+            (symbol, provider, provider),
+        ).fetchone()
+    return (row[0], row[1]) if row else (None, None)
+
+
 def record_downtime_gap(dsn: str, *, symbol: str, provider: str, prev_bar_close, prev_run_id,
                         resumed_bar_close, run_id: str, missed_bars: int, policy: str) -> int | None:
     """Persist a downtime gap as an AUDITABLE FACT (append-only; not just a log line): how many

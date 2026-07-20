@@ -42,10 +42,11 @@ from database.repository import (
     insert_evaluation,
     insert_llm_call,
     insert_spread_observation,
-    last_decision_bar_across_runs,
+    last_processed_bar,
     open_shadow_trades,
     quarantine_shadow_trade,
     record_downtime_gap,
+    record_processed_bar,
     reserve_decision,
     upsert_shadow_trade,
     upsert_snapshot,
@@ -79,6 +80,40 @@ log = logging.getLogger(__name__)
 # bar, so missed bars are SKIPPED (not replayed) — recorded explicitly per gap so the choice is
 # auditable, not implicit. A future backfill mode would record 'backfill' instead.
 DOWNTIME_POLICY = "skip"
+
+# Tick outcomes that mean the bar was HANDLED cleanly (advance the downtime reference); the rest
+# ('llm_failed', 'error') are failures that must NOT advance it.
+_OK_OUTCOMES = frozenset({"decided", "position_open", "held", "already_decided",
+                          "ineligible", "prefiltered"})
+
+
+def _record_processed_and_downtime(settings: Settings, provider_name: str, run_id: str,
+                                   summary: dict) -> None:
+    """After a tick is handled: measure downtime vs the last *processed* bar (P0-C3), persist a real
+    gap, then record THIS bar in the processed-bars ledger. Only a cleanly-processed bar (`ok`)
+    counts as a resume and advances the reference; a failed bar is recorded but does not."""
+    as_of_iso = summary.get("as_of")
+    if not as_of_iso:
+        return   # no closed bar this tick (nothing processed)
+    as_of = datetime.fromisoformat(as_of_iso)
+    outcome = summary.get("outcome", "error")
+    ok = outcome in _OK_OUTCOMES
+    symbol = settings.symbol_query
+    if ok:
+        prev_proc, prev_run = last_processed_bar(settings.db_dsn, symbol, provider_name)
+        missed = count_missed_open_bars(prev_proc, as_of, calendar_for(provider_name))
+        if missed:
+            summary["missed_bars"] = missed
+            summary["downtime_policy"] = DOWNTIME_POLICY
+            record_downtime_gap(settings.db_dsn, symbol=symbol, provider=provider_name,
+                                prev_bar_close=prev_proc, prev_run_id=prev_run,
+                                resumed_bar_close=as_of, run_id=run_id, missed_bars=missed,
+                                policy=DOWNTIME_POLICY)
+            log.warning("downtime gap: %d open-market bar(s) missing before %s (prev_run=%s, "
+                        "run=%s), recorded (policy=%s) — track record NOT continuous over the gap",
+                        missed, as_of.isoformat(), prev_run, run_id, DOWNTIME_POLICY)
+    record_processed_bar(settings.db_dsn, symbol=symbol, provider=provider_name, bar_close=as_of,
+                         run_id=run_id, outcome=outcome, ok=ok)
 
 
 def _to_trade(row: dict) -> VirtualTrade:
@@ -214,24 +249,10 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     as_of = closes[-1]
     summary: dict = {"as_of": as_of.isoformat()}
 
-    # DOWNTIME GAP (auditable POLICY, not just a log line): each tick decides only the LATEST bar,
-    # so after downtime the open-market bars between the last decision and now are SKIPPED. The gap
-    # is measured against the last decision for this SYMBOL+PROVIDER across ALL RUNS — so a gap that
-    # spans a run/config change is still seen (continuity), not reset to zero by a new run_id — and
-    # a real gap is PERSISTED as a fact (who sat on each side, how many bars, how it was handled),
-    # not merely logged. The track record is "continuous" only if downtime_gaps stays empty.
-    prev, prev_run = last_decision_bar_across_runs(settings.db_dsn, brain_symbol, provider_name)
-    missed = count_missed_open_bars(prev, as_of, calendar_for(provider_name))
-    if missed:
-        summary["missed_bars"] = missed
-        summary["downtime_policy"] = DOWNTIME_POLICY
-        record_downtime_gap(settings.db_dsn, symbol=brain_symbol, provider=provider_name,
-                            prev_bar_close=prev, prev_run_id=prev_run, resumed_bar_close=as_of,
-                            run_id=run_id, missed_bars=missed, policy=DOWNTIME_POLICY)
-        log.warning("downtime gap: %d open-market bar(s) skipped between %s and %s "
-                    "(prev_run=%s, run=%s), recorded (policy=%s) — the track record is NOT "
-                    "continuous over this gap", missed, prev.isoformat() if prev else "?",
-                    as_of.isoformat(), prev_run, run_id, DOWNTIME_POLICY)
+    # DOWNTIME is detected + persisted by observed_shadow_tick AFTER this bar is fully processed
+    # (against the last *processed* bar, not the last *decision* — see P0-C3). shadow_tick only
+    # tags each exit's `outcome` so the wrapper can record this bar in the processed-bars ledger.
+    summary["outcome"] = "error"   # overwritten below at every clean exit; 'error' if we fall out
 
     # 1) RECONCILE FIRST: close any open trade the new bars just hit, BEFORE considering a new
     #    entry — so we never stack a new position on one the same bars should have closed.
@@ -254,6 +275,7 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     #    both matches single-position and blocks stacking a new run on a not-yet-drained old one.
     if open_shadow_trades(settings.db_dsn, symbol=brain_symbol):
         summary["decision"] = "skipped:position_open"
+        summary["outcome"] = "position_open"     # PROCESSED (gate respected) — NOT downtime
         return summary
 
     packet = build_packet_from_windows(
@@ -295,9 +317,11 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
                                     worker=worker)
     if claim == "held":
         summary["decision"] = "skipped:held_by_other"
+        summary["outcome"] = "held"
         return summary
     if claim == "done":
         summary["decision"] = "skipped:already_decided"
+        summary["outcome"] = "already_decided"
         return summary
 
     status, snap_id = upsert_snapshot(settings.db_dsn, packet)
@@ -305,6 +329,7 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     if snap_id is None or status == "conflict":
         complete_decision_reservation(settings.db_dsn, input_fingerprint=fingerprint, run_id=run_id,
                                       status="failed", claim_token=token)
+        summary["outcome"] = "error"     # snapshot conflict — not cleanly processed
         return summary
     # Spread + eligibility are separate append-only facts about the snapshot.
     spread_obs_id = None
@@ -325,6 +350,7 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
         complete_decision_reservation(settings.db_dsn, input_fingerprint=fingerprint, run_id=run_id,
                                       status="failed", claim_token=token)
         summary["decision"] = f"llm_failed:{record.llm_error}"
+        summary["outcome"] = "llm_failed"
         return summary
 
     inp = build_decision_input(packet, mode="online", feedback=feedback)
@@ -361,6 +387,7 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     complete_decision_reservation(settings.db_dsn, input_fingerprint=fingerprint, run_id=run_id,
                                   status="done", claim_token=token, decision_id=dec_id)
     summary["decision"] = f"{record.stage}:{record.decision.direction.value if record.decision else '-'}"
+    summary["outcome"] = "decided"
     if open_trade is not None:
         summary["opened_trade"] = "opened" if inserted else "exists"
 
@@ -393,6 +420,10 @@ async def observed_shadow_tick(settings: Settings, provider, provider_name: str,
         telemetry.heartbeat("error", error=exc,
                             details={"run_id": run_id, "operation_id": operation_id})
         raise
+    # P0-C3: downtime + processed-bar ledger, AFTER the bar was handled (not before it finalises),
+    # measured against the last *processed* bar (not the last decision) — so a bar the position gate
+    # skipped, being processed, does NOT register as downtime.
+    _record_processed_and_downtime(settings, provider_name, run_id, summary)
     telemetry.finish_run(operation_id, "success", bars_processed=int("as_of" in summary),
                          result=summary)
     telemetry.heartbeat("healthy", success=True,

@@ -1317,6 +1317,76 @@ def test_downtime_gap_is_persisted_across_a_run_change_and_is_idempotent():
             c.commit()
 
 
+def test_processed_bars_ledger_tracks_last_ok_bar_and_upserts():
+    """P0-C3: last_processed_bar returns the most recent CLEANLY-processed (ok) bar. A failed bar is
+    recorded but does NOT advance the reference, and a retry upserts the outcome in place."""
+    from database.repository import last_processed_bar, record_processed_bar
+
+    sym = "TST_" + os.urandom(3).hex()
+    run = "r-" + os.urandom(3).hex()
+    t0 = datetime(2026, 7, 6, 14, 0, tzinfo=timezone.utc)
+    t1 = datetime(2026, 7, 6, 14, 15, tzinfo=timezone.utc)
+    try:
+        record_processed_bar(DSN, symbol=sym, provider="csv", bar_close=t0, run_id=run,
+                             outcome="decided", ok=True)
+        # a FAILED later bar must not advance the 'last processed' reference
+        record_processed_bar(DSN, symbol=sym, provider="csv", bar_close=t1, run_id=run,
+                             outcome="llm_failed", ok=False)
+        assert last_processed_bar(DSN, sym, "csv") == (t0, run)     # still t0 (t1 failed)
+        # a retry of t1 succeeds -> upsert upgrades it in place; now t1 is the reference
+        record_processed_bar(DSN, symbol=sym, provider="csv", bar_close=t1, run_id=run,
+                             outcome="position_open", ok=True)
+        assert last_processed_bar(DSN, sym, "csv") == (t1, run)
+        with psycopg.connect(DSN) as c:
+            n = c.execute("SELECT count(*) FROM processed_bars WHERE symbol=%s", (sym,)).fetchone()[0]
+        assert n == 2                                              # upsert, not a duplicate
+        # provider-scoped
+        assert last_processed_bar(DSN, sym, "polygon") == (None, None)
+    finally:
+        with psycopg.connect(_cleanup_dsn()) as c:
+            c.execute("DELETE FROM processed_bars WHERE symbol=%s", (sym,))
+            c.commit()
+
+
+def test_downtime_ignores_bars_skipped_by_the_position_gate():
+    """P0-C3 (the core fix): while a position is open the gate skips DECIDING, but those bars are
+    still PROCESSED. Downtime is measured vs the last PROCESSED bar, so position-gated bars are NOT
+    false downtime. A genuine gap (no processed bar) still fires."""
+    from types import SimpleNamespace
+
+    from database.repository import record_processed_bar
+    from shadow.online import _record_processed_and_downtime
+
+    sym = "TST_" + os.urandom(3).hex()
+    run = "r-" + os.urandom(3).hex()
+    st = SimpleNamespace(db_dsn=DSN, symbol_query=sym)
+    T = [datetime(2026, 7, 6, 14, 15 * i, tzinfo=timezone.utc) for i in range(4)]  # 14:00..14:45
+    try:
+        # 14:00 decided, then 14:15 & 14:30 the gate skipped (position_open) — all PROCESSED.
+        record_processed_bar(DSN, symbol=sym, provider="csv", bar_close=T[0], run_id=run,
+                             outcome="decided", ok=True)
+        for t in (T[1], T[2]):
+            record_processed_bar(DSN, symbol=sym, provider="csv", bar_close=t, run_id=run,
+                                 outcome="position_open", ok=True)
+        # 14:45 decides again -> adjacent to the last processed (14:30) -> NO downtime.
+        _record_processed_and_downtime(st, "csv", run, {"as_of": T[3].isoformat(), "outcome": "decided"})
+        with psycopg.connect(DSN) as c:
+            gaps = c.execute("SELECT count(*) FROM downtime_gaps WHERE symbol=%s", (sym,)).fetchone()[0]
+        assert gaps == 0, "position-gated bars must NOT be reported as downtime"
+
+        # Now a GENUINE gap: last processed is 14:45; jump to 15:45 with 3 open bars missing.
+        later = datetime(2026, 7, 6, 15, 45, tzinfo=timezone.utc)
+        _record_processed_and_downtime(st, "csv", run, {"as_of": later.isoformat(), "outcome": "decided"})
+        with psycopg.connect(DSN) as c:
+            row = c.execute("SELECT missed_bars FROM downtime_gaps WHERE symbol=%s", (sym,)).fetchone()
+        assert row is not None and row[0] == 3           # 15:00/15:15/15:30 genuinely missed
+    finally:
+        with psycopg.connect(_cleanup_dsn()) as c:
+            c.execute("DELETE FROM downtime_gaps WHERE symbol=%s", (sym,))
+            c.execute("DELETE FROM processed_bars WHERE symbol=%s", (sym,))
+            c.commit()
+
+
 def test_insert_llm_call_logs_success_and_failure():
     from database.repository import insert_llm_call, upsert_snapshot
     from decision.llm_client import LlmCallResult
