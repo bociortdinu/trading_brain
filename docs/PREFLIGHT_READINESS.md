@@ -40,6 +40,25 @@ se confirmă. Retrag explicit următoarele afirmații de mai jos:
 central + P0-C1..C3 + blocantele de produs. Vezi criteriile de GO în raportul Codex §9–§11.
 Secțiunile 3–6 de mai jos rămân ca istoric, dar trebuie citite prin filtrul acestei corectări.
 
+### Stadiul remedierii (2026-07-20, post-audit)
+
+**REZOLVAT în cod, cu teste (fără push/servicii/Claude):**
+- Cost-safety pe toate CLI-urile: `BRAIN_PAID_AI_ENABLED=false` implicit; `app.decide` gratuit
+  implicit; `app.llm_smoke` + `runner --maker claude` cu poartă (`555c713`).
+- **P0-C2** deadlock: trade cross-provider → **quarantine**, nu blochează gate-ul (`7abc37c`).
+- **P0-C3** downtime fals: ledger `processed_bars`, downtime față de ultima bară **procesată**
+  (`8eaff72`).
+- **P0-C1** identitate în lookup-uri: `provider_symbol` + `pipeline_version` (`cb41d91`).
+- **Gateway financiar central** (Codex §8): bugete USD run/zi/lună (default 0), cap pe încercări
+  HTTP, allowlist de model, ledger `paid_attempts` cu rezervare atomică + audit pre-attempt, cablat
+  pe toate cele 3 entry point-uri (`318226b`). Vezi [FINANCIAL_GATEWAY_DESIGN.md](FINANCIAL_GATEWAY_DESIGN.md).
+- Teste: fără-DB **298 passed**; DB **354 passed**.
+
+**ÎNCĂ blocant pentru GO (nu ține de mine / mediu):** date istorice XAUUSD reale + înghețate;
+migrări de la zero + toate testele DB + CI remote verde; Compose live + soak XTB; rate reale GOLD;
+apoi canary de UN request cu buget mic setat explicit. Deci calea de bani e acum **sigură la nivel de
+cod**, dar rămâne **NO-GO** până se închid blocantele de produs de mai sus.
+
 ---
 
 ## 1. Scopul aplicației

@@ -1,6 +1,27 @@
-# Propunere de design: gateway financiar central pentru apeluri AI plătite
+# Design: gateway financiar central pentru apeluri AI plătite
 
-**Status:** PROPUNERE (de aprobat înainte de implementare) · **Data:** 2026-07-20
+**Status:** **IMPLEMENTAT** (commit `318226b`), cu deciziile confirmate: contabilitate derivată din
+`paid_attempts`, reconciliere manuală, plafoane default 0, allowlist doar `claude-haiku-4-5`.
+**Data:** 2026-07-20
+
+**Livrat:** `config` (allowlist, `paid_max_http_attempts`, bugete run/zi/lună USD default 0);
+migrarea `0030_paid_attempts` (ledger per-încercare, `started`→`completed/timeout/error`);
+`reserve_paid_attempt` (rezervare ATOMICĂ cu advisory lock, fail-closed) + `finalize_paid_attempt`
++ `paid_spend_summary`; `decision/paid_gateway.py` (`PaidAiGateway`: poartă + allowlist +
+persist/run_id + cap pe încercări HTTP + rezervare buget + estimare pe input real); cablat în
+`shadow.runner --maker claude`, `app.decide --paid`, `app.llm_smoke` (toate cer persist+run_id);
+teste cu fake transport (refuz buget/gate/allowlist, stări timeout/error, fără apel real).
+
+**Rămâne (follow-up onest):** (a) rânduri per-încercare HTTP pentru retry-uri >1 (azi o încercare
+logică = un rând, cu estimarea care acoperă bugetul de retry; la canary attempts=1 rândul ESTE
+încercarea HTTP); (b) reconcilierea automată cu consola Anthropic (acum manuală: setezi
+`reconciled_console=true`); (c) un reconciler pentru rândurile orfane rămase la `started` (proces
+mort în timpul request-ului). Restul secțiunilor de mai jos rămân ca referință de design.
+
+---
+
+## (istoric) Propunerea inițială
+**Data:** 2026-07-20
 **Context:** auditul Codex (§8) cere ca TOATE căile care pot cheltui la Anthropic să treacă printr-un
 singur gateway cu invariants stricte. Seed-ul e deja livrat (commit `555c713`): `BRAIN_PAID_AI_ENABLED`
 (default OFF), `require_paid_ai_enabled()` + `confirm_paid_call()`, `app.decide` free-by-default,
