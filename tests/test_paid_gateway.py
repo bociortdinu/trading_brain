@@ -184,3 +184,49 @@ def test_error_result_is_recorded_and_excluded_from_spend():
         assert paid_spend_summary(DSN, run_id)["run"] == 0.0     # 'error' rows don't count as spend
     finally:
         _cleanup(run_id)
+
+
+# --- operator reconciliation + orphan sweep -----------------------------------------------------
+def _seed_completed(run_id, cost=0.002):
+    from database.repository import finalize_paid_attempt, reserve_paid_attempt
+    aid = reserve_paid_attempt(DSN, run_id=run_id, context="test", model="claude-haiku-4-5",
+                               input_hash="h-" + os.urandom(2).hex(), attempt_no=0,
+                               est_cost_usd=0.005, budget_run_usd=1000.0, budget_day_usd=1e9,
+                               budget_month_usd=1e9)
+    finalize_paid_attempt(DSN, attempt_id=aid, status="completed", request_id="req", input_tokens=10,
+                          output_tokens=5, actual_cost_usd=cost)
+    return aid
+
+
+def test_console_reconciliation_workflow():
+    from database.repository import (
+        mark_paid_attempt_reconciled, paid_attempts_needing_reconciliation,
+    )
+    run_id = "r-rec-" + os.urandom(3).hex()
+    try:
+        aid = _seed_completed(run_id)
+        unrec = paid_attempts_needing_reconciliation(DSN, run_id)
+        assert len(unrec) == 1 and unrec[0]["id"] == aid
+        assert mark_paid_attempt_reconciled(DSN, aid) == 1
+        assert paid_attempts_needing_reconciliation(DSN, run_id) == []
+        assert mark_paid_attempt_reconciled(DSN, aid) == 0        # already reconciled -> no-op
+    finally:
+        _cleanup(run_id)
+
+
+def test_orphan_started_attempts_are_swept_to_unknown():
+    from database.repository import stale_started_attempts, sweep_started_attempts_to_unknown
+    run_id = "r-orph-" + os.urandom(3).hex()
+    try:
+        with psycopg.connect(DSN) as c:      # an OLD 'started' row (process died mid-request)
+            c.execute("INSERT INTO paid_attempts (run_id, context, model, input_hash, attempt_no, "
+                      "status, est_cost_usd, started_at) VALUES (%s,'test','claude-haiku-4-5','h',0,"
+                      "'started', 0.003, now() - interval '10 minutes')", (run_id,))
+            c.commit()
+        assert any(r["run_id"] == run_id for r in stale_started_attempts(DSN, older_than_seconds=300))
+        assert sweep_started_attempts_to_unknown(DSN, older_than_seconds=300) >= 1
+        with psycopg.connect(DSN) as c:
+            st = c.execute("SELECT status FROM paid_attempts WHERE run_id=%s", (run_id,)).fetchone()[0]
+        assert st == "unknown"               # flagged as outcome-uncertain, not silently pending
+    finally:
+        _cleanup(run_id)

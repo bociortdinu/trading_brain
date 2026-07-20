@@ -937,3 +937,70 @@ def paid_spend_summary(dsn: str, run_id: str | None = None) -> dict:
             "day": _spent("AND started_at >= date_trunc('day', now())", ()),
             "month": _spent("AND started_at >= date_trunc('month', now())", ()),
         }
+
+
+def paid_attempts_needing_reconciliation(dsn: str, run_id: str | None = None) -> list[dict]:
+    """Completed paid attempts whose cost has NOT yet been checked against the Anthropic console.
+    The operator compares each `actual_cost_usd`/tokens with the console, then marks it reconciled
+    (the GO-criterion: reconcile local vs provider before scaling up)."""
+    import psycopg
+
+    from psycopg.rows import dict_row
+
+    where = ["status = 'completed'", "reconciled_console = false"]
+    params: list = []
+    if run_id is not None:
+        where.append("run_id = %s")
+        params.append(run_id)
+    with psycopg.connect(dsn, row_factory=dict_row) as conn:
+        return conn.execute(
+            "SELECT id, run_id, context, model, request_id, input_tokens, output_tokens, "
+            "actual_cost_usd, started_at, finished_at FROM paid_attempts WHERE "
+            + " AND ".join(where) + " ORDER BY started_at",
+            tuple(params),
+        ).fetchall()
+
+
+def mark_paid_attempt_reconciled(dsn: str, attempt_id: int) -> int:
+    """Mark ONE completed attempt as reconciled with the provider console. Returns rows updated
+    (0 if the id is not a completed, not-yet-reconciled attempt)."""
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        cur = conn.execute(
+            "UPDATE paid_attempts SET reconciled_console = true "
+            "WHERE id = %s AND status = 'completed' AND reconciled_console = false",
+            (attempt_id,))
+        conn.commit()
+        return cur.rowcount
+
+
+def stale_started_attempts(dsn: str, older_than_seconds: int = 300) -> list[dict]:
+    """Attempts stuck at 'started' longer than `older_than_seconds` — a request was reserved (and
+    likely sent) but never finalized (process died mid-call). These are ORPHANS to investigate: the
+    provider may have billed them, so they must be reconciled, never assumed free."""
+    import psycopg
+
+    from psycopg.rows import dict_row
+
+    with psycopg.connect(dsn, row_factory=dict_row) as conn:
+        return conn.execute(
+            "SELECT id, run_id, context, model, est_cost_usd, started_at FROM paid_attempts "
+            "WHERE status = 'started' AND started_at < now() - make_interval(secs => %s) "
+            "ORDER BY started_at",
+            (older_than_seconds,)).fetchall()
+
+
+def sweep_started_attempts_to_unknown(dsn: str, older_than_seconds: int = 300) -> int:
+    """Move stuck 'started' orphans to 'unknown' so they are explicitly flagged as
+    outcome-uncertain (cost possibly incurred) rather than silently pending. Returns the count
+    swept. Their est_cost_usd still counts toward spend (conservative)."""
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        cur = conn.execute(
+            "UPDATE paid_attempts SET status = 'unknown', finished_at = now() "
+            "WHERE status = 'started' AND started_at < now() - make_interval(secs => %s)",
+            (older_than_seconds,))
+        conn.commit()
+        return cur.rowcount
