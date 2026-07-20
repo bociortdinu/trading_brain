@@ -50,14 +50,21 @@ Secțiunile 3–6 de mai jos rămân ca istoric, dar trebuie citite prin filtrul
   (`8eaff72`).
 - **P0-C1** identitate în lookup-uri: `provider_symbol` + `pipeline_version` (`cb41d91`).
 - **Gateway financiar central** (Codex §8): bugete USD run/zi/lună (default 0), cap pe încercări
-  HTTP, allowlist de model, ledger `paid_attempts` cu rezervare atomică + audit pre-attempt, cablat
-  pe toate cele 3 entry point-uri (`318226b`). Vezi [FINANCIAL_GATEWAY_DESIGN.md](FINANCIAL_GATEWAY_DESIGN.md).
-- Teste: fără-DB **298 passed**; DB **354 passed**.
+  HTTP (audit per-încercare), allowlist de model, ledger `paid_attempts` cu rezervare atomică +
+  audit pre-attempt, cablat pe toate cele 3 entry point-uri; + unelte de reconciliere/orfani
+  (`app.paid_report`) (`318226b`, `058c819`, `d888858`).
+  Vezi [FINANCIAL_GATEWAY_DESIGN.md](FINANCIAL_GATEWAY_DESIGN.md).
+- **Freeze de dataset reproductibil**: tabel `datasets` (hash de conținut + provenance) +
+  `dataset_id` pe snapshot (doar la replay); `app.freeze_dataset`; runul persistat își pinuiește
+  snapshoturile pe dataset (`65e9471`, `7d365b5`).
+- Teste: fără-DB **298 passed**; DB **362 passed**.
 
-**ÎNCĂ blocant pentru GO (nu ține de mine / mediu):** date istorice XAUUSD reale + înghețate;
-migrări de la zero + toate testele DB + CI remote verde; Compose live + soak XTB; rate reale GOLD;
-apoi canary de UN request cu buget mic setat explicit. Deci calea de bani e acum **sigură la nivel de
-cod**, dar rămâne **NO-GO** până se închid blocantele de produs de mai sus.
+**ÎNCĂ blocant pentru GO (majoritar mediu/operator, NU cod):** date istorice XAUUSD **reale**
+(mecanismul de freeze există acum — lipsesc datele reale de înghețat; pipeline-ul e blocat pe CoreAPI
+chart command în `trading_hands`); migrări de la zero + toate testele DB + CI remote verde; Compose
+live + soak XTB; rate reale GOLD; apoi canary de UN request cu buget mic setat explicit. Deci calea de
+bani + reproductibilitatea sunt acum **la nivel de cod gata**, dar rămâne **NO-GO** până se închid
+blocantele de produs de mai sus.
 
 ---
 
