@@ -1772,3 +1772,38 @@ def test_spread_status_tracks_a_bar_with_no_observation_yet():
         assert snapshot_spread_status(DSN, sym, bar_close, provider="csv") == (True, False)  # recovered
     finally:
         _cleanup(sym)
+
+
+def test_scheduler_lookups_are_scoped_to_the_full_source_identity():
+    """P0-C1: latest_snapshot_bar_close + snapshot_spread_status must scope to the CURRENT source's
+    provider_symbol / pipeline_version, not just provider — otherwise a stale row under an old
+    instrument mapping makes the scheduler think the current source is caught up (skipping bars) or
+    read the wrong snapshot's spread status."""
+    from database.repository import (
+        insert_spread_observation, latest_snapshot_bar_close, snapshot_spread_status,
+        upsert_snapshot,
+    )
+
+    sym = "TST_" + os.urandom(3).hex()
+    t0 = datetime(2026, 7, 6, tzinfo=timezone.utc)
+    t1 = datetime(2026, 7, 7, tzinfo=timezone.utc)      # newer, but under a DIFFERENT provider_symbol
+    try:
+        # Same symbol+provider (csv), two DIFFERENT instrument mappings; t1 is newer.
+        _, a_id = upsert_snapshot(DSN, _packet(sym, provider="csv", provider_symbol="C:XAUUSD",
+                                               end=t0, spread=None))
+        upsert_snapshot(DSN, _packet(sym, provider="csv", provider_symbol="X:XAUUSD", end=t1))
+        # latest for the C:XAUUSD source is t0, NOT t1 (which belongs to X:XAUUSD).
+        assert latest_snapshot_bar_close(DSN, sym, "csv", provider_symbol="C:XAUUSD") == t0
+        assert latest_snapshot_bar_close(DSN, sym, "csv", provider_symbol="X:XAUUSD") == t1
+        assert latest_snapshot_bar_close(DSN, sym, "csv") == t1      # unscoped mixes the mappings
+        # spread status is answered for the addressed instrument only.
+        assert snapshot_spread_status(DSN, sym, t0, provider="csv",
+                                      provider_symbol="C:XAUUSD") == (True, True)   # no spread yet
+        assert snapshot_spread_status(DSN, sym, t0, provider="csv",
+                                      provider_symbol="X:XAUUSD") == (False, False)  # not this bar
+        insert_spread_observation(DSN, snapshot_id=a_id, spread_pct=0.05,
+                                  provenance="observed_xtb", observed_at=t0)
+        assert snapshot_spread_status(DSN, sym, t0, provider="csv",
+                                      provider_symbol="C:XAUUSD") == (True, False)
+    finally:
+        _cleanup(sym)

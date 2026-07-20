@@ -25,6 +25,7 @@ from config.settings import Settings, load_settings
 from data_collector.providers.base import MarketDataProvider, only_closed, timeframe_minutes
 from data_collector.providers.factory import build_provider
 from data_collector.providers.polygon import ProviderError
+from features.version import FEATURE_PIPELINE_VERSION
 from database.repository import (
     insert_evaluation,
     insert_spread_observation,
@@ -154,7 +155,9 @@ async def catch_up(settings: Settings, provider: MarketDataProvider, provider_na
                    for tf in settings.timeframes}
 
     closes = m15_closes(windows)
-    last_done = latest_snapshot_bar_close(settings.db_dsn, brain_symbol, settings.market_data_provider)
+    last_done = latest_snapshot_bar_close(
+        settings.db_dsn, brain_symbol, settings.market_data_provider,
+        provider_symbol=provider_symbol, pipeline_version=FEATURE_PIPELINE_VERSION)
     targets = select_targets(closes, last_done, max_backfill)
     latest = closes[-1] if closes else None
 
@@ -174,8 +177,9 @@ async def catch_up(settings: Settings, provider: MarketDataProvider, provider_na
     # Retry the quote for a latest bar that is stored but still has NO spread observation.
     # Online only — same rule as above.
     if should_observe_spread(settings.market_mode, True) and latest is not None and latest not in targets:
-        exists, needs = snapshot_spread_status(settings.db_dsn, brain_symbol, latest,
-                                               provider=provider_name)
+        exists, needs = snapshot_spread_status(
+            settings.db_dsn, brain_symbol, latest, provider=provider_name,
+            provider_symbol=provider_symbol, pipeline_version=FEATURE_PIPELINE_VERSION)
         if exists and needs:
             status = await _finalize_and_store(
                 settings, windows, latest, brain_symbol=brain_symbol, provider_name=provider_name,

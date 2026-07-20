@@ -709,38 +709,50 @@ def find_shadow_trade_by_input(dsn: str, *, input_hash: str, model: str, run_id:
 
 
 def snapshot_spread_status(dsn: str, symbol: str, bar_close,
-                           provider: str | None = None) -> tuple[bool, bool]:
+                           provider: str | None = None, provider_symbol: str | None = None,
+                           pipeline_version: str | None = None) -> tuple[bool, bool]:
     """(snapshot_exists, has_no_spread_observation) — lets the ONLINE scheduler retry the XTB
     quote only for a bar that still has no contextual spread recorded. The snapshot itself is
     never mutated; a retry appends a new spread_observations row.
 
-    SOURCE-SCOPED: since a bar can now be observed by several providers (0024/0025), the caller
-    passes the CURRENT `provider` so we answer for THAT source's snapshot, never another feed's.
-    When two same-source rows exist for a bar (e.g. a pipeline upgrade), the most recent wins."""
+    SOURCE-SCOPED on the FULL identity (P0-C1): the caller passes the CURRENT
+    provider / provider_symbol / pipeline_version so we answer for exactly THIS source's snapshot —
+    not another feed's, another instrument mapping's, or an older pipeline version's row for the
+    same bar. When several matching rows exist, the most recent wins."""
     import psycopg
 
     with psycopg.connect(dsn) as conn:
         row = conn.execute(
             "SELECT s.id, EXISTS (SELECT 1 FROM spread_observations o WHERE o.snapshot_id = s.id) "
             "FROM market_snapshots s WHERE s.symbol = %s AND s.bar_close = %s "
-            "AND (%s::text IS NULL OR s.provider = %s) ORDER BY s.id DESC LIMIT 1",
-            (symbol, bar_close, provider, provider),
+            "AND (%s::text IS NULL OR s.provider = %s) "
+            "AND (%s::text IS NULL OR s.provider_symbol = %s) "
+            "AND (%s::text IS NULL OR s.pipeline_version = %s) ORDER BY s.id DESC LIMIT 1",
+            (symbol, bar_close, provider, provider, provider_symbol, provider_symbol,
+             pipeline_version, pipeline_version),
         ).fetchone()
     if row is None:
         return False, False
     return True, not row[1]
 
 
-def latest_snapshot_bar_close(dsn: str, symbol: str, provider: str | None = None):
-    """Most recent snapshot bar_close for `symbol` (optionally for one `provider` — a snapshot is
-    now source-specific, so mixing providers here would skip bars). Used to detect missed bars."""
+def latest_snapshot_bar_close(dsn: str, symbol: str, provider: str | None = None,
+                              provider_symbol: str | None = None,
+                              pipeline_version: str | None = None):
+    """Most recent snapshot bar_close for the CURRENT source (P0-C1): scoped to
+    provider / provider_symbol / pipeline_version when given, so a stale row under an old instrument
+    mapping or pipeline version can't make the scheduler think the current source is already caught
+    up (and thereby skip bars). Used to detect missed bars."""
     import psycopg
 
     with psycopg.connect(dsn) as conn:
         row = conn.execute(
             "SELECT max(bar_close) FROM market_snapshots "
-            "WHERE symbol = %s AND (%s::text IS NULL OR provider = %s)",
-            (symbol, provider, provider),
+            "WHERE symbol = %s AND (%s::text IS NULL OR provider = %s) "
+            "AND (%s::text IS NULL OR provider_symbol = %s) "
+            "AND (%s::text IS NULL OR pipeline_version = %s)",
+            (symbol, provider, provider, provider_symbol, provider_symbol,
+             pipeline_version, pipeline_version),
         ).fetchone()
     return row[0] if row and row[0] else None
 
