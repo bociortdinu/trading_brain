@@ -81,9 +81,17 @@ class Settings(BaseSettings):
     decision_max_tokens: int = Field(1024, gt=0)
     # MASTER KILL-SWITCH for PAID Anthropic calls. Default OFF: every entry point that could spend
     # money (app.decide --paid, app.llm_smoke, shadow.runner --maker claude) must fail-closed unless
-    # this is explicitly true. A configured api key alone must NEVER be sufficient to spend. This is
-    # the seed of the central financial gateway (budgets/attempt caps land on top of it).
+    # this is explicitly true. A configured api key alone must NEVER be sufficient to spend.
     paid_ai_enabled: bool = False
+    # Central financial gateway (decision/paid_gateway.py). Only a model on the allowlist may be
+    # used paid; HTTP attempts per logical decision are hard-capped (1 = no retries, for a canary);
+    # and USD budgets (per run / UTC day / UTC month) default to 0 = NOTHING permitted until you set
+    # them. Budget accounting is derived from the paid_attempts ledger.
+    paid_ai_model_allowlist: list[str] = Field(default_factory=lambda: ["claude-haiku-4-5"])
+    paid_max_http_attempts: int = Field(1, ge=1)
+    paid_budget_run_usd: float = Field(0.0, ge=0)
+    paid_budget_day_usd: float = Field(0.0, ge=0)
+    paid_budget_month_usd: float = Field(0.0, ge=0)
 
     # Shadow backtest: a MODELED spread for historical (replay) bars — we never borrow the
     # current live quote for a past bar. ~XTB gold spread observed live (~0.018-0.02%).

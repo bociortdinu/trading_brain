@@ -854,3 +854,86 @@ def record_downtime_gap(dsn: str, *, symbol: str, provider: str, prev_bar_close,
         ).fetchone()
         conn.commit()
     return row[0] if row else None
+
+
+class BudgetExceeded(RuntimeError):
+    """A paid AI attempt was refused because a USD budget (run/day/month) had no room for it."""
+
+
+_PAID_BUDGET_LOCK = 0x50A1D_B0B   # constant advisory-lock key serializing all budget reservations
+
+
+def reserve_paid_attempt(dsn: str, *, run_id: str, context: str, model: str, input_hash: str,
+                         attempt_no: int, est_cost_usd: float, budget_run_usd: float,
+                         budget_day_usd: float, budget_month_usd: float) -> int:
+    """Atomically reserve budget for ONE paid HTTP attempt and record it 'started' BEFORE the request
+    (so a timeout/crash still leaves a trace). FAIL-CLOSED: refuses (BudgetExceeded) if any window's
+    spend + this estimate would exceed its plafon — and a plafon of 0 permits NOTHING. A
+    transaction-scoped advisory lock serializes reservations across runs so two cannot both pass.
+    Spend per window = actual_cost_usd where known, else the reserved est; 'error' rows don't count.
+    Returns the new attempt id."""
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (_PAID_BUDGET_LOCK,))
+
+        def _spent(extra_sql: str, params: tuple) -> float:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(COALESCE(actual_cost_usd, est_cost_usd)), 0) "
+                "FROM paid_attempts WHERE status <> 'error' " + extra_sql, params).fetchone()
+            return float(row[0])
+
+        windows = (
+            ("run", _spent("AND run_id = %s", (run_id,)), budget_run_usd),
+            ("day", _spent("AND started_at >= date_trunc('day', now())", ()), budget_day_usd),
+            ("month", _spent("AND started_at >= date_trunc('month', now())", ()), budget_month_usd),
+        )
+        for name, spent, budget in windows:
+            if spent + est_cost_usd > budget + 1e-9:
+                conn.rollback()
+                raise BudgetExceeded(
+                    f"paid AI refused: {name} budget ${budget:.4f} has no room for ${est_cost_usd:.4f} "
+                    f"(already ${spent:.4f}). Raise BRAIN_PAID_BUDGET_{name.upper()}_USD to proceed.")
+        row = conn.execute(
+            "INSERT INTO paid_attempts (run_id, context, model, input_hash, attempt_no, status, "
+            "est_cost_usd) VALUES (%s,%s,%s,%s,%s,'started',%s) RETURNING id",
+            (run_id, context, model, input_hash, attempt_no, est_cost_usd)).fetchone()
+        conn.commit()
+        return row[0]
+
+
+def finalize_paid_attempt(dsn: str, *, attempt_id: int, status: str, request_id: str | None = None,
+                          input_tokens: int | None = None, output_tokens: int | None = None,
+                          cache_read_tokens: int | None = None, cache_write_tokens: int | None = None,
+                          actual_cost_usd: float | None = None) -> None:
+    """Close a reserved attempt with its real outcome + usage. `status` is completed/timeout/error/
+    unknown. A row left at 'started' (never finalized) is a visible orphan to reconcile."""
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        conn.execute(
+            "UPDATE paid_attempts SET status=%s, request_id=%s, input_tokens=%s, output_tokens=%s, "
+            "cache_read_tokens=%s, cache_write_tokens=%s, actual_cost_usd=%s, finished_at=now() "
+            "WHERE id=%s",
+            (status, request_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+             actual_cost_usd, attempt_id))
+        conn.commit()
+
+
+def paid_spend_summary(dsn: str, run_id: str | None = None) -> dict:
+    """USD spent (actual where known, else reserved est) over the current run/day/month — the same
+    accounting the reservation enforces, for a dashboard/operator view."""
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        def _spent(extra_sql: str, params: tuple) -> float:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(COALESCE(actual_cost_usd, est_cost_usd)), 0) "
+                "FROM paid_attempts WHERE status <> 'error' " + extra_sql, params).fetchone()
+            return float(row[0])
+
+        return {
+            "run": _spent("AND run_id = %s", (run_id,)) if run_id else None,
+            "day": _spent("AND started_at >= date_trunc('day', now())", ()),
+            "month": _spent("AND started_at >= date_trunc('month', now())", ()),
+        }

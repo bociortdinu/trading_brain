@@ -45,10 +45,16 @@ FROZEN_INPUT = DecisionInput(
 )
 
 
-async def _run(model: str, api_key: str) -> int:
-    from decision.llm_client import AnthropicDecisionMaker
+async def _run(settings, model: str) -> int:
+    from datetime import datetime, timezone
 
-    maker = AnthropicDecisionMaker(api_key, model, max_tokens=1024)
+    from decision.paid_gateway import PaidAiGateway
+
+    # Route through the central gateway so the smoke call is budgeted + audited (paid_attempts),
+    # not a bypass. A unique run_id keeps its spend isolated in the ledger.
+    run_id = f"smoke-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    maker = PaidAiGateway(settings, run_id=run_id, persist_dsn=settings.db_dsn,
+                          context="app.llm_smoke", model=model)
     try:
         res = await maker.call(FROZEN_INPUT)
     finally:
@@ -85,7 +91,7 @@ def main() -> int:
     require_paid_ai_enabled(settings, context="app.llm_smoke")
     confirm_paid_call(context="app.llm_smoke", model=model, assume_yes=args.yes,
                       extra="(one frozen request; no execution)")
-    return asyncio.run(_run(model, settings.anthropic_api_key))
+    return asyncio.run(_run(settings, model))
 
 
 if __name__ == "__main__":

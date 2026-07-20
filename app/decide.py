@@ -50,7 +50,7 @@ class DeterministicMaker:
 
 
 async def _run(settings, *, mode: str, use_paid: bool, assume_yes: bool = False,
-               all_regimes: bool = False) -> None:
+               run_id: str | None = None, all_regimes: bool = False) -> None:
     # PAID GATE FIRST — before any work. A configured key alone must not spend: --paid needs the
     # master switch (BRAIN_PAID_AI_ENABLED) and an explicit confirmation. Fails fast, no data fetch.
     if use_paid:
@@ -117,10 +117,11 @@ async def _run(settings, *, mode: str, use_paid: bool, assume_yes: bool = False,
         key_present_note(settings)
         maker, model_name = DeterministicMaker(), "deterministic-fake"
     else:
-        # Already gated + confirmed at the top of _run; here we only construct the paid maker.
-        from decision.llm_client import AnthropicDecisionMaker
-        maker = AnthropicDecisionMaker(settings.anthropic_api_key, settings.decision_model,
-                                       max_tokens=settings.decision_max_tokens)
+        # Gated + confirmed at the top of _run; the gateway adds the allowlist, budgets and the
+        # pre-attempt audit (it requires run_id + persistence).
+        from decision.paid_gateway import PaidAiGateway
+        maker = PaidAiGateway(settings, run_id=run_id, persist_dsn=settings.db_dsn,
+                              context="app.decide")
         model_name = settings.decision_model
 
     try:
@@ -175,14 +176,18 @@ def main() -> int:
     parser.add_argument("--fake", action="store_true",
                         help="(deprecated; free is already the default) deterministic maker")
     parser.add_argument("--yes", action="store_true", help="skip the paid-call confirmation (with --paid)")
+    parser.add_argument("--run-id", help="experiment id (REQUIRED with --paid; the gateway needs an "
+                                         "auditable run for budget accounting)")
     parser.add_argument("--shadow-all-regimes", action="store_true",
                         help="shadow: do not skip on regime (record all regimes)")
     args = parser.parse_args()
+    if args.paid and not args.run_id:
+        raise SystemExit("--paid requires --run-id (a paid run must be auditable).")
     settings = load_settings()
     mode = "replay" if args.replay else settings.market_mode
     # Free by default. --fake is now a no-op alias (kept for back-compat); only --paid spends.
     asyncio.run(_run(settings, mode=mode, use_paid=args.paid, assume_yes=args.yes,
-                     all_regimes=args.shadow_all_regimes))
+                     run_id=args.run_id, all_regimes=args.shadow_all_regimes))
     return 0
 
 

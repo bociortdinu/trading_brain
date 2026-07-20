@@ -457,20 +457,21 @@ def report(rows: list[dict]) -> dict:
     }
 
 
-def _build_maker(settings, kind: str):
-    """deterministic = free ConfluenceStrategy; claude = the real paid AnthropicDecisionMaker
-    (wrapped in _CountingMaker so the runner can enforce a hard call cap). Returns
-    (maker, model_name, is_paid)."""
+def _build_maker(settings, kind: str, *, run_id: str | None = None,
+                 persist_dsn: str | None = None):
+    """deterministic = free ConfluenceStrategy; claude = the paid maker behind the central financial
+    gateway (persistence + run_id + budgets required), wrapped in _CountingMaker so the runner still
+    enforces the logical call cap. Returns (maker, model_name, is_paid)."""
     if kind == "deterministic":
         return ConfluenceStrategy(), "deterministic-confluence", False
     if kind == "claude":
-        # Master gate first: a configured key is NOT sufficient to spend (BRAIN_PAID_AI_ENABLED).
-        from decision.paid_guard import require_paid_ai_enabled
-        require_paid_ai_enabled(settings, context="shadow.runner")
-        from decision.llm_client import AnthropicDecisionMaker
-        inner = AnthropicDecisionMaker(settings.anthropic_api_key, settings.decision_model,
-                                       max_tokens=settings.decision_max_tokens)
-        return _CountingMaker(inner), settings.decision_model, True
+        # The gateway enforces the master gate, the model allowlist, persistence+run_id, the
+        # HTTP-attempt cap and USD budgets (with the pre-attempt audit row). It refuses here if any
+        # invariant is unmet — no request is made.
+        from decision.paid_gateway import PaidAiGateway
+        gateway = PaidAiGateway(settings, run_id=run_id, persist_dsn=persist_dsn,
+                                context="shadow.runner")
+        return _CountingMaker(gateway), settings.decision_model, True
     raise SystemExit(f"unknown maker {kind!r} (expected deterministic|claude)")
 
 
@@ -510,7 +511,9 @@ def _confirm_paid_run(model: str, max_calls: int, max_tokens: int, assume_yes: b
 
 async def _run(settings, *, count: int, run_id: str | None, maker_kind: str = "deterministic",
                max_llm_calls: int = 50, assume_yes: bool = False, use_feedback: bool = False) -> None:
-    maker, model_name, is_paid = _build_maker(settings, maker_kind)
+    persist_dsn = settings.db_dsn if run_id else None
+    maker, model_name, is_paid = _build_maker(settings, maker_kind, run_id=run_id,
+                                              persist_dsn=persist_dsn)
     if use_feedback and not run_id:
         raise SystemExit("--feedback needs --persist (feedback is read from the run's persisted trades)")
     if is_paid:
@@ -526,6 +529,7 @@ async def _run(settings, *, count: int, run_id: str | None, maker_kind: str = "d
         aclose = getattr(provider, "aclose", None)
         if aclose:
             await aclose()
+    from database.repository import BudgetExceeded
     try:
         rows = await backtest_over_windows(
             windows, symbol=symbol, provider_name=settings.market_data_provider,
@@ -533,9 +537,13 @@ async def _run(settings, *, count: int, run_id: str | None, maker_kind: str = "d
             slippage_pct=settings.slippage_pct, model_name=model_name,
             max_llm_calls=max_llm_calls if is_paid else None,
             shadow_config=shadow_config_from_settings(settings),
-            persist_dsn=settings.db_dsn if run_id else None, run_id=run_id,
+            persist_dsn=persist_dsn, run_id=run_id,
             use_feedback=use_feedback,
         )
+    except BudgetExceeded as exc:
+        # Fail-closed: stop cleanly at the budget. Whatever was decided before this is persisted.
+        print(f"[paid run] STOPPED: {exc}")
+        return
     finally:
         # ALWAYS close the Anthropic client (even on error/cap) so we don't leak the connection.
         maker_aclose = getattr(getattr(maker, "inner", None), "aclose", None)

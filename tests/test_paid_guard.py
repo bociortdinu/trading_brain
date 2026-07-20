@@ -45,8 +45,9 @@ def test_confirm_aborts_on_no_answer_and_proceeds_on_yes(monkeypatch, capsys):
 # --- each entry point refuses when the gate is OFF (no real call) -------------------------------
 def test_runner_build_maker_refuses_claude_when_gate_off():
     from shadow.runner import _build_maker
+    # run_id + persist provided, so the refusal is specifically the master gate (not missing run_id).
     with pytest.raises(SystemExit):
-        _build_maker(_settings(enabled=False), "claude")
+        _build_maker(_settings(enabled=False), "claude", run_id="r", persist_dsn="d")
     # the free maker never touches the gate
     maker, name, is_paid = _build_maker(_settings(enabled=False), "deterministic")
     assert is_paid is False
