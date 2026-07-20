@@ -1,6 +1,7 @@
 "use strict";
 
 const $ = (selector) => document.querySelector(selector);
+const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 const state = { data: null, timer: null, loading: false };
 
 const escapeHtml = (value) => String(value ?? "")
@@ -14,6 +15,7 @@ const n = (value, digits = 2) => value === null || value === undefined
 const integer = (value) => Number(value || 0).toLocaleString("ro-RO");
 const pct = (value) => value === null || value === undefined ? "—" : `${n(Number(value) * 100, 1)}%`;
 const usd = (value) => `$${n(Number(value || 0), 4)}`;
+const sub = (text) => `<span class="cell-sub">${escapeHtml(text ?? "")}</span>`;
 
 function timeLabel(value, withDate = true) {
   if (!value) return "—";
@@ -42,16 +44,47 @@ function durationLabel(start, end) {
   return `${n(seconds / 60, 1)}m`;
 }
 
-function badge(label, tone = "neutral") {
-  return `<span class="badge ${tone}">${escapeHtml(label)}</span>`;
-}
+const badge = (label, tone = "neutral") => `<span class="badge ${tone}">${escapeHtml(label)}</span>`;
 
 function setStatusCard(id, title, main, detail, tone) {
-  $(id).className = `status-card ${tone}`;
-  $(id).innerHTML = `<div class="status-top"><span>${escapeHtml(title)}</span><i class="status-dot"></i></div>
+  const el = $(id);
+  el.className = `status-card ${tone}`;
+  el.innerHTML = `<div class="status-top"><span>${escapeHtml(title)}</span><i class="status-dot"></i></div>
     <strong>${escapeHtml(main)}</strong><small>${escapeHtml(detail)}</small>`;
 }
 
+function setChip(id, label, value, tone) {
+  const el = $(id);
+  el.className = `chip ${tone}`;
+  el.innerHTML = `<span class="chip-label">${escapeHtml(label)}</span><span class="chip-value">${escapeHtml(value)}</span>`;
+}
+
+/** Generic table filler: cols is an array of row->html cell functions. */
+function fillTable(bodyId, rows, cols, emptyMsg, onRow) {
+  const body = $(bodyId);
+  if (!rows || !rows.length) {
+    body.innerHTML = `<tr><td colspan="${cols.length}" class="empty-row">${escapeHtml(emptyMsg)}</td></tr>`;
+    return;
+  }
+  body.innerHTML = rows.map((r, i) => `<tr${onRow ? ` class="clickable" data-row="${i}"` : ""}>${
+    cols.map((c) => `<td>${c(r)}</td>`).join("")}</tr>`).join("");
+  if (onRow) body.querySelectorAll("tr[data-row]").forEach((tr) =>
+    tr.addEventListener("click", () => onRow(rows[Number(tr.dataset.row)])));
+}
+
+function setCount(id, value) { const el = $(id); if (el) el.textContent = value; }
+
+// ---------------------------------------------------------------- tabs ------
+function activateTab(name) {
+  $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === name));
+  $$(".tabpanel").forEach((p) => p.classList.toggle("active", p.id === `tab-${name}`));
+  try { localStorage.setItem("brain-tab", name); } catch { /* ignore */ }
+}
+
+$$(".tab").forEach((t) => t.addEventListener("click", () => activateTab(t.dataset.tab)));
+$$("[data-goto]").forEach((el) => el.addEventListener("click", () => activateTab(el.dataset.goto)));
+
+// ---------------------------------------------------------------- load ------
 async function loadState() {
   if (state.loading) return;
   state.loading = true;
@@ -83,17 +116,31 @@ function render(data) {
   const latest = data.latest.pipeline || {};
   const quote = hands.quote || {};
   const candlePayload = hands.candles || {};
-  const candles = candlePayload.candles || [];
   const services = data.services || [];
-  const collector = services.find((service) => service.service_name === "collector_scheduler");
+  const collector = services.find((s) => s.service_name === "collector_scheduler");
   const tradingEnabled = hands.status?.trading_enabled;
+  const alerts = data.alerts || [];
+  const criticals = alerts.filter((a) => a.severity === "critical").length;
 
+  // health strip
   const strip = $("#connection-strip");
   strip.className = `connection-strip ${hands.ok && db.ok ? "connected" : "failed"}`;
   strip.querySelector("span").textContent = hands.ok && db.ok
     ? `Sistem citibil · XTB ${hands.status?.environment || "—"} · actualizat ${timeLabel(data.generated_at, false)}`
     : `Atenție: ${!hands.ok ? "XTB deconectat" : ""} ${!db.ok ? "DB indisponibil" : ""}`;
+  setChip("#chip-xtb", "XTB", hands.ok ? (tradingEnabled === true ? "ORDINE ACTIVE" : "conectat") : "deconectat",
+    !hands.ok || tradingEnabled === true ? "bad" : "ok");
+  setChip("#chip-market", "Piață", data.runtime.market_open === true ? "deschisă"
+    : data.runtime.market_open === false ? "închisă" : "necunoscută",
+    data.runtime.market_open === true ? "ok" : "neutral");
+  setChip("#chip-brain", "Brain", collector ? String(collector.status) : "oprit",
+    collector?.status === "healthy" ? "ok" : collector?.status === "degraded" ? "warn" : "bad");
+  setChip("#chip-db", "DB", db.ok ? (db.schema_version || "ok") : "indisponibil",
+    db.ok && db.schema_current ? "ok" : "bad");
+  setChip("#chip-alerts", "Alerte", criticals ? `${criticals} critice` : `${alerts.length}`,
+    criticals ? "bad" : alerts.length ? "warn" : "ok");
 
+  // detailed status cards (Prezentare)
   setStatusCard("#status-xtb", "XTB CoreAPI", hands.ok ? "Conectat" : "Deconectat",
     hands.status ? `${hands.status.environment} · ordine ${tradingEnabled === false ? "DEZACTIVATE" : tradingEnabled === true ? "ACTIVE" : "NECUNOSCUT"}` : (hands.error || "fără răspuns"),
     !hands.ok || tradingEnabled === true ? "bad" : tradingEnabled === false ? "ok" : "warn");
@@ -109,16 +156,32 @@ function render(data) {
     db.ok ? `${db.schema_version} · ${db.latency_ms} ms` : (db.error || "eroare"),
     db.ok && db.schema_current ? "ok" : "bad");
 
-  renderAlerts(data.alerts || []);
+  renderAlerts(alerts);
   renderQuote(data.selection.symbol, quote, candlePayload, latestMarket, data.runtime.provider, data.timeline);
   renderMetrics(data.summary || {}, data.selection.run_id);
   renderPipeline(latest);
-  renderServices(services);
-  renderPipelineRuns(data.pipeline_runs || []);
+
   renderTimeline(data.timeline || []);
   renderOpenTrades(data.open_trades || []);
+  renderQuarantined(data.quarantined_trades || []);
+  renderClosedTrades(data.closed_trades || []);
   renderRuns(data.runs || [], data.selection.run_id);
+  renderDatasets(data.datasets || []);
+  renderPaid(data.runtime.paid_ai || {}, data.paid_spend || {}, data.paid_attempts || []);
   renderLlm(data.llm_calls || []);
+  renderServices(services);
+  renderPipelineRuns(data.pipeline_runs || []);
+  renderReservations(data.reservations || []);
+  renderDowntime(data.downtime_gaps || []);
+  renderProcessed(data.processed_bars || []);
+  renderDbTables(data.db_tables || [], db);
+  renderConflicts(data.snapshot_conflicts || []);
+
+  // tab counters
+  setCount("#count-timeline", (data.timeline || []).length);
+  setCount("#count-trades", (data.open_trades || []).length + (data.quarantined_trades || []).length);
+  setCount("#count-runs", (data.runs || []).length);
+  setCount("#count-paid", (data.paid_attempts || []).length);
 
   const gitState = git.state || (git.ok ? (git.dirty ? "dirty" : "clean") : "unknown");
   const gitLabel = { dirty: " · DIRTY", clean: " · clean", unknown: " · provenance UNKNOWN" }[gitState] || " · unknown";
@@ -188,42 +251,6 @@ function renderMetrics(summary, runId) {
   $("#metric-llm-calls").textContent = `${integer(summary.llm_calls)} apeluri auditate`;
 }
 
-function renderServices(rows) {
-  $("#services-count").textContent = rows.length;
-  const body = $("#services-body");
-  if (!rows.length) return body.innerHTML = `<tr><td colspan="5" class="empty-row">Niciun serviciu nu a emis heartbeat.</td></tr>`;
-  body.innerHTML = rows.map((row) => {
-    const tone = row.status === "healthy" ? "ok" : row.status === "degraded" ? "warn" : row.status === "stopped" ? "neutral" : "bad";
-    return `<tr>
-      <td><span class="cell-main">${escapeHtml(row.service_name)}</span><span class="cell-sub">${escapeHtml(row.instance_id)}</span></td>
-      <td>${badge(row.status, tone)}<span class="cell-sub">${escapeHtml(row.last_error || "")}</span></td>
-      <td>${timeLabel(row.last_seen_at)}<span class="cell-sub">${ageLabel(row.last_seen_at)}</span></td>
-      <td>${row.next_wake_at ? timeLabel(row.next_wake_at) : "—"}</td>
-      <td>${escapeHtml(row.git_commit || "—")}</td>
-    </tr>`;
-  }).join("");
-}
-
-function renderPipelineRuns(rows) {
-  $("#pipeline-runs-count").textContent = rows.length;
-  const body = $("#pipeline-runs-body");
-  if (!rows.length) return body.innerHTML = `<tr><td colspan="5" class="empty-row">Niciun tick auditat.</td></tr>`;
-  body.innerHTML = rows.slice(0, 30).map((row) => {
-    const tone = row.status === "success" ? "ok" : row.status === "running" ? "warn" : row.status === "cancelled" ? "neutral" : "bad";
-    return `<tr class="clickable" data-operation-id="${row.id}">
-      <td>${timeLabel(row.started_at)}<span class="cell-sub">#${row.id}</span></td>
-      <td><span class="cell-main">${escapeHtml(row.service_name)}</span><span class="cell-sub">${escapeHtml(row.run_kind)}</span></td>
-      <td>${badge(row.status, tone)}<span class="cell-sub">${escapeHtml(row.error_type || "")}</span></td>
-      <td>${integer(row.bars_processed)}</td>
-      <td>${durationLabel(row.started_at, row.finished_at)}</td>
-    </tr>`;
-  }).join("");
-  body.querySelectorAll("tr[data-operation-id]").forEach((tr) => tr.addEventListener("click", () => {
-    const row = rows.find((item) => String(item.id) === tr.dataset.operationId);
-    showDialog(`Execuție #${row.id}`, row);
-  }));
-}
-
 function step(index, title, main, detail, tone = "neutral") {
   return `<article class="pipeline-step ${tone}"><span class="step-index">0${index}</span>
     <h3>${escapeHtml(title)}</h3><strong>${escapeHtml(main)}</strong><p>${escapeHtml(detail)}</p></article>`;
@@ -257,71 +284,201 @@ function renderPipeline(row) {
 }
 
 function renderTimeline(rows) {
-  const body = $("#timeline-body");
-  if (!rows.length) return body.innerHTML = `<tr><td colspan="8" class="empty-row">Nicio bară pentru filtrul selectat.</td></tr>`;
-  body.innerHTML = rows.map((row, index) => {
-    const elig = row.eligible === true ? badge("eligibil", "ok") : row.eligible === false ? badge("blocat", "warn") : badge("—");
-    const risk = row.risk_verdict === "approved" ? badge("aprobat", "ok") : row.risk_verdict === "rejected" ? badge("respins", "warn") : badge("—");
-    const trade = row.trade_status ? badge(row.trade_status, row.trade_status === "closed" ? "neutral" : "warn") : badge("fără trade");
-    const r = row.r_multiple === null || row.r_multiple === undefined ? "—" : `${Number(row.r_multiple) > 0 ? "+" : ""}${n(row.r_multiple, 3)}`;
-    return `<tr class="clickable" data-timeline-index="${index}">
-      <td><span class="cell-main">${escapeHtml(timeLabel(row.bar_close))}</span><span class="cell-sub">snap #${row.snapshot_id}</span></td>
-      <td>${escapeHtml(n(row.price, 2))}<span class="cell-sub">spread ${n(row.spread_pct, 4)}%</span></td>
-      <td><span class="cell-main">${escapeHtml(row.regime || "—")}</span><span class="cell-sub">${escapeHtml(row.confluence || "—")}</span></td>
-      <td>${elig}<span class="cell-sub">${escapeHtml((row.eligibility_reasons || []).join(", "))}</span></td>
-      <td><span class="cell-main">${escapeHtml(row.direction || "—")} ${row.confidence !== null ? n(row.confidence, 2) : ""}</span><span class="cell-sub">${escapeHtml(row.model || "—")}</span></td>
-      <td>${risk}<span class="cell-sub">${escapeHtml(row.risk_reason || row.blocked_reason || "")}</span></td>
-      <td>${trade}<span class="cell-sub">${escapeHtml(row.exit_reason || row.side || "")}</span></td>
-      <td class="${Number(row.r_multiple) > 0 ? "positive" : Number(row.r_multiple) < 0 ? "negative" : ""}">${escapeHtml(r)}</td>
-    </tr>`;
-  }).join("");
-  body.querySelectorAll("tr[data-timeline-index]").forEach((tr) => tr.addEventListener("click", () => {
-    const row = rows[Number(tr.dataset.timelineIndex)];
-    showDialog(`Snapshot #${row.snapshot_id}`, row);
-  }));
+  fillTable("#timeline-body", rows, [
+    (r) => `<span class="cell-main">${escapeHtml(timeLabel(r.bar_close))}</span>${sub(`snap #${r.snapshot_id}`)}`,
+    (r) => `${escapeHtml(n(r.price, 2))}${sub(`spread ${n(r.spread_pct, 4)}%`)}`,
+    (r) => `<span class="cell-main">${escapeHtml(r.regime || "—")}</span>${sub(r.confluence || "—")}`,
+    (r) => `${r.eligible === true ? badge("eligibil", "ok") : r.eligible === false ? badge("blocat", "warn") : badge("—")}${sub((r.eligibility_reasons || []).join(", "))}`,
+    (r) => `<span class="cell-main">${escapeHtml(r.direction || "—")} ${r.confidence !== null && r.confidence !== undefined ? n(r.confidence, 2) : ""}</span>${sub(r.model || "—")}`,
+    (r) => `${r.risk_verdict === "approved" ? badge("aprobat", "ok") : r.risk_verdict === "rejected" ? badge("respins", "warn") : badge("—")}${sub(r.risk_reason || r.blocked_reason || "")}`,
+    (r) => `${r.trade_status ? badge(r.trade_status, r.trade_status === "closed" ? "neutral" : "warn") : badge("fără trade")}${sub(r.exit_reason || r.side || "")}`,
+    (r) => rCell(r.r_multiple),
+  ], "Nicio bară pentru filtrul selectat.", (r) => showDialog(`Snapshot #${r.snapshot_id}`, r));
 }
 
+const rCell = (r) => {
+  if (r === null || r === undefined) return "—";
+  const cls = Number(r) > 0 ? "positive" : Number(r) < 0 ? "negative" : "";
+  return `<span class="${cls}">${Number(r) > 0 ? "+" : ""}${n(r, 3)}</span>`;
+};
+
 function renderOpenTrades(rows) {
-  $("#open-count").textContent = rows.length;
-  const body = $("#open-trades-body");
-  if (!rows.length) return body.innerHTML = `<tr><td colspan="6" class="empty-row">Nicio poziție shadow deschisă.</td></tr>`;
-  body.innerHTML = rows.map((row) => `<tr>
-    <td><span class="cell-main">${escapeHtml(row.run_id || "—")}</span><span class="cell-sub">#${row.id} · ${escapeHtml(row.validity)}</span></td>
-    <td>${badge(row.side, row.side === "buy" ? "ok" : "warn")}</td>
-    <td>${n(row.entry_price, 2)}<span class="cell-sub">acum ${n(row.current_mid, 2)}</span></td>
-    <td class="${Number(row.unrealized_r_gross) >= 0 ? "positive" : "negative"}">${row.unrealized_r_gross === null || row.unrealized_r_gross === undefined ? "—" : `${Number(row.unrealized_r_gross) >= 0 ? "+" : ""}${n(row.unrealized_r_gross, 3)}R`}<span class="cell-sub">indicativ, brut</span></td>
-    <td>${n(row.sl_price, 2)} / ${n(row.tp_price, 2)}<span class="cell-sub">distanță ${n(row.distance_to_sl_pct, 3)}% / ${n(row.distance_to_tp_pct, 3)}%</span></td>
-    <td>${row.timeout_at_estimate ? timeLabel(row.timeout_at_estimate) : "—"}<span class="cell-sub">deschis ${ageLabel(row.opened_at)}</span></td>
-  </tr>`).join("");
+  setCount("#open-count", rows.length);
+  fillTable("#open-trades-body", rows, [
+    (r) => `<span class="cell-main">${escapeHtml(r.run_id || "—")}</span>${sub(`#${r.id} · ${r.validity}`)}`,
+    (r) => badge(r.side, r.side === "buy" ? "ok" : "warn"),
+    (r) => `${n(r.entry_price, 2)}${sub(`acum ${n(r.current_mid, 2)}`)}`,
+    (r) => `${r.unrealized_r_gross === null || r.unrealized_r_gross === undefined ? "—" : `<span class="${Number(r.unrealized_r_gross) >= 0 ? "positive" : "negative"}">${Number(r.unrealized_r_gross) >= 0 ? "+" : ""}${n(r.unrealized_r_gross, 3)}R</span>`}${sub("indicativ, brut")}`,
+    (r) => `${n(r.sl_price, 2)} / ${n(r.tp_price, 2)}${sub(`distanță ${n(r.distance_to_sl_pct, 3)}% / ${n(r.distance_to_tp_pct, 3)}%`)}`,
+    (r) => `${r.timeout_at_estimate ? timeLabel(r.timeout_at_estimate) : "—"}${sub(`deschis ${ageLabel(r.opened_at)}`)}`,
+  ], "Nicio poziție shadow deschisă.");
+}
+
+function renderQuarantined(rows) {
+  setCount("#quarantined-count", rows.length);
+  fillTable("#quarantined-body", rows, [
+    (r) => `<span class="cell-main">${escapeHtml(r.run_id || "—")}</span>${sub(`#${r.id}`)}`,
+    (r) => badge(r.side, r.side === "buy" ? "ok" : "warn"),
+    (r) => n(r.entry_price, 2),
+    (r) => badge(r.data_provider || "—", "warn"),
+    (r) => `<span class="cell-sub wrap">${escapeHtml(r.quarantine_reason || "")}</span>`,
+    (r) => `${timeLabel(r.quarantined_at)}${sub(ageLabel(r.quarantined_at))}`,
+  ], "Niciun trade în carantină.");
+}
+
+function renderClosedTrades(rows) {
+  setCount("#closed-count", rows.length);
+  fillTable("#closed-trades-body", rows, [
+    (r) => `<span class="cell-main">${escapeHtml(r.run_id || "—")}</span>${sub(`#${r.id}`)}`,
+    (r) => badge(r.side, r.side === "buy" ? "ok" : "warn"),
+    (r) => `${n(r.entry_price, 2)} → ${n(r.exit_price, 2)}`,
+    (r) => `${badge(r.status, r.status === "expired" ? "neutral" : "ok")}${sub(r.exit_reason || "")}${r.ambiguous ? sub("ambiguu") : ""}`,
+    (r) => rCell(r.r_multiple),
+    (r) => `${timeLabel(r.closed_at)}${sub(ageLabel(r.closed_at))}`,
+  ], "Niciun trade închis pentru filtrul selectat.");
 }
 
 function renderRuns(rows, selected) {
-  $("#runs-count").textContent = rows.length;
+  setCount("#runs-count", rows.length);
   const body = $("#runs-body");
-  if (!rows.length) return body.innerHTML = `<tr><td colspan="6" class="empty-row">Niciun experiment persistat.</td></tr>`;
+  if (!rows.length) { body.innerHTML = `<tr><td colspan="6" class="empty-row">Niciun experiment persistat.</td></tr>`; return; }
   body.innerHTML = rows.map((row) => `<tr class="clickable ${row.run_id === selected ? "selected" : ""}" data-run="${escapeHtml(row.run_id)}">
-    <td><span class="cell-main">${escapeHtml(row.run_id)}</span><span class="cell-sub">${timeLabel(row.last_decision || row.last_trade)}</span></td>
-    <td>${badge(row.validity, row.validity === "verified" ? "ok" : "warn")}<span class="cell-sub">${escapeHtml(row.run_kind)} · ${escapeHtml(row.validity_reason || "")}</span></td>
+    <td><span class="cell-main">${escapeHtml(row.run_id)}</span>${sub(timeLabel(row.last_decision || row.last_trade))}</td>
+    <td>${badge(row.validity, row.validity === "verified" ? "ok" : "warn")}${sub(`${row.run_kind} · ${row.validity_reason || ""}`)}</td>
     <td>${escapeHtml(row.model || "—")}</td><td>${integer(row.decisions)}</td>
-    <td>${integer(row.trades)}<span class="cell-sub">${integer(row.open_trades)} open</span></td>
-    <td class="${Number(row.expectancy_r) >= 0 ? "positive" : "negative"}">${row.expectancy_r === null ? "—" : `${n(row.expectancy_r, 3)}R`}</td>
-  </tr>`).join("");
+    <td>${integer(row.trades)}${sub(`${integer(row.open_trades)} open`)}</td>
+    <td>${rCell(row.expectancy_r)}</td></tr>`).join("");
   body.querySelectorAll("tr[data-run]").forEach((tr) => tr.addEventListener("click", () => {
     $("#run-filter").value = tr.dataset.run;
     loadState();
   }));
 }
 
+function renderDatasets(rows) {
+  setCount("#datasets-count", rows.length);
+  fillTable("#datasets-body", rows, [
+    (r) => `<span class="cell-main mono">${escapeHtml(r.dataset_id)}</span>${sub(`v${r.pipeline_version || "?"}`)}`,
+    (r) => `<span class="cell-main">${escapeHtml(r.provider || "—")}</span>${sub(r.source || r.provider_symbol || "")}`,
+    (r) => escapeHtml((r.timeframes || []).join(", ")),
+    (r) => escapeHtml(Object.values(r.bar_counts || {}).reduce((a, b) => a + Number(b), 0) || "—"),
+    (r) => `${timeLabel(r.first_bar)}${sub(`→ ${timeLabel(r.last_bar)}`)}`,
+    (r) => `${timeLabel(r.frozen_at)}${sub(ageLabel(r.frozen_at))}`,
+  ], "Niciun dataset înghețat.", (r) => showDialog(`Dataset ${r.dataset_id}`, r));
+}
+
+function renderPaid(config, spend, attempts) {
+  const budgetCard = (id, title, spent, budget) => {
+    const over = budget > 0 && spent > budget;
+    setStatusCard(id, title, usd(spent),
+      budget > 0 ? `din $${n(budget, 2)}` : "buget 0 (nimic permis)",
+      over ? "bad" : budget > 0 && spent > 0 ? "warn" : "ok");
+  };
+  budgetCard("#budget-run", "Spend run", Number(spend.run || 0), Number(config.budget_run || 0));
+  budgetCard("#budget-day", "Spend azi (UTC)", Number(spend.day || 0), Number(config.budget_day || 0));
+  budgetCard("#budget-month", "Spend lună (UTC)", Number(spend.month || 0), Number(config.budget_month || 0));
+  setStatusCard("#budget-orphans", "Paid AI",
+    config.enabled ? "ACTIV" : "OPRIT",
+    `${integer(spend.orphans || 0)} orfani · ${integer(spend.unreconciled || 0)} nereconciliate · model ${config.model || "—"}`,
+    config.enabled ? (Number(spend.orphans || 0) ? "bad" : "warn") : "ok");
+
+  setCount("#paid-count", attempts.length);
+  fillTable("#paid-body", attempts, [
+    (r) => `${timeLabel(r.started_at)}${sub(ageLabel(r.started_at))}`,
+    (r) => `<span class="cell-main">${escapeHtml(r.run_id || "—")}</span>${sub(r.context || "")}`,
+    (r) => escapeHtml(r.model || "—"),
+    (r) => badge(r.status, r.status === "completed" ? "ok" : r.status === "started" ? "warn"
+      : r.status === "timeout" || r.status === "unknown" ? "warn" : "bad"),
+    (r) => `${integer(r.input_tokens)} / ${integer(r.output_tokens)}`,
+    (r) => r.actual_cost_usd != null ? usd(r.actual_cost_usd) : `${sub(`est ${usd(r.est_cost_usd)}`)}`,
+    (r) => r.reconciled_console ? badge("da", "ok") : r.status === "completed" ? badge("de reconciliat", "warn") : "—",
+  ], "Niciun apel plătit înregistrat.", (r) => showDialog(`Paid attempt #${r.id}`, r));
+}
+
 function renderLlm(rows) {
-  const body = $("#llm-body");
-  if (!rows.length) return body.innerHTML = `<tr><td colspan="8" class="empty-row">Niciun apel LLM auditat pentru simbolul selectat.</td></tr>`;
-  body.innerHTML = rows.map((row) => `<tr>
-    <td>${timeLabel(row.ts)}</td><td><span class="cell-main">${escapeHtml(row.requested_model)}</span><span class="cell-sub">${escapeHtml(row.effective_model || "—")}</span></td>
-    <td>${row.ok ? badge("OK", "ok") : badge(row.error || "FAIL", "bad")}</td>
-    <td>${integer(row.input_tokens)} / ${integer(row.output_tokens)}</td>
-    <td>${integer(row.cache_read_tokens)} / ${integer(row.cache_creation_tokens)}</td>
-    <td>${integer(row.retry_count)}</td><td>${integer(row.latency_ms)} ms</td><td>${usd(row.estimated_cost_usd)}</td>
-  </tr>`).join("");
+  fillTable("#llm-body", rows, [
+    (r) => timeLabel(r.ts),
+    (r) => `<span class="cell-main">${escapeHtml(r.requested_model)}</span>${sub(r.effective_model || "—")}`,
+    (r) => r.ok ? badge("OK", "ok") : badge(r.error || "FAIL", "bad"),
+    (r) => `${integer(r.input_tokens)} / ${integer(r.output_tokens)}`,
+    (r) => `${integer(r.cache_read_tokens)} / ${integer(r.cache_creation_tokens)}`,
+    (r) => integer(r.retry_count),
+    (r) => `${integer(r.latency_ms)} ms`,
+    (r) => usd(r.estimated_cost_usd),
+  ], "Niciun apel LLM auditat pentru simbolul selectat.");
+}
+
+function renderServices(rows) {
+  setCount("#services-count", rows.length);
+  fillTable("#services-body", rows, [
+    (r) => `<span class="cell-main">${escapeHtml(r.service_name)}</span>${sub(r.instance_id)}`,
+    (r) => `${badge(r.status, r.status === "healthy" ? "ok" : r.status === "degraded" ? "warn" : r.status === "stopped" ? "neutral" : "bad")}${sub(r.last_error || "")}`,
+    (r) => `${timeLabel(r.last_seen_at)}${sub(ageLabel(r.last_seen_at))}`,
+    (r) => r.next_wake_at ? timeLabel(r.next_wake_at) : "—",
+    (r) => escapeHtml(r.git_commit || "—"),
+  ], "Niciun serviciu nu a emis heartbeat.");
+}
+
+function renderPipelineRuns(rows) {
+  setCount("#pipeline-runs-count", rows.length);
+  fillTable("#pipeline-runs-body", rows.slice(0, 40), [
+    (r) => `${timeLabel(r.started_at)}${sub(`#${r.id}`)}`,
+    (r) => `<span class="cell-main">${escapeHtml(r.service_name)}</span>${sub(r.run_kind)}`,
+    (r) => `${badge(r.status, r.status === "success" ? "ok" : r.status === "running" ? "warn" : r.status === "cancelled" ? "neutral" : "bad")}${sub(r.error_type || "")}`,
+    (r) => integer(r.bars_processed),
+    (r) => durationLabel(r.started_at, r.finished_at),
+  ], "Niciun tick auditat.", (r) => showDialog(`Execuție #${r.id}`, r));
+}
+
+function renderReservations(rows) {
+  setCount("#reservations-count", rows.length);
+  fillTable("#reservations-body", rows, [
+    (r) => escapeHtml(r.run_id || "—"),
+    (r) => badge(r.status, r.status === "in_progress" ? "warn" : "neutral"),
+    (r) => escapeHtml(r.worker || "—"),
+    (r) => timeLabel(r.reserved_at),
+    (r) => `${timeLabel(r.lease_expires_at)}${sub(ageLabel(r.lease_expires_at))}`,
+  ], "Nicio rezervare activă.");
+}
+
+function renderDowntime(rows) {
+  setCount("#downtime-count", rows.length);
+  fillTable("#downtime-body", rows, [
+    (r) => `<span class="cell-main">${escapeHtml(timeLabel(r.resumed_bar_close))}</span>${sub(`de la ${timeLabel(r.prev_bar_close)}`)}`,
+    (r) => `<span class="cell-main">${integer(r.missed_bars)}</span>`,
+    (r) => badge(r.policy || "—", "neutral"),
+    (r) => `${escapeHtml(r.prev_run_id || "—")}${sub(`→ ${r.run_id || "—"}`)}`,
+    (r) => `${timeLabel(r.detected_at)}${sub(ageLabel(r.detected_at))}`,
+  ], "Niciun gol de downtime înregistrat.");
+}
+
+function renderProcessed(rows) {
+  setCount("#processed-count", rows.length);
+  fillTable("#processed-body", rows, [
+    (r) => escapeHtml(timeLabel(r.bar_close)),
+    (r) => escapeHtml(r.provider || "—"),
+    (r) => escapeHtml(r.run_id || "—"),
+    (r) => badge(r.outcome, r.outcome === "decided" ? "ok" : r.ok ? "neutral" : "bad"),
+    (r) => r.ok ? badge("da", "ok") : badge("nu", "bad"),
+    (r) => `${timeLabel(r.processed_at)}${sub(ageLabel(r.processed_at))}`,
+  ], "Nicio bară procesată înregistrată.");
+}
+
+function renderDbTables(rows, db) {
+  $("#db-schema").textContent = db.ok ? `${db.schema_version || "—"} · ${db.tables || 0} tabele` : "DB indisponibil";
+  fillTable("#db-tables-body", rows, [
+    (r) => `<span class="cell-main mono">${escapeHtml(r.name)}</span>`,
+    (r) => integer(r.approx_rows),
+  ], "Fără tabele.");
+}
+
+function renderConflicts(rows) {
+  setCount("#conflicts-count", rows.length);
+  fillTable("#conflicts-body", rows, [
+    (r) => escapeHtml(timeLabel(r.bar_close)),
+    (r) => `${escapeHtml(r.existing_provider || "—")}${sub(r.existing_pipeline_version || "")}`,
+    (r) => `${escapeHtml(r.incoming_provider || "—")}${sub(r.incoming_pipeline_version || "")}`,
+    (r) => `${timeLabel(r.ts)}${sub(ageLabel(r.ts))}`,
+  ], "Niciun conflict de snapshot.");
 }
 
 function populateRunFilter(runs, selected) {
@@ -351,5 +508,6 @@ $("#show-latest-json").addEventListener("click", () => state.data?.latest?.pipel
 $("#close-dialog").addEventListener("click", () => $("#detail-dialog").close());
 $("#detail-dialog").addEventListener("click", (event) => { if (event.target === $("#detail-dialog")) $("#detail-dialog").close(); });
 
+try { const saved = localStorage.getItem("brain-tab"); if (saved) activateTab(saved); } catch { /* ignore */ }
 loadState();
 restartTimer();

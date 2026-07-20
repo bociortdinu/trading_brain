@@ -9,6 +9,7 @@
 </head>
 <body>
   <div class="noise" aria-hidden="true"></div>
+
   <header class="topbar">
     <div class="brand">
       <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
@@ -18,183 +19,278 @@
       </div>
     </div>
     <div class="controls">
-      <label>
-        <span>Simbol</span>
-        <input id="symbol-input" value="GOLD" maxlength="20" autocomplete="off">
-      </label>
-      <label>
-        <span>Experiment</span>
-        <select id="run-filter"><option value="">Toate run-urile</option></select>
-      </label>
-      <label class="toggle-control">
-        <span>Auto-refresh</span>
-        <input id="auto-refresh" type="checkbox" checked>
-        <i aria-hidden="true"></i>
-      </label>
+      <label><span>Simbol</span>
+        <input id="symbol-input" value="GOLD" maxlength="20" autocomplete="off"></label>
+      <label><span>Experiment</span>
+        <select id="run-filter"><option value="">Toate run-urile</option></select></label>
+      <label class="toggle-control"><span>Auto-refresh</span>
+        <input id="auto-refresh" type="checkbox" checked><i aria-hidden="true"></i></label>
       <button id="refresh-button" class="primary-button" type="button">
-        <span class="refresh-icon" aria-hidden="true">↻</span> Actualizează
-      </button>
+        <span class="refresh-icon" aria-hidden="true">↻</span> Actualizează</button>
     </div>
   </header>
 
+  <!-- Always-visible health strip: connection + compact status chips + alert count -->
+  <div class="healthbar" aria-live="polite">
+    <section id="connection-strip" class="connection-strip">
+      <div class="pulse"></div><span>Se încarcă starea sistemului…</span>
+    </section>
+    <div class="health-chips">
+      <button class="chip" id="chip-xtb" data-goto="prezentare" type="button"></button>
+      <button class="chip" id="chip-market" data-goto="prezentare" type="button"></button>
+      <button class="chip" id="chip-brain" data-goto="operational" type="button"></button>
+      <button class="chip" id="chip-db" data-goto="baza-de-date" type="button"></button>
+      <button class="chip alert-chip" id="chip-alerts" data-goto="prezentare" type="button"></button>
+    </div>
+  </div>
+
+  <nav class="tabbar" role="tablist" aria-label="Secțiuni dashboard">
+    <button class="tab active" data-tab="prezentare" role="tab">Prezentare</button>
+    <button class="tab" data-tab="decizii" role="tab">Decizii <span class="tab-count" id="count-timeline"></span></button>
+    <button class="tab" data-tab="tradeuri" role="tab">Trade-uri <span class="tab-count" id="count-trades"></span></button>
+    <button class="tab" data-tab="experimente" role="tab">Experimente <span class="tab-count" id="count-runs"></span></button>
+    <button class="tab" data-tab="ai-cost" role="tab">AI &amp; Cost <span class="tab-count" id="count-paid"></span></button>
+    <button class="tab" data-tab="operational" role="tab">Operațional</button>
+    <button class="tab" data-tab="baza-de-date" role="tab">Bază de date</button>
+  </nav>
+
   <main>
-    <section id="connection-strip" class="connection-strip" aria-live="polite">
-      <div class="pulse"></div>
-      <span>Se încarcă starea sistemului…</span>
-    </section>
+    <!-- ============================ PREZENTARE ============================ -->
+    <section class="tabpanel active" id="tab-prezentare" role="tabpanel">
+      <section id="alerts" class="alerts" aria-label="Alerte operaționale"></section>
 
-    <section id="alerts" class="alerts" aria-label="Alerte operaționale"></section>
+      <section class="status-grid" aria-label="Stare generală">
+        <article class="status-card" id="status-xtb"></article>
+        <article class="status-card" id="status-market"></article>
+        <article class="status-card" id="status-brain"></article>
+        <article class="status-card" id="status-db"></article>
+      </section>
 
-    <section class="status-grid" aria-label="Stare generală">
-      <article class="status-card" id="status-xtb"></article>
-      <article class="status-card" id="status-market"></article>
-      <article class="status-card" id="status-brain"></article>
-      <article class="status-card" id="status-db"></article>
-    </section>
-
-    <section class="hero-grid">
-      <article class="panel market-panel">
-        <div class="panel-heading">
-          <div>
-            <p class="eyebrow">PIAȚĂ &amp; FEED</p>
-            <h2 id="market-title">GOLD</h2>
+      <section class="hero-grid">
+        <article class="panel market-panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">PIAȚĂ &amp; FEED</p><h2 id="market-title">GOLD</h2></div>
+            <span id="quote-time" class="muted">—</span>
           </div>
-          <span id="quote-time" class="muted">—</span>
-        </div>
-        <div class="quote-row">
-          <div><span>Bid</span><strong id="quote-bid">—</strong></div>
-          <div><span>Ask</span><strong id="quote-ask">—</strong></div>
-          <div><span>Spread</span><strong id="quote-spread">—</strong></div>
-        </div>
-        <div id="price-chart" class="price-chart" aria-label="Istoric recent preț"></div>
-        <div class="market-meta">
-          <div><span>Ultima bară XTB</span><strong id="broker-bar">—</strong></div>
-          <div><span>Ultimul snapshot brain</span><strong id="brain-bar">—</strong></div>
-          <div><span>Provider</span><strong id="provider-name">—</strong></div>
-        </div>
-      </article>
-
-      <article class="panel metrics-panel">
-        <div class="panel-heading">
-          <div>
-            <p class="eyebrow">TRACK RECORD SELECTAT</p>
-            <h2>Rezultate shadow</h2>
+          <div class="quote-row">
+            <div><span>Bid</span><strong id="quote-bid">—</strong></div>
+            <div><span>Ask</span><strong id="quote-ask">—</strong></div>
+            <div><span>Spread</span><strong id="quote-spread">—</strong></div>
           </div>
-          <span id="metrics-scope" class="tag">TOATE</span>
-        </div>
-        <div class="metric-grid">
-          <div class="metric"><span>Decizii</span><strong id="metric-decisions">—</strong></div>
-          <div class="metric"><span>Trade-uri</span><strong id="metric-trades">—</strong></div>
-          <div class="metric"><span>Deschise</span><strong id="metric-open">—</strong></div>
-          <div class="metric"><span>Win rate</span><strong id="metric-win">—</strong></div>
-          <div class="metric wide"><span>Expectancy</span><strong id="metric-expectancy">—</strong><small>R / trade închis</small></div>
-          <div class="metric wide"><span>Cost LLM auditat</span><strong id="metric-cost">—</strong><small id="metric-llm-calls">— apeluri</small></div>
-        </div>
-      </article>
-    </section>
+          <div id="price-chart" class="price-chart" aria-label="Istoric recent preț"></div>
+          <div class="market-meta">
+            <div><span>Ultima bară XTB</span><strong id="broker-bar">—</strong></div>
+            <div><span>Ultimul snapshot brain</span><strong id="brain-bar">—</strong></div>
+            <div><span>Provider</span><strong id="provider-name">—</strong></div>
+          </div>
+        </article>
 
-    <section class="panel pipeline-panel">
-      <div class="panel-heading">
-        <div>
-          <p class="eyebrow">ULTIMA PROCESARE</p>
-          <h2>Traseul deciziei</h2>
-        </div>
-        <button id="show-latest-json" class="ghost-button" type="button">Vezi datele brute</button>
-      </div>
-      <div id="pipeline" class="pipeline"></div>
-      <div id="rationale" class="rationale"></div>
-    </section>
+        <article class="panel metrics-panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">TRACK RECORD SELECTAT</p><h2>Rezultate shadow</h2></div>
+            <span id="metrics-scope" class="tag">TOATE</span>
+          </div>
+          <div class="metric-grid">
+            <div class="metric"><span>Decizii</span><strong id="metric-decisions">—</strong></div>
+            <div class="metric"><span>Trade-uri</span><strong id="metric-trades">—</strong></div>
+            <div class="metric"><span>Deschise</span><strong id="metric-open">—</strong></div>
+            <div class="metric"><span>Win rate</span><strong id="metric-win">—</strong></div>
+            <div class="metric wide"><span>Expectancy</span><strong id="metric-expectancy">—</strong><small>R / trade închis</small></div>
+            <div class="metric wide"><span>Cost LLM auditat</span><strong id="metric-cost">—</strong><small id="metric-llm-calls">— apeluri</small></div>
+          </div>
+        </article>
+      </section>
 
-    <section class="lower-grid operations-grid">
-      <article class="panel table-panel">
+      <section class="panel pipeline-panel">
         <div class="panel-heading">
-          <div><p class="eyebrow">PROCESE</p><h2>Servicii &amp; heartbeat</h2></div>
-          <span id="services-count" class="tag">0</span>
+          <div><p class="eyebrow">ULTIMA PROCESARE</p><h2>Traseul deciziei</h2></div>
+          <button id="show-latest-json" class="ghost-button" type="button">Vezi datele brute</button>
         </div>
-        <div class="table-wrap compact">
+        <div id="pipeline" class="pipeline"></div>
+        <div id="rationale" class="rationale"></div>
+      </section>
+    </section>
+
+    <!-- ============================ DECIZII ============================ -->
+    <section class="tabpanel" id="tab-decizii" role="tabpanel">
+      <section class="panel table-panel">
+        <div class="panel-heading table-heading">
+          <div><p class="eyebrow">AUDIT CRONOLOGIC</p><h2>Timeline M15</h2></div>
+          <div class="legend">
+            <span><i class="dot ok"></i>Aprobat</span>
+            <span><i class="dot warn"></i>Respins</span>
+            <span><i class="dot muted-dot"></i>Fără decizie</span>
+          </div>
+        </div>
+        <p class="panel-hint">Fiecare rând = o bară M15: features → eligibilitate → decizie → risk → trade. Click pe rând pentru datele brute.</p>
+        <div class="table-wrap">
           <table>
+            <thead><tr>
+              <th>Bară</th><th>Preț</th><th>Regim</th><th>Eligibilitate</th>
+              <th>Model / decizie</th><th>Risk</th><th>Trade</th><th>R</th>
+            </tr></thead>
+            <tbody id="timeline-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+
+    <!-- ============================ TRADE-URI ============================ -->
+    <section class="tabpanel" id="tab-tradeuri" role="tabpanel">
+      <section class="panel table-panel">
+        <div class="panel-heading"><div><p class="eyebrow">POZIȚII</p><h2>Shadow deschise</h2></div>
+          <span id="open-count" class="tag">0</span></div>
+        <p class="panel-hint">Mark-to-market <strong>indicativ, brut</strong> din quote-ul curent — nu este PnL definitiv.</p>
+        <div class="table-wrap compact"><table>
+          <thead><tr><th>Run</th><th>Side</th><th>Entry / acum</th><th>R brut</th><th>SL / TP</th><th>Timeout estimat</th></tr></thead>
+          <tbody id="open-trades-body"></tbody>
+        </table></div>
+      </section>
+
+      <section class="panel table-panel">
+        <div class="panel-heading"><div><p class="eyebrow">CARANTINĂ</p><h2>Trade-uri quarantined</h2></div>
+          <span id="quarantined-count" class="tag">0</span></div>
+        <p class="panel-hint">Deschise sub alt provider decât procesul curent → scoase din position gate, NU reconciliate. Necesită drain manual.</p>
+        <div class="table-wrap compact"><table>
+          <thead><tr><th>Run</th><th>Side</th><th>Entry</th><th>Provider trade</th><th>Motiv</th><th>Carantinat</th></tr></thead>
+          <tbody id="quarantined-body"></tbody>
+        </table></div>
+      </section>
+
+      <section class="panel table-panel">
+        <div class="panel-heading"><div><p class="eyebrow">ISTORIC</p><h2>Trade-uri închise</h2></div>
+          <span id="closed-count" class="tag">0</span></div>
+        <div class="table-wrap compact"><table>
+          <thead><tr><th>Run</th><th>Side</th><th>Entry → Exit</th><th>Motiv ieșire</th><th>R</th><th>Închis</th></tr></thead>
+          <tbody id="closed-trades-body"></tbody>
+        </table></div>
+      </section>
+    </section>
+
+    <!-- ============================ EXPERIMENTE ============================ -->
+    <section class="tabpanel" id="tab-experimente" role="tabpanel">
+      <section class="panel table-panel">
+        <div class="panel-heading"><div><p class="eyebrow">EXPERIMENTE</p><h2>Run-uri persistate</h2></div>
+          <span id="runs-count" class="tag">0</span></div>
+        <p class="panel-hint">Click pe un run pentru a filtra tot dashboardul pe el.</p>
+        <div class="table-wrap compact"><table>
+          <thead><tr><th>Run</th><th>Tip / validitate</th><th>Model</th><th>Decizii</th><th>Trade-uri</th><th>Exp. R</th></tr></thead>
+          <tbody id="runs-body"></tbody>
+        </table></div>
+      </section>
+
+      <section class="panel table-panel">
+        <div class="panel-heading"><div><p class="eyebrow">REPRODUCTIBILITATE</p><h2>Dataseturi înghețate</h2></div>
+          <span id="datasets-count" class="tag">0</span></div>
+        <p class="panel-hint">Un run persistat se pinuiește pe un dataset cu hash de conținut → rulare reproductibilă.</p>
+        <div class="table-wrap compact"><table>
+          <thead><tr><th>dataset_id</th><th>Sursă</th><th>Timeframes</th><th>Bare</th><th>Interval</th><th>Înghețat</th></tr></thead>
+          <tbody id="datasets-body"></tbody>
+        </table></div>
+      </section>
+    </section>
+
+    <!-- ============================ AI & COST ============================ -->
+    <section class="tabpanel" id="tab-ai-cost" role="tabpanel">
+      <section class="status-grid budget-grid" aria-label="Bugete AI">
+        <article class="status-card" id="budget-run"></article>
+        <article class="status-card" id="budget-day"></article>
+        <article class="status-card" id="budget-month"></article>
+        <article class="status-card" id="budget-orphans"></article>
+      </section>
+
+      <section class="panel table-panel">
+        <div class="panel-heading"><div><p class="eyebrow">GATEWAY FINANCIAR</p><h2>Încercări plătite (paid_attempts)</h2></div>
+          <span id="paid-count" class="tag">0</span></div>
+        <p class="panel-hint">Fiecare încercare HTTP: rând scris ÎNAINTE de request (started) → completed / timeout / error. „started" vechi = orfan de reconciliat.</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Timp</th><th>Run / context</th><th>Model</th><th>Stare</th><th>Tokeni in/out</th><th>Cost real</th><th>Consolă</th></tr></thead>
+          <tbody id="paid-body"></tbody>
+        </table></div>
+      </section>
+
+      <section class="panel table-panel">
+        <div class="panel-heading"><div><p class="eyebrow">TRASABILITATE LLM</p><h2>Apeluri LLM (rezultat logic)</h2></div>
+          <span class="tag">READ ONLY</span></div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Timp</th><th>Model cerut</th><th>Rezultat</th><th>Tokeni in/out</th><th>Cache</th><th>Retry</th><th>Latență</th><th>Cost est.</th></tr></thead>
+          <tbody id="llm-body"></tbody>
+        </table></div>
+      </section>
+    </section>
+
+    <!-- ============================ OPERAȚIONAL ============================ -->
+    <section class="tabpanel" id="tab-operational" role="tabpanel">
+      <section class="lower-grid operations-grid">
+        <article class="panel table-panel">
+          <div class="panel-heading"><div><p class="eyebrow">PROCESE</p><h2>Servicii &amp; heartbeat</h2></div>
+            <span id="services-count" class="tag">0</span></div>
+          <div class="table-wrap compact"><table>
             <thead><tr><th>Serviciu</th><th>Stare</th><th>Heartbeat</th><th>Următoarea trezire</th><th>Commit</th></tr></thead>
             <tbody id="services-body"></tbody>
-          </table>
-        </div>
-      </article>
-
-      <article class="panel table-panel">
-        <div class="panel-heading">
-          <div><p class="eyebrow">EXECUȚII</p><h2>Ultimele tick-uri</h2></div>
-          <span id="pipeline-runs-count" class="tag">0</span>
-        </div>
-        <div class="table-wrap compact">
-          <table>
+          </table></div>
+        </article>
+        <article class="panel table-panel">
+          <div class="panel-heading"><div><p class="eyebrow">EXECUȚII</p><h2>Ultimele tick-uri</h2></div>
+            <span id="pipeline-runs-count" class="tag">0</span></div>
+          <div class="table-wrap compact"><table>
             <thead><tr><th>Start</th><th>Serviciu / tip</th><th>Rezultat</th><th>Bare</th><th>Durată</th></tr></thead>
             <tbody id="pipeline-runs-body"></tbody>
-          </table>
-        </div>
-      </article>
+          </table></div>
+        </article>
+      </section>
+
+      <section class="lower-grid">
+        <article class="panel table-panel">
+          <div class="panel-heading"><div><p class="eyebrow">CONCURENȚĂ</p><h2>Rezervări active</h2></div>
+            <span id="reservations-count" class="tag">0</span></div>
+          <div class="table-wrap compact"><table>
+            <thead><tr><th>Run</th><th>Stare</th><th>Worker</th><th>Rezervat</th><th>Lease expiră</th></tr></thead>
+            <tbody id="reservations-body"></tbody>
+          </table></div>
+        </article>
+        <article class="panel table-panel">
+          <div class="panel-heading"><div><p class="eyebrow">CONTINUITATE</p><h2>Goluri de downtime</h2></div>
+            <span id="downtime-count" class="tag">0</span></div>
+          <div class="table-wrap compact"><table>
+            <thead><tr><th>Reluat la</th><th>Bare sărite</th><th>Politică</th><th>Run prev → curent</th><th>Detectat</th></tr></thead>
+            <tbody id="downtime-body"></tbody>
+          </table></div>
+        </article>
+      </section>
+
+      <section class="panel table-panel">
+        <div class="panel-heading"><div><p class="eyebrow">LEDGER DE PROCESARE</p><h2>Bare procesate</h2></div>
+          <span id="processed-count" class="tag">0</span></div>
+        <p class="panel-hint">Referința pentru downtime: fiecare bară procesată + rezultatul ei (o bară sărită de position gate rămâne „procesată").</p>
+        <div class="table-wrap compact"><table>
+          <thead><tr><th>Bară</th><th>Provider</th><th>Run</th><th>Rezultat</th><th>OK</th><th>Procesat</th></tr></thead>
+          <tbody id="processed-body"></tbody>
+        </table></div>
+      </section>
     </section>
 
-    <section class="panel table-panel">
-      <div class="panel-heading table-heading">
-        <div>
-          <p class="eyebrow">AUDIT CRONOLOGIC</p>
-          <h2>Timeline M15</h2>
-        </div>
-        <div class="legend">
-          <span><i class="dot ok"></i>Aprobat</span>
-          <span><i class="dot warn"></i>Respins</span>
-          <span><i class="dot muted-dot"></i>Fără decizie</span>
-        </div>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr>
-            <th>Bară</th><th>Preț</th><th>Regim</th><th>Eligibilitate</th>
-            <th>Model / decizie</th><th>Risk</th><th>Trade</th><th>R</th>
-          </tr></thead>
-          <tbody id="timeline-body"></tbody>
-        </table>
-      </div>
-    </section>
+    <!-- ============================ BAZĂ DE DATE ============================ -->
+    <section class="tabpanel" id="tab-baza-de-date" role="tabpanel">
+      <section class="panel table-panel">
+        <div class="panel-heading"><div><p class="eyebrow">SCHEMĂ &amp; ISTORIC</p><h2>Tabele în bază</h2></div>
+          <span id="db-schema" class="tag">—</span></div>
+        <p class="panel-hint">Număr aproximativ de rânduri per tabel (din statisticile Postgres). Pentru numărul exact rulează <code>ANALYZE</code>.</p>
+        <div class="table-wrap compact"><table>
+          <thead><tr><th>Tabel</th><th>Rânduri ≈</th></tr></thead>
+          <tbody id="db-tables-body"></tbody>
+        </table></div>
+      </section>
 
-    <section class="lower-grid">
-      <article class="panel table-panel">
-        <div class="panel-heading">
-          <div><p class="eyebrow">POZIȚII</p><h2>Shadow deschise</h2></div>
-          <span id="open-count" class="tag">0</span>
-        </div>
-        <div class="table-wrap compact">
-          <table>
-            <thead><tr><th>Run</th><th>Side</th><th>Entry / acum</th><th>R brut</th><th>SL / TP</th><th>Timeout estimat</th></tr></thead>
-            <tbody id="open-trades-body"></tbody>
-          </table>
-        </div>
-      </article>
-
-      <article class="panel table-panel">
-        <div class="panel-heading">
-          <div><p class="eyebrow">EXPERIMENTE</p><h2>Run-uri persistate</h2></div>
-          <span id="runs-count" class="tag">0</span>
-        </div>
-        <div class="table-wrap compact">
-          <table>
-            <thead><tr><th>Run</th><th>Tip / validitate</th><th>Model</th><th>Decizii</th><th>Trade-uri</th><th>Exp. R</th></tr></thead>
-            <tbody id="runs-body"></tbody>
-          </table>
-        </div>
-      </article>
-    </section>
-
-    <section class="panel table-panel">
-      <div class="panel-heading">
-        <div><p class="eyebrow">COST &amp; TRASABILITATE</p><h2>Apeluri LLM</h2></div>
-        <span class="tag">READ ONLY</span>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Timp</th><th>Model cerut</th><th>Rezultat</th><th>Tokeni in / out</th><th>Cache</th><th>Retry</th><th>Latență</th><th>Cost</th></tr></thead>
-          <tbody id="llm-body"></tbody>
-        </table>
-      </div>
+      <section class="panel table-panel">
+        <div class="panel-heading"><div><p class="eyebrow">INTEGRITATE SURSĂ</p><h2>Conflicte de snapshot</h2></div>
+          <span id="conflicts-count" class="tag">0</span></div>
+        <p class="panel-hint">Aceeași bară raportată de un provider/pipeline diferit față de cel deja stocat.</p>
+        <div class="table-wrap compact"><table>
+          <thead><tr><th>Bară</th><th>Existent (provider/pipeline)</th><th>Incoming (provider/pipeline)</th><th>Detectat</th></tr></thead>
+          <tbody id="conflicts-body"></tbody>
+        </table></div>
+      </section>
     </section>
   </main>
 

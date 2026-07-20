@@ -42,7 +42,6 @@ body {
   display: flex; align-items: center; justify-content: space-between; gap: 28px;
   border-bottom: 1px solid var(--line-soft);
   background: rgba(7, 11, 15, .78); backdrop-filter: blur(16px);
-  position: sticky; top: 0; z-index: 20;
 }
 
 .brand, .controls, .panel-heading, .quote-row, .market-meta, .legend, footer { display: flex; align-items: center; }
@@ -219,4 +218,61 @@ dialog pre { overflow: auto; max-height: 65vh; margin: 0; padding: 15px; color: 
   .market-meta { align-items: flex-start; flex-direction: column; gap: 10px; }
   .legend { display: none; }
   footer { align-items: flex-start; flex-direction: column; justify-content: center; gap: 5px; }
+}
+
+/* ---- always-visible health strip (system pulse) ---- */
+.healthbar {
+  position: sticky; top: 0; z-index: 18;
+  display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
+  min-height: 46px; padding: 7px clamp(18px, 3vw, 52px);
+  background: rgba(7, 11, 15, .92); backdrop-filter: blur(14px);
+  border-bottom: 1px solid var(--line-soft);
+}
+.healthbar .connection-strip { margin: 0; }
+.health-chips { display: flex; gap: 8px; flex-wrap: wrap; }
+.chip {
+  display: inline-flex; align-items: center; gap: 7px; padding: 5px 11px;
+  border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--text);
+  font-size: 11px; transition: border-color .15s;
+}
+.chip::before { content: ""; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--chip-color, var(--muted)); box-shadow: 0 0 8px var(--chip-color, transparent); }
+.chip .chip-label { color: var(--muted); text-transform: uppercase; letter-spacing: .07em; font-size: 9px; }
+.chip .chip-value { font-weight: 620; }
+.chip.ok { --chip-color: var(--green); }
+.chip.warn { --chip-color: var(--amber); }
+.chip.bad { --chip-color: var(--red); border-color: rgba(255,120,111,.4); }
+.chip.neutral { --chip-color: var(--blue); }
+.chip:hover { border-color: #4e6674; }
+
+/* ---- tab navigation ---- */
+.tabbar {
+  position: sticky; top: 46px; z-index: 17;
+  display: flex; gap: 2px; flex-wrap: wrap;
+  padding: 0 clamp(18px, 3vw, 52px);
+  background: rgba(7, 11, 15, .92); backdrop-filter: blur(14px);
+  border-bottom: 1px solid var(--line-soft);
+}
+.tab {
+  border: none; background: transparent; color: var(--muted);
+  padding: 12px 15px; font-size: 13px; font-weight: 560;
+  border-bottom: 2px solid transparent;
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--cyan); border-bottom-color: var(--cyan); }
+.tab-count { color: var(--muted); font-size: 10px; margin-left: 2px; }
+.tab.active .tab-count { color: var(--cyan); }
+
+.tabpanel { display: none; }
+.tabpanel.active { display: block; }
+
+.panel-hint { margin: -8px 0 14px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.panel-hint code { background: rgba(131,148,157,.12); padding: 1px 5px; border-radius: 4px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }
+.cell-sub.wrap { white-space: normal; max-width: 340px; }
+.budget-grid { margin-bottom: 12px; }
+
+@media (max-width: 720px) {
+  .tabbar { top: 78px; }
+  .tab { padding: 10px 11px; font-size: 12px; }
 }

@@ -34,22 +34,30 @@ pip install -e '.[db]'
 - endpointurile trading_hands folosite sunt exclusiv `GET /status`, `GET /quote` și
   `GET /candles`.
 
-## Ce afișează
+## Organizare (tab-uri)
 
-- conectivitate XTB demo, quote și ultimele lumânări;
-- indicator explicit `trading_enabled` (alertă critică dacă ordinele reale sunt permise);
-- versiunea DB, commitul Git și avertisment pentru working tree dirty;
-- heartbeat separat pentru collector/Shadow Online și auditul fiecărui tick (succes/eroare/durată);
-- lag feed XTB ↔ ultim snapshot brain;
-- alerte pentru date stale, trade-uri shadow vechi, rezervări expirate și audit LLM incomplet;
-- cronologia ultimelor bare cu features, eligibilitate, decizie, risk și outcome;
-- poziții shadow deschise cu mark-to-market **indicativ, brut** și timeout estimat;
-- experimente clasificate (`shadow_online`, `executable_backtest`, `event_study`, `legacy`, `test`);
-- expectancy implicit numai din run-uri cu manifest verificat **și working tree clean**; un run legacy/dirty poate fi selectat,
-  dar este etichetat explicit `NEVERIFICAT`;
-- fiecare apel LLM auditat, tokeni, cache, retry, latență și cost.
+Deasupra e o **bară de sănătate mereu vizibilă** (conexiune XTB/piață/brain/DB + număr de alerte),
+apoi **navigație pe tab-uri** (nu mai e un scroll unic haotic):
 
-Datele se actualizează la 10 secunde sau manual. Filtrul `Experiment` izolează un `run_id`.
+- **Prezentare** — carduri de stare, quote + grafic preț, metrici track record, traseul ultimei
+  decizii (bară → features → eligibilitate → decizie → risk → trade) și lista de alerte.
+- **Decizii** — timeline-ul M15 complet; click pe orice bară pentru datele brute.
+- **Trade-uri** — poziții shadow deschise (mark-to-market **indicativ, brut**), trade-uri
+  **quarantined** (deschise sub alt provider, scoase din gate) și **istoricul** celor închise.
+- **Experimente** — run-uri persistate cu tip/validitate + manifest, plus **dataseturile înghețate**
+  (hash de conținut) de care se leagă rulările pentru reproductibilitate.
+- **AI & Cost** — bugetele plătite (**spend run/zi/lună vs plafon**, orfani, nereconciliate),
+  ledgerul **`paid_attempts`** (per încercare HTTP: started → completed/timeout/error) și apelurile
+  `llm_calls` auditate.
+- **Operațional** — servicii + heartbeat, tick-uri (`pipeline_runs`), rezervări active,
+  **goluri de downtime** și **ledgerul de bare procesate** (referința pentru downtime).
+- **Bază de date** — versiunea schemei, numărul (aproximativ) de rânduri per tabel și conflictele
+  de snapshot.
+
+Metricile de track record folosesc implicit **doar run-uri cu manifest verificat și working tree
+clean**; un run legacy/dirty poate fi selectat, dar e etichetat `NEVERIFICAT`. Datele se actualizează
+la 10 secunde sau manual; filtrul `Experiment` izolează un `run_id`; tabul activ e reținut între
+reîncărcări.
 
 Dashboardul nu pornește procesele de calcul. Pentru heartbeat și date noi, pornește separat:
 

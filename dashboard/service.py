@@ -94,6 +94,15 @@ class DashboardService:
                 "market_open": market_open,
                 "expected_schema_version": self.expected_schema_version,
                 "git": git,
+                # Non-secret paid-AI config (no keys/DSNs) so the AI & Cost tab shows spend vs budget.
+                "paid_ai": {
+                    "enabled": bool(self.settings.paid_ai_enabled),
+                    "model": self.settings.decision_model,
+                    "budget_run": self.settings.paid_budget_run_usd,
+                    "budget_day": self.settings.paid_budget_day_usd,
+                    "budget_month": self.settings.paid_budget_month_usd,
+                    "max_http_attempts": self.settings.paid_max_http_attempts,
+                },
             },
             "health": {"database": db["health"], "trading_hands": hands},
             "alerts": alerts,
@@ -101,11 +110,20 @@ class DashboardService:
             "latest": db["latest"],
             "timeline": db["timeline"],
             "open_trades": db["open_trades"],
+            "quarantined_trades": db["quarantined_trades"],
+            "closed_trades": db["closed_trades"],
             "runs": db["runs"],
+            "datasets": db["datasets"],
             "llm_calls": db["llm_calls"],
+            "paid_attempts": db["paid_attempts"],
+            "paid_spend": db["paid_spend"],
+            "downtime_gaps": db["downtime_gaps"],
+            "processed_bars": db["processed_bars"],
+            "snapshot_conflicts": db["snapshot_conflicts"],
             "reservations": db["reservations"],
             "services": db["services"],
             "pipeline_runs": db["pipeline_runs"],
+            "db_tables": db["db_tables"],
         })
 
     def _market_open(self, now: datetime) -> bool | None:
@@ -146,8 +164,10 @@ class DashboardService:
         started = time.perf_counter()
         empty = {
             "health": {"ok": False}, "summary": {}, "latest": {}, "timeline": [],
-            "open_trades": [], "runs": [], "llm_calls": [], "reservations": [],
-            "services": [], "pipeline_runs": [],
+            "open_trades": [], "quarantined_trades": [], "closed_trades": [], "runs": [],
+            "datasets": [], "llm_calls": [], "paid_attempts": [], "paid_spend": {},
+            "downtime_gaps": [], "processed_bars": [], "snapshot_conflicts": [],
+            "reservations": [], "services": [], "pipeline_runs": [], "db_tables": [],
         }
         try:
             import psycopg
@@ -416,6 +436,115 @@ class DashboardService:
                 if "run_manifests" in tables:
                     manifest_count = conn.execute("SELECT count(*) AS n FROM run_manifests").fetchone()["n"]
 
+                # --- Trades: quarantined (cross-provider, removed from the gate) + closed history -
+                quarantined_trades = conn.execute(
+                    """
+                    SELECT t.id, t.run_id, t.symbol, t.side, t.opened_at, t.quarantined_at,
+                           t.quarantine_reason, t.entry_price, d.data_provider
+                    FROM trades t JOIN decisions d ON d.id=t.decision_id
+                    WHERE t.symbol=%s AND t.status='quarantined'
+                      AND (CAST(%s AS text) IS NULL OR t.run_id=%s)
+                    ORDER BY t.quarantined_at DESC LIMIT 50
+                    """, (symbol, run_id, run_id),
+                ).fetchall()
+                closed_trades = conn.execute(
+                    """
+                    SELECT t.id, t.run_id, t.side, t.opened_at, t.closed_at, t.entry_price,
+                           t.exit_price, t.exit_reason, t.status, t.r_multiple, t.ambiguous
+                    FROM trades t
+                    WHERE t.symbol=%s AND t.status IN ('closed','expired')
+                      AND (CAST(%s AS text) IS NULL OR t.run_id=%s)
+                    ORDER BY t.closed_at DESC NULLS LAST, t.id DESC LIMIT 50
+                    """, (symbol, run_id, run_id),
+                ).fetchall()
+
+                # --- Frozen datasets (reproducible replay identity) --------------------------------
+                datasets = []
+                if "datasets" in tables:
+                    datasets = conn.execute(
+                        """
+                        SELECT dataset_id, symbol, provider, provider_symbol, pipeline_version,
+                               timeframes, bar_counts, first_bar, last_bar, source, frozen_at
+                        FROM datasets WHERE symbol=%s ORDER BY frozen_at DESC LIMIT 50
+                        """, (symbol,),
+                    ).fetchall()
+
+                # --- Paid AI: per-attempt ledger + budget accounting -------------------------------
+                paid_attempts, paid_spend = [], {}
+                if "paid_attempts" in tables:
+                    paid_attempts = conn.execute(
+                        """
+                        SELECT id, run_id, context, model, status, request_id, input_tokens,
+                               output_tokens, est_cost_usd, actual_cost_usd, reconciled_console,
+                               started_at, finished_at
+                        FROM paid_attempts WHERE (CAST(%s AS text) IS NULL OR run_id=%s)
+                        ORDER BY started_at DESC LIMIT 50
+                        """, (run_id, run_id),
+                    ).fetchall()
+                    paid_spend = conn.execute(
+                        """
+                        SELECT
+                          (SELECT COALESCE(sum(COALESCE(actual_cost_usd,est_cost_usd)),0)
+                             FROM paid_attempts WHERE status<>'error'
+                               AND (CAST(%s AS text) IS NULL OR run_id=%s)) AS run,
+                          (SELECT COALESCE(sum(COALESCE(actual_cost_usd,est_cost_usd)),0)
+                             FROM paid_attempts WHERE status<>'error'
+                               AND started_at >= date_trunc('day', now())) AS day,
+                          (SELECT COALESCE(sum(COALESCE(actual_cost_usd,est_cost_usd)),0)
+                             FROM paid_attempts WHERE status<>'error'
+                               AND started_at >= date_trunc('month', now())) AS month,
+                          (SELECT count(*) FROM paid_attempts
+                             WHERE status='completed' AND reconciled_console=false) AS unreconciled,
+                          (SELECT count(*) FROM paid_attempts
+                             WHERE status='started'
+                               AND started_at < now() - make_interval(secs => 300)) AS orphans
+                        """, (run_id, run_id),
+                    ).fetchone()
+
+                # --- Downtime gaps + processed-bar ledger ------------------------------------------
+                downtime_gaps = []
+                if "downtime_gaps" in tables:
+                    downtime_gaps = conn.execute(
+                        """
+                        SELECT id, symbol, provider, prev_bar_close, prev_run_id, resumed_bar_close,
+                               run_id, missed_bars, policy, detected_at
+                        FROM downtime_gaps WHERE symbol=%s
+                          AND (CAST(%s AS text) IS NULL OR run_id=%s)
+                        ORDER BY detected_at DESC LIMIT 50
+                        """, (symbol, run_id, run_id),
+                    ).fetchall()
+                processed_bars = []
+                if "processed_bars" in tables:
+                    processed_bars = conn.execute(
+                        """
+                        SELECT symbol, provider, bar_close, run_id, outcome, ok, processed_at
+                        FROM processed_bars WHERE symbol=%s
+                          AND (CAST(%s AS text) IS NULL OR run_id=%s)
+                        ORDER BY bar_close DESC LIMIT 50
+                        """, (symbol, run_id, run_id),
+                    ).fetchall()
+
+                # --- Snapshot source conflicts -----------------------------------------------------
+                snapshot_conflicts = []
+                if "snapshot_conflicts" in tables:
+                    snapshot_conflicts = conn.execute(
+                        """
+                        SELECT id, ts, symbol, bar_close, existing_provider, existing_pipeline_version,
+                               incoming_provider, incoming_pipeline_version
+                        FROM snapshot_conflicts WHERE symbol=%s ORDER BY ts DESC LIMIT 50
+                        """, (symbol,),
+                    ).fetchall()
+
+                # --- DB history: approximate row counts per table (fast; labeled as approximate) ---
+                db_tables = conn.execute(
+                    """
+                    SELECT c.relname AS name, GREATEST(c.reltuples, 0)::bigint AS approx_rows
+                    FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                    WHERE n.nspname='public' AND c.relkind='r' AND c.relname <> 'schema_migrations'
+                    ORDER BY c.relname
+                    """
+                ).fetchall()
+
             closed = int(metrics["trades_closed"] or 0)
             wins = int(metrics["wins"] or 0)
             summary = {
@@ -446,11 +575,20 @@ class DashboardService:
                 "latest": latest,
                 "timeline": [dict(r) for r in timeline],
                 "open_trades": [dict(r) for r in open_trades],
+                "quarantined_trades": [dict(r) for r in quarantined_trades],
+                "closed_trades": [dict(r) for r in closed_trades],
                 "runs": [dict(r) for r in runs],
+                "datasets": [dict(r) for r in datasets],
                 "llm_calls": [dict(r) for r in llm_calls],
+                "paid_attempts": [dict(r) for r in paid_attempts],
+                "paid_spend": dict(paid_spend) if paid_spend else {},
+                "downtime_gaps": [dict(r) for r in downtime_gaps],
+                "processed_bars": [dict(r) for r in processed_bars],
+                "snapshot_conflicts": [dict(r) for r in snapshot_conflicts],
                 "reservations": [dict(r) for r in reservations],
                 "services": [dict(r) for r in services],
                 "pipeline_runs": [dict(r) for r in pipeline_runs],
+                "db_tables": [dict(r) for r in db_tables],
             }
         except Exception as exc:  # noqa: BLE001 - API remains available when DB is down
             empty["health"] = {
@@ -660,6 +798,23 @@ class DashboardService:
         if summary.get("selected_run_validity") == "unverified":
             add("warning", "UNVERIFIED_RUN_SELECTED",
                 "Run-ul selectat este legacy/test/neclasificat; metricile lui nu sunt dovadă de edge executabil.")
+
+        quarantined = db.get("quarantined_trades") or []
+        if quarantined:
+            add("warning", "QUARANTINED_TRADES",
+                f"{len(quarantined)} trade-uri în carantină (deschise sub alt provider); necesită drain manual.")
+        paid = db.get("paid_spend") or {}
+        if paid.get("orphans"):
+            add("warning", "PAID_ORPHANS",
+                f"{paid['orphans']} apeluri plătite blocate la 'started'; reconciliază costul cu consola "
+                "(python -m app.paid_report --sweep-orphans).")
+        if paid.get("unreconciled"):
+            add("info", "PAID_UNRECONCILED",
+                f"{paid['unreconciled']} apeluri plătite nereconciliate cu consola Anthropic.")
+        if db.get("downtime_gaps"):
+            add("info", "DOWNTIME_GAPS",
+                f"{len(db['downtime_gaps'])} goluri de downtime înregistrate; track record-ul nu e "
+                "continuu peste ele.")
 
         order = {"critical": 0, "warning": 1, "info": 2}
         return sorted(alerts, key=lambda a: (order.get(a["severity"], 9), a["code"]))
