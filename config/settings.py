@@ -79,6 +79,11 @@ class Settings(BaseSettings):
     decision_model: str = "claude-sonnet-5"
     benchmark_model: str = "claude-opus-4-8"
     decision_max_tokens: int = Field(1024, gt=0)
+    # MASTER KILL-SWITCH for PAID Anthropic calls. Default OFF: every entry point that could spend
+    # money (app.decide --paid, app.llm_smoke, shadow.runner --maker claude) must fail-closed unless
+    # this is explicitly true. A configured api key alone must NEVER be sufficient to spend. This is
+    # the seed of the central financial gateway (budgets/attempt caps land on top of it).
+    paid_ai_enabled: bool = False
 
     # Shadow backtest: a MODELED spread for historical (replay) bars — we never borrow the
     # current live quote for a past bar. ~XTB gold spread observed live (~0.018-0.02%).

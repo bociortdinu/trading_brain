@@ -73,14 +73,18 @@ async def _run(model: str, api_key: str) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="One Anthropic API smoke-test (no execution).")
+    parser = argparse.ArgumentParser(description="One PAID Anthropic API smoke-test (no execution).")
     parser.add_argument("--benchmark", action="store_true", help="use the benchmark model")
+    parser.add_argument("--yes", action="store_true", help="skip the paid-call confirmation")
     args = parser.parse_args()
     settings = load_settings()
-    if not settings.anthropic_api_key:
-        print("SKIPPED: BRAIN_ANTHROPIC_API_KEY not set (no real API call made).")
-        return 0
     model = settings.benchmark_model if args.benchmark else settings.decision_model
+    # This ALWAYS makes a real paid call -> master gate + explicit confirmation first. A configured
+    # key alone is NOT sufficient (was: key presence -> immediate charge).
+    from decision.paid_guard import confirm_paid_call, require_paid_ai_enabled
+    require_paid_ai_enabled(settings, context="app.llm_smoke")
+    confirm_paid_call(context="app.llm_smoke", model=model, assume_yes=args.yes,
+                      extra="(one frozen request; no execution)")
     return asyncio.run(_run(model, settings.anthropic_api_key))
 
 

@@ -5,8 +5,9 @@ Flow: fetch closed OHLCV -> packet -> persist snapshot (immutable) -> persist el
 `decisions` row FK'd to the exact authorizing evaluation. The verdict comes straight from
 the Risk Engine — an approved verdict is never fabricated.
 
-    python -m app.decide --replay --fake   # deterministic maker (no API); shadow
-    python -m app.decide --replay          # real Anthropic maker (needs BRAIN_ANTHROPIC_API_KEY)
+    python -m app.decide --replay          # FREE deterministic maker (default; no API call)
+    python -m app.decide --replay --paid   # REAL paid maker: needs BRAIN_PAID_AI_ENABLED=true,
+                                           # BRAIN_ANTHROPIC_API_KEY, and a confirmation (--yes to skip)
 """
 
 from __future__ import annotations
@@ -48,7 +49,15 @@ class DeterministicMaker:
                               rationale="deterministic stub (no live LLM)")
 
 
-async def _run(settings, *, mode: str, use_fake: bool, all_regimes: bool = False) -> None:
+async def _run(settings, *, mode: str, use_paid: bool, assume_yes: bool = False,
+               all_regimes: bool = False) -> None:
+    # PAID GATE FIRST — before any work. A configured key alone must not spend: --paid needs the
+    # master switch (BRAIN_PAID_AI_ENABLED) and an explicit confirmation. Fails fast, no data fetch.
+    if use_paid:
+        from decision.paid_guard import confirm_paid_call, require_paid_ai_enabled
+        require_paid_ai_enabled(settings, context="app.decide")
+        confirm_paid_call(context="app.decide", model=settings.decision_model,
+                          assume_yes=assume_yes, extra="(one real decision; no execution)")
     provider = build_provider(settings)
     provider_name = settings.market_data_provider
     brain_symbol = settings.symbol_query
@@ -100,64 +109,80 @@ async def _run(settings, *, mode: str, use_fake: bool, all_regimes: bool = False
     eval_id = insert_evaluation(settings.db_dsn, snap_id, result)
     print(f"[db] evaluation id={eval_id} mode={result.mode} eligible={result.eligible} reasons={result.reasons}")
 
-    if use_fake:
+    # FREE BY DEFAULT. The real (paid) maker is used only with --paid, and even then it must pass
+    # the master gate (BRAIN_PAID_AI_ENABLED) + an explicit confirmation — a configured key alone
+    # never spends. The client is always closed (a leaked httpx client was a real defect).
+    if not use_paid:
+        from decision.paid_guard import key_present_note
+        key_present_note(settings)
         maker, model_name = DeterministicMaker(), "deterministic-fake"
     else:
-        if not settings.anthropic_api_key:
-            raise SystemExit("BRAIN_ANTHROPIC_API_KEY is required for the real maker (or use --fake)")
+        # Already gated + confirmed at the top of _run; here we only construct the paid maker.
         from decision.llm_client import AnthropicDecisionMaker
         maker = AnthropicDecisionMaker(settings.anthropic_api_key, settings.decision_model,
                                        max_tokens=settings.decision_max_tokens)
         model_name = settings.decision_model
 
-    # Shadow experimentation may record decisions across ALL regimes (to measure the model);
-    # --shadow-all-regimes lifts only the regime skip, keeping every other gate intact.
-    pf_config = PrefilterConfig(blocked_regimes=[]) if all_regimes else PrefilterConfig()
-    record = await run_decision(packet, result, maker, mode=mode,
-                                prefilter_config=pf_config, risk_config=RiskConfig(),
-                                calendar=calendar_for(provider_name))
-    inp = build_decision_input(packet, mode=mode)
-    print(f"[decision] stage={record.stage} "
-          f"{'prefilter='+str(record.prefilter.reasons) if record.stage=='prefiltered_out' else ''}")
-    if record.risk is not None:
-        print(f"[risk] approved={record.risk.approved} reason={record.risk.reason} "
-              f"sl={record.risk.sl_pct} tp={record.risk.tp_pct} "
-              f"execution_ready={record.risk.execution_ready} pending={record.risk.pending_execution_gates}")
+    try:
+        # Shadow experimentation may record decisions across ALL regimes (to measure the model);
+        # --shadow-all-regimes lifts only the regime skip, keeping every other gate intact.
+        pf_config = PrefilterConfig(blocked_regimes=[]) if all_regimes else PrefilterConfig()
+        record = await run_decision(packet, result, maker, mode=mode,
+                                    prefilter_config=pf_config, risk_config=RiskConfig(),
+                                    calendar=calendar_for(provider_name))
+        inp = build_decision_input(packet, mode=mode)
+        print(f"[decision] stage={record.stage} "
+              f"{'prefilter='+str(record.prefilter.reasons) if record.stage=='prefiltered_out' else ''}")
+        if record.risk is not None:
+            print(f"[risk] approved={record.risk.approved} reason={record.risk.reason} "
+                  f"sl={record.risk.sl_pct} tp={record.risk.tp_pct} "
+                  f"execution_ready={record.risk.execution_ready} pending={record.risk.pending_execution_gates}")
 
-    # Audit-log the LLM call (success OR failure) with its full manifest + cost.
-    last = getattr(maker, "last_result", None)
-    if record.stage == "llm_failed":
-        if last is not None:   # a failed call yielded no decision -> log it unlinked
-            insert_llm_call(settings.db_dsn, last, snapshot_id=snap_id)
-        print(f"[llm] FAILED: {record.llm_error} (logged to llm_calls; no decision persisted)")
-        return
+        # Audit-log the LLM call (success OR failure) with its full manifest + cost.
+        last = getattr(maker, "last_result", None)
+        if record.stage == "llm_failed":
+            if last is not None:   # a failed call yielded no decision -> log it unlinked
+                insert_llm_call(settings.db_dsn, last, snapshot_id=snap_id)
+            print(f"[llm] FAILED: {record.llm_error} (logged to llm_calls; no decision persisted)")
+            return
 
-    tokens = {}
-    if last is not None:
-        tokens = {"input": last.input_tokens, "output": last.output_tokens,
-                  "latency_ms": last.latency_ms,
-                  "cache_hit": bool(last.cache_read_input_tokens)}
-    ai_output = record.decision.model_dump(mode="json") if record.decision else None
-    dec_id, _ = insert_decision(   # decision + paid-call audit in ONE transaction (atomic)
-        settings.db_dsn, snapshot_id=snap_id, evaluation_id=eval_id, model=model_name,
-        record=record, ai_input=inp.model_dump(mode="json"), ai_output=ai_output,
-        mode="shadow", data_provider=provider_name, tokens=tokens,
-        spread_observation_id=spread_obs_id, llm_result=last,
-    )
-    verdict = "approved" if (record.risk and record.risk.approved) else "rejected"
-    print(f"[db] decision id={dec_id} verdict={verdict} -> evaluation_id={eval_id} (shadow, NOT executed)")
+        tokens = {}
+        if last is not None:
+            tokens = {"input": last.input_tokens, "output": last.output_tokens,
+                      "latency_ms": last.latency_ms,
+                      "cache_hit": bool(last.cache_read_input_tokens)}
+        ai_output = record.decision.model_dump(mode="json") if record.decision else None
+        dec_id, _ = insert_decision(   # decision + paid-call audit in ONE transaction (atomic)
+            settings.db_dsn, snapshot_id=snap_id, evaluation_id=eval_id, model=model_name,
+            record=record, ai_input=inp.model_dump(mode="json"), ai_output=ai_output,
+            mode="shadow", data_provider=provider_name, tokens=tokens,
+            spread_observation_id=spread_obs_id, llm_result=last,
+        )
+        verdict = "approved" if (record.risk and record.risk.approved) else "rejected"
+        print(f"[db] decision id={dec_id} verdict={verdict} -> evaluation_id={eval_id} (shadow, NOT executed)")
+    finally:
+        mclose = getattr(maker, "aclose", None)
+        if mclose:
+            await mclose()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run + persist one shadow decision (no execution).")
     parser.add_argument("--replay", action="store_true", help="market mode replay (freshness vs as_of)")
-    parser.add_argument("--fake", action="store_true", help="deterministic maker (no API call)")
+    parser.add_argument("--paid", action="store_true",
+                        help="use the REAL (paid) Anthropic maker; requires BRAIN_PAID_AI_ENABLED "
+                             "and a confirmation. Default is the FREE deterministic maker.")
+    parser.add_argument("--fake", action="store_true",
+                        help="(deprecated; free is already the default) deterministic maker")
+    parser.add_argument("--yes", action="store_true", help="skip the paid-call confirmation (with --paid)")
     parser.add_argument("--shadow-all-regimes", action="store_true",
                         help="shadow: do not skip on regime (record all regimes)")
     args = parser.parse_args()
     settings = load_settings()
     mode = "replay" if args.replay else settings.market_mode
-    asyncio.run(_run(settings, mode=mode, use_fake=args.fake, all_regimes=args.shadow_all_regimes))
+    # Free by default. --fake is now a no-op alias (kept for back-compat); only --paid spends.
+    asyncio.run(_run(settings, mode=mode, use_paid=args.paid, assume_yes=args.yes,
+                     all_regimes=args.shadow_all_regimes))
     return 0
 
 

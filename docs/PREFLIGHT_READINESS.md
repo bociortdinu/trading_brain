@@ -8,6 +8,40 @@ parte. Reevaluează acest fișier la fiecare rundă și compară.
 
 ---
 
+## ACTUALIZARE 2026-07-20 — corectare după auditul independent Codex
+
+Un audit independent ([PRE_PAID_AI_READINESS_AUDIT_CODEX.md](PRE_PAID_AI_READINESS_AUDIT_CODEX.md))
+a găsit că **acest raport a fost prea optimist**. Am **verificat fiecare constatare în cod** — toate
+se confirmă. Retrag explicit următoarele afirmații de mai jos:
+
+- **„Calea de bani e sănătoasă" — RETRAS.** Doar `shadow.runner --maker claude --persist` e rezonabil
+  protejat, iar și acolo: plafonul numără **decizii logice, nu request-uri HTTP** (`max_retries=3` →
+  până la 4 request-uri/decizie), `--persist` NU e obligatoriu, default cap 50 (nu 0), `--yes`
+  ocolește confirmarea, iar estimarea „worst-case" nu e validă (folosește `max_tokens` și pentru
+  input, nu multiplică cu retry-urile, nu include cache-write).
+- **DOUĂ CLI-uri fac apeluri plătite aproape neprotejate:** `python -m app.decide` (default = maker
+  REAL; doar `--fake` îl oprește; fără plafon USD/confirmare/rezervare) și `python -m app.llm_smoke`
+  (apel imediat la prezența cheii). Cu cheia Anthropic configurată = risc real de cheltuială
+  accidentală.
+- **„Fiecare apel e în `llm_calls` în aceeași tranzacție" — RETRAS literal.** Doar rezultatul logic
+  reușit e atomic cu decizia; încercările HTTP intermediare și crash-urile pre-commit nu sunt toate
+  auditate (timeout după accept ⇒ cost fără dovadă locală).
+- **„Resume nu replătește" — CALIFICAT.** Adevărat după persistare, DAR în fereastra
+  provider-accept ↔ DB-necomis un crash + expirare lease poate re-apela (at-most-one-concurrent, nu
+  exactly-once).
+- **Blocante de corectitudine confirmate**, două fiind **regresii/incompletitudini în propria mea
+  muncă R3**: **P0-C1** (lookup-urile scheduler nu folosesc `provider_symbol`/`pipeline_version`;
+  fără `dataset_id`); **P0-C2** (R3-2: trade-ul cross-provider e doar *sărit* → rămâne open →
+  position gate-ul pe simbol blochează la nesfârșit — `open_shadow_trades(symbol=…)` nu filtrează
+  provider); **P0-C3** (R3-5: downtime măsurat față de ultima **decizie**, nu ultima **bară
+  procesată** → barele sărite intenționat de position gate sunt raportate fals ca downtime).
+
+**Verdict aliniat: NO-GO** pentru orice test AI contra cost până la remedierea gateway-ului financiar
+central + P0-C1..C3 + blocantele de produs. Vezi criteriile de GO în raportul Codex §9–§11.
+Secțiunile 3–6 de mai jos rămân ca istoric, dar trebuie citite prin filtrul acestei corectări.
+
+---
+
 ## 1. Scopul aplicației
 
 Un sistem algoritmic de **shadow-trading pe aur (XAUUSD)** pe XTB, în care:

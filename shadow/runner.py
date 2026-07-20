@@ -464,8 +464,9 @@ def _build_maker(settings, kind: str):
     if kind == "deterministic":
         return ConfluenceStrategy(), "deterministic-confluence", False
     if kind == "claude":
-        if not settings.anthropic_api_key:
-            raise SystemExit("--maker claude needs BRAIN_ANTHROPIC_API_KEY (real, paid API calls)")
+        # Master gate first: a configured key is NOT sufficient to spend (BRAIN_PAID_AI_ENABLED).
+        from decision.paid_guard import require_paid_ai_enabled
+        require_paid_ai_enabled(settings, context="shadow.runner")
         from decision.llm_client import AnthropicDecisionMaker
         inner = AnthropicDecisionMaker(settings.anthropic_api_key, settings.decision_model,
                                        max_tokens=settings.decision_max_tokens)
@@ -473,16 +474,29 @@ def _build_maker(settings, kind: str):
     raise SystemExit(f"unknown maker {kind!r} (expected deterministic|claude)")
 
 
-def _confirm_paid_run(model: str, max_calls: int, max_tokens: int, assume_yes: bool) -> None:
-    """Fail-closed cost gate for a paid backtest: print a WORST-CASE cost estimate and require an
-    explicit confirmation (interactive y/N, or --yes). Never spends money silently."""
+def _confirm_paid_run(model: str, max_calls: int, max_tokens: int, assume_yes: bool,
+                      http_attempts_per_call: int = 4) -> None:
+    """Fail-closed cost gate for a paid backtest: print a ROUGH cost estimate and require an explicit
+    confirmation (interactive y/N, or --yes). Never spends money silently.
+
+    HONEST about the estimate's limits (per the readiness audit): `--max-llm-calls` caps LOGICAL
+    decisions, but the maker retries transient errors, so HTTP requests can be up to ~4x that; the
+    real INPUT size is the system prompt + packet JSON (not `max_tokens`, which bounds OUTPUT), and
+    cache-write is billed separately. So this is a ballpark, NOT a true worst-case; the authoritative
+    cost is the usage returned per call, reconciled against the Anthropic console. A hard USD/HTTP
+    budget is the job of the central financial gateway (not yet implemented)."""
     from decision.llm_client import _PRICES
 
     pin, pout = _PRICES.get(model, (5.0e-6, 25.0e-6))   # default to Opus-tier (conservative)
-    # worst case: every call sends a full prompt (~max_tokens in) and fills max_tokens out.
-    est = max_calls * (max_tokens * pin + max_tokens * pout)
-    print(f"[paid run] maker=claude model={model} max_llm_calls={max_calls} "
-          f"-> worst-case ~${est:.2f} (dedupe/resume + prefilter usually make it far less).")
+    # Ballpark: assume input ~= max_tokens (LOWER bound if the packet is larger), output up to
+    # max_tokens, and scale by the retry budget since retries multiply HTTP requests.
+    per_call = max_tokens * pin + max_tokens * pout
+    est = max_calls * per_call
+    est_hi = max_calls * per_call * http_attempts_per_call
+    print(f"[paid run] maker=claude model={model} max_llm_calls={max_calls} (LOGICAL; up to "
+          f"~{http_attempts_per_call}x HTTP with retries) -> rough ~${est:.2f}, up to ~${est_hi:.2f} "
+          f"if every call retries. NOT a true worst-case (real input size + cache-write not modelled) "
+          f"— reconcile actual usage with the Anthropic console.")
     if assume_yes:
         print("[paid run] --yes given; proceeding.")
         return
