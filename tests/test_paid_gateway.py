@@ -72,9 +72,32 @@ class _FakeInner:
         self.closed = True
 
 
-def _gw(settings, inner, run_id):
+class _SeqFakeInner:
+    """Returns a SEQUENCE of canned results (one per HTTP attempt) — for the retry loop."""
+    def __init__(self, results):
+        self._results = list(results)
+        self.last_result = None
+        self.called = 0
+        self.closed = False
+
+    async def call(self, inp):
+        res = self._results[min(self.called, len(self._results) - 1)]
+        self.called += 1
+        self.last_result = res
+        return res
+
+    async def aclose(self):
+        self.closed = True
+
+
+async def _nosleep(_delay):
+    return None
+
+
+def _gw(settings, inner, run_id, sleep_fn=None):
     from decision.paid_gateway import PaidAiGateway
-    return PaidAiGateway(settings, run_id=run_id, persist_dsn=DSN, context="test", inner=inner)
+    return PaidAiGateway(settings, run_id=run_id, persist_dsn=DSN, context="test", inner=inner,
+                         sleep_fn=sleep_fn)
 
 
 def _rows(run_id):
@@ -182,6 +205,39 @@ def test_error_result_is_recorded_and_excluded_from_spend():
         rows = _rows(run_id)
         assert len(rows) == 1 and rows[0][0] == "error"
         assert paid_spend_summary(DSN, run_id)["run"] == 0.0     # 'error' rows don't count as spend
+    finally:
+        _cleanup(run_id)
+
+
+# --- per-HTTP-attempt retry auditing ------------------------------------------------------------
+def test_retries_a_transient_attempt_and_records_each_http_attempt():
+    """attempts=2: a transient first attempt is retried; EACH HTTP attempt is its own audited row
+    (timeout then completed), proving per-HTTP auditing + the HTTP-attempt cap."""
+    run_id = "r-retry-" + os.urandom(3).hex()
+    inner = _SeqFakeInner([
+        _result(ok=False, error="exhausted_retries:APITimeoutError", cost=None),   # transient
+        _result(ok=True, cost=0.001),                                              # then success
+    ])
+    gw = _gw(_settings(attempts=2), inner, run_id, sleep_fn=_nosleep)
+    try:
+        out = run(gw.decide(_FakeInput()))
+        assert out.direction.value == "BUY" and inner.called == 2
+        rows = _rows(run_id)
+        assert [r[0] for r in rows] == ["timeout", "completed"]     # both HTTP attempts audited
+    finally:
+        _cleanup(run_id)
+
+
+def test_a_fatal_error_is_not_retried():
+    """A non-transient failure (4xx) is recorded once and NOT retried, even with attempts=2."""
+    run_id = "r-fatal-" + os.urandom(3).hex()
+    inner = _SeqFakeInner([_result(ok=False, error="api_status:400", cost=None)])
+    gw = _gw(_settings(attempts=2), inner, run_id, sleep_fn=_nosleep)
+    try:
+        with pytest.raises(Exception):
+            run(gw.decide(_FakeInput()))
+        assert inner.called == 1                                    # no retry on a fatal error
+        assert [r[0] for r in _rows(run_id)] == ["error"]
     finally:
         _cleanup(run_id)
 

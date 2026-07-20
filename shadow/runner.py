@@ -517,7 +517,8 @@ async def _run(settings, *, count: int, run_id: str | None, maker_kind: str = "d
     if use_feedback and not run_id:
         raise SystemExit("--feedback needs --persist (feedback is read from the run's persisted trades)")
     if is_paid:
-        _confirm_paid_run(model_name, max_llm_calls, settings.decision_max_tokens, assume_yes)
+        _confirm_paid_run(model_name, max_llm_calls, settings.decision_max_tokens, assume_yes,
+                          http_attempts_per_call=settings.paid_max_http_attempts)
 
     provider = build_provider(settings)
     symbol = settings.symbol_query

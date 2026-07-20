@@ -31,7 +31,7 @@ class PaidAiGateway:
     """A DecisionMaker that fronts the real Anthropic maker with the financial gateway."""
 
     def __init__(self, settings, *, run_id: str, persist_dsn: str, context: str,
-                 model: str | None = None, inner=None) -> None:
+                 model: str | None = None, inner=None, sleep_fn=None) -> None:
         if not run_id or not persist_dsn:
             raise SystemExit(f"REFUSING paid AI ({context}): a paid run requires persistence + an "
                              f"explicit run_id (auditable). Pass --persist and --run-id.")
@@ -55,52 +55,80 @@ class PaidAiGateway:
         self.last_result = None
         if inner is None:
             from decision.llm_client import AnthropicDecisionMaker
+            # max_retries=0: the GATEWAY owns the retry loop so EACH HTTP attempt gets its own
+            # reserved + audited paid_attempts row (per-HTTP auditing, not per logical call).
             inner = AnthropicDecisionMaker(settings.anthropic_api_key, model,
-                                           max_tokens=self._max_tokens,
-                                           max_retries=max(self._max_http_attempts - 1, 0))
+                                           max_tokens=self._max_tokens, max_retries=0)
         self._inner = inner
+        self._sleep = sleep_fn      # injected in tests; None -> anyio.sleep
         # Transparency: the operator sees exactly what will be billed-against before any request.
         print(f"[paid gateway] context={context} model={model} run_id={run_id} "
               f"max_http_attempts={self._max_http_attempts} budgets(run/day/month)="
               f"${self._budget_run:.2f}/${self._budget_day:.2f}/${self._budget_month:.2f}",
               file=sys.stderr)
 
-    def _estimate_worst_usd(self, inp) -> float:
-        """A GENEROUS per-logical-call estimate for the reservation: real input size (system rules +
-        the input JSON) as input tokens, max_tokens as output, a cache-write surcharge, times the
-        HTTP-attempt budget. The AUTHORITATIVE cost is the usage recorded at finalize."""
+    def _estimate_per_attempt_usd(self, inp) -> float:
+        """A GENEROUS per-HTTP-attempt estimate for the reservation: real input size (system rules +
+        the input JSON) as input tokens, max_tokens as output, plus a cache-write surcharge. Each
+        attempt reserves this, so the budget is consumed per actual attempt. The AUTHORITATIVE cost
+        is the usage recorded at finalize."""
         pin, pout = _PRICES.get(self._model, (5.0e-6, 25.0e-6))
         prompt_chars = len(SYSTEM_RULES) + len(inp.model_dump_json())
         prompt_tokens = int(prompt_chars / 4 * 1.2)          # ~4 chars/token, +20% safety
-        per_attempt = prompt_tokens * pin + self._max_tokens * pout + prompt_tokens * pin * 0.25
-        return round(per_attempt * self._max_http_attempts, 6)
+        return round(prompt_tokens * pin + self._max_tokens * pout + prompt_tokens * pin * 0.25, 6)
+
+    @staticmethod
+    def _status_for(res) -> str:
+        if res.ok:
+            return "completed"
+        return "timeout" if (res.error and "Timeout" in res.error) else "error"
+
+    @staticmethod
+    def _is_transient(error: str | None) -> bool:
+        # errors from AnthropicDecisionMaker.call(max_retries=0): a single transient attempt yields
+        # 'exhausted_retries:<ExcName>' (timeout/connection/429); a 5xx yields 'api_status:5xx'.
+        return bool(error) and (error.startswith("exhausted_retries")
+                                or error.startswith("api_status:5"))
 
     async def call(self, inp):
-        """Reserve budget + record a 'started' attempt BEFORE the request, run the inner call, then
-        finalize with the real usage. Raises BudgetExceeded (before any request) if no budget."""
+        """Per-HTTP-attempt: for each attempt (up to paid_max_http_attempts) reserve budget + record
+        a 'started' row BEFORE the request, run ONE HTTP call, finalize it, and retry only on a
+        transient failure. Raises BudgetExceeded (before a request) if a window has no budget."""
         self.calls += 1
         input_hash = inp.input_hash()
-        est = self._estimate_worst_usd(inp)
-        attempt_id = reserve_paid_attempt(
-            self._dsn, run_id=self._run_id, context=self._context, model=self._model,
-            input_hash=input_hash, attempt_no=0, est_cost_usd=est,
-            budget_run_usd=self._budget_run, budget_day_usd=self._budget_day,
-            budget_month_usd=self._budget_month)   # raises BudgetExceeded -> no request made
-        try:
-            res = await self._inner.call(inp)
-        except Exception:
-            finalize_paid_attempt(self._dsn, attempt_id=attempt_id, status="error")
-            raise
+        est = self._estimate_per_attempt_usd(inp)
+        res = None
+        for attempt_no in range(self._max_http_attempts):
+            attempt_id = reserve_paid_attempt(
+                self._dsn, run_id=self._run_id, context=self._context, model=self._model,
+                input_hash=input_hash, attempt_no=attempt_no, est_cost_usd=est,
+                budget_run_usd=self._budget_run, budget_day_usd=self._budget_day,
+                budget_month_usd=self._budget_month)   # raises BudgetExceeded -> no request made
+            try:
+                res = await self._inner.call(inp)
+            except Exception:
+                finalize_paid_attempt(self._dsn, attempt_id=attempt_id, status="error")
+                raise
+            finalize_paid_attempt(
+                self._dsn, attempt_id=attempt_id, status=self._status_for(res),
+                request_id=res.request_id, input_tokens=res.input_tokens,
+                output_tokens=res.output_tokens, cache_read_tokens=res.cache_read_input_tokens,
+                cache_write_tokens=res.cache_creation_input_tokens,
+                actual_cost_usd=res.estimated_cost_usd)
+            if res.ok or not self._is_transient(res.error) or attempt_no == self._max_http_attempts - 1:
+                break
+            await self._sleep_backoff(attempt_no)
         self.last_result = res
-        status = ("completed" if res.ok
-                  else "timeout" if (res.error and "Timeout" in res.error) else "error")
-        finalize_paid_attempt(
-            self._dsn, attempt_id=attempt_id, status=status, request_id=res.request_id,
-            input_tokens=res.input_tokens, output_tokens=res.output_tokens,
-            cache_read_tokens=res.cache_read_input_tokens,
-            cache_write_tokens=res.cache_creation_input_tokens,
-            actual_cost_usd=res.estimated_cost_usd)
         return res
+
+    async def _sleep_backoff(self, attempt: int) -> None:
+        import random
+        delay = min(0.5 * (2 ** attempt) + random.uniform(0, 0.25), 8.0)
+        if self._sleep is not None:
+            await self._sleep(delay)
+        else:
+            import anyio
+            await anyio.sleep(delay)
 
     async def decide(self, inp):
         res = await self.call(inp)
