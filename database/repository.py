@@ -24,7 +24,8 @@ from contextlib import contextmanager
 from features.mtf import FeaturePacket
 
 
-def upsert_snapshot(dsn: str, packet: FeaturePacket) -> tuple[str, int | None]:
+def upsert_snapshot(dsn: str, packet: FeaturePacket,
+                    dataset_id: str | None = None) -> tuple[str, int | None]:
     import psycopg
     from psycopg.types.json import Json
 
@@ -37,14 +38,15 @@ def upsert_snapshot(dsn: str, packet: FeaturePacket) -> tuple[str, int | None]:
         # 1. Concurrency-safe insert: the winner of a race inserts; everyone else falls through.
         #    The snapshot is a pure OBSERVATION; eligibility (snapshot_evaluations) and the
         #    contextual spread (spread_observations) are persisted separately so neither ever
-        #    mutates the observation.
+        #    mutates the observation. `dataset_id` (REPLAY only) records the frozen dataset a bar
+        #    came from; it is NULL for live snapshots.
         row = conn.execute(
             """
             INSERT INTO market_snapshots
                 (bar_close, symbol, regime, adx_h1, atr_pct_m15, features,
                  news_digest, provider, provider_symbol, ingested_at, intervals,
-                 pipeline_version, data_quality)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 pipeline_version, data_quality, dataset_id)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (symbol, provider, provider_symbol, pipeline_version, bar_close) DO NOTHING
             RETURNING id
             """,
@@ -52,7 +54,7 @@ def upsert_snapshot(dsn: str, packet: FeaturePacket) -> tuple[str, int | None]:
                 packet.bar_close, packet.symbol, packet.regime, packet.adx_h1,
                 packet.atr_pct_m15, features, news, packet.provider,
                 packet.provider_symbol, packet.ingested_at, intervals,
-                packet.pipeline_version, dq,
+                packet.pipeline_version, dq, dataset_id,
             ),
         ).fetchone()
         if row is not None:
@@ -82,6 +84,69 @@ def upsert_snapshot(dsn: str, packet: FeaturePacket) -> tuple[str, int | None]:
         conn.execute("UPDATE market_snapshots SET data_quality = %s WHERE id = %s", (dq, snap_id))
         conn.commit()
         return "enriched", snap_id
+
+
+def compute_dataset_id(symbol: str, provider: str, provider_symbol: str, windows: dict):
+    """Deterministic CONTENT hash of a historical bar set (all timeframes). Same bars -> same id,
+    regardless of fetch order or object identity. Returns (dataset_id, full_sha256, meta) where
+    dataset_id = sha256[:16] and meta = {timeframes, bar_counts, first_bar, last_bar}."""
+    import hashlib
+    import json
+
+    h = hashlib.sha256()
+    h.update(json.dumps({"symbol": symbol, "provider": provider,
+                         "provider_symbol": provider_symbol}, sort_keys=True).encode())
+    counts: dict[str, int] = {}
+    first = last = None
+    for tf in sorted(windows):
+        bars = sorted(windows[tf], key=lambda b: b.open_time)
+        counts[tf] = len(bars)
+        h.update(f"|{tf}|".encode())
+        for b in bars:
+            h.update((f"{b.open_time.isoformat()},{b.open},{b.high},{b.low},{b.close},"
+                      f"{b.volume};").encode())
+            first = b.open_time if first is None or b.open_time < first else first
+            last = b.open_time if last is None or b.open_time > last else last
+    sha = h.hexdigest()
+    return sha[:16], sha, {"timeframes": sorted(windows), "bar_counts": counts,
+                           "first_bar": first, "last_bar": last}
+
+
+def freeze_dataset(dsn: str, *, symbol: str, provider: str, provider_symbol: str,
+                   windows: dict, pipeline_version: str | None = None, source: str | None = None,
+                   provenance: dict | None = None) -> tuple[str, bool]:
+    """Freeze a historical bar set as an immutable, content-hashed dataset for reproducible replay.
+    Idempotent on the content hash: freezing the SAME bytes again returns the existing id. Returns
+    (dataset_id, newly_frozen)."""
+    import psycopg
+    from psycopg.types.json import Json
+
+    dataset_id, sha, meta = compute_dataset_id(symbol, provider, provider_symbol, windows)
+    with psycopg.connect(dsn) as conn:
+        row = conn.execute(
+            """
+            INSERT INTO datasets (dataset_id, symbol, provider, provider_symbol, pipeline_version,
+                                  timeframes, bar_counts, first_bar, last_bar, sha256, source,
+                                  provenance)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (dataset_id) DO NOTHING RETURNING dataset_id
+            """,
+            (dataset_id, symbol, provider, provider_symbol, pipeline_version,
+             Json(meta["timeframes"]), Json(meta["bar_counts"]), meta["first_bar"], meta["last_bar"],
+             sha, source, Json(provenance) if provenance is not None else None),
+        ).fetchone()
+        conn.commit()
+    return dataset_id, row is not None
+
+
+def get_dataset(dsn: str, dataset_id: str) -> dict | None:
+    """Fetch a frozen dataset's metadata + provenance (for verification/repro), or None."""
+    import psycopg
+
+    from psycopg.rows import dict_row
+
+    with psycopg.connect(dsn, row_factory=dict_row) as conn:
+        return conn.execute("SELECT * FROM datasets WHERE dataset_id = %s", (dataset_id,)).fetchone()
 
 
 def insert_spread_observation(dsn: str, *, snapshot_id: int, spread_pct: float, provenance: str,

@@ -1807,3 +1807,93 @@ def test_scheduler_lookups_are_scoped_to_the_full_source_identity():
                                       provider_symbol="C:XAUUSD") == (True, False)
     finally:
         _cleanup(sym)
+
+
+def _mini_windows(seed=0.0):
+    from data_collector.providers.base import Candle
+    base = datetime(2026, 7, 6, tzinfo=timezone.utc)
+    out = {}
+    for tf, m in (("15min", 15), ("1h", 60)):
+        out[tf] = [
+            Candle(open_time=base + timedelta(minutes=m * i),
+                   close_time=base + timedelta(minutes=m * (i + 1)),
+                   open=4000 + seed + i, high=4001 + seed + i, low=3999 + seed + i,
+                   close=4000.5 + seed + i, volume=1.0 + i)
+            for i in range(3)
+        ]
+    return out
+
+
+def test_compute_dataset_id_is_deterministic_and_content_based():
+    import random
+
+    from database.repository import compute_dataset_id
+
+    w = _mini_windows()
+    id_a, sha_a, meta = compute_dataset_id("GOLD", "csv", "C:XAUUSD", w)
+    # order-independent: shuffling the bar lists yields the SAME id (content, not order)
+    shuffled = {tf: random.sample(bars, len(bars)) for tf, bars in w.items()}
+    id_b, sha_b, _ = compute_dataset_id("GOLD", "csv", "C:XAUUSD", shuffled)
+    assert (id_a, sha_a) == (id_b, sha_b)
+    assert meta["bar_counts"] == {"15min": 3, "1h": 3}
+    # different content -> different id; different source identity -> different id
+    assert compute_dataset_id("GOLD", "csv", "C:XAUUSD", _mini_windows(seed=1.0))[0] != id_a
+    assert compute_dataset_id("GOLD", "polygon", "C:XAUUSD", w)[0] != id_a
+
+
+def test_freeze_dataset_is_idempotent_and_records_provenance():
+    from database.repository import freeze_dataset, get_dataset
+
+    w = _mini_windows(seed=float(int(os.urandom(1).hex(), 16)))   # unique content per run
+    try:
+        did, newly = freeze_dataset(DSN, symbol="GOLD", provider="csv", provider_symbol="C:XAUUSD",
+                                    windows=w, pipeline_version="1.2.0", source="unit-test",
+                                    provenance={"count": 3})
+        assert newly is True
+        # freezing the SAME bytes again is idempotent (existing id, not newly frozen)
+        did2, newly2 = freeze_dataset(DSN, symbol="GOLD", provider="csv", provider_symbol="C:XAUUSD",
+                                      windows=w, source="unit-test")
+        assert did2 == did and newly2 is False
+        ds = get_dataset(DSN, did)
+        assert ds["symbol"] == "GOLD" and ds["bar_counts"] == {"15min": 3, "1h": 3}
+        assert ds["provenance"] == {"count": 3} and ds["source"] == "unit-test"
+        assert ds["sha256"].startswith(did)                       # id is the digest prefix
+    finally:
+        with psycopg.connect(_cleanup_dsn()) as c:
+            c.execute("DELETE FROM datasets WHERE dataset_id=%s", (did,))
+            c.commit()
+
+
+def test_snapshot_records_a_replay_dataset_id_and_live_stays_null():
+    from psycopg import errors
+
+    from database.repository import freeze_dataset, upsert_snapshot
+
+    sym = "TST_" + os.urandom(3).hex()
+    w = _mini_windows(seed=float(int(os.urandom(1).hex(), 16)))
+    did = None
+    try:
+        did, _ = freeze_dataset(DSN, symbol="GOLD", provider="csv", provider_symbol="C:XAUUSD",
+                                windows=w)
+        # REPLAY snapshot pins its dataset; a LIVE snapshot (no dataset_id) stays NULL.
+        _, replay_id = upsert_snapshot(DSN, _packet(sym, provider="csv"), dataset_id=did)
+        _, live_id = upsert_snapshot(DSN, _packet(sym + "L", provider="csv"))
+        with psycopg.connect(DSN) as c:
+            assert c.execute("SELECT dataset_id FROM market_snapshots WHERE id=%s",
+                             (replay_id,)).fetchone()[0] == did
+            assert c.execute("SELECT dataset_id FROM market_snapshots WHERE id=%s",
+                             (live_id,)).fetchone()[0] is None
+        # FK integrity: a dataset_id that was never frozen is rejected.
+        with psycopg.connect(DSN) as c:
+            with pytest.raises(errors.ForeignKeyViolation):
+                c.execute("INSERT INTO market_snapshots (bar_close, symbol, regime, features, "
+                          "provider, provider_symbol, pipeline_version, dataset_id) VALUES "
+                          "(now(),%s,'range','{}'::jsonb,'csv','C:X','1.0','deadbeefdeadbeef')", (sym,))
+            c.rollback()
+    finally:
+        _cleanup(sym)
+        _cleanup(sym + "L")
+        if did:
+            with psycopg.connect(_cleanup_dsn()) as c:
+                c.execute("DELETE FROM datasets WHERE dataset_id=%s", (did,))
+                c.commit()
