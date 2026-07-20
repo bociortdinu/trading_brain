@@ -133,6 +133,7 @@ async def _backtest_over_windows(
     worker_id: str | None = None,      # identifies this worker's reservations (default: host:pid)
     fast_features: bool = True,        # precompute the indicator arrays (default); False = per-slice
     use_feedback: bool = False,        # inject the as_of-safe track record (needs persist_dsn)
+    dataset_id: str | None = None,     # frozen replay dataset the snapshots belong to (repro)
 ) -> list[dict]:
     """Backtest over provided windows. Returns per-bar dicts:
     {as_of, stage, direction, approved, outcome(dict|None)}. When `persist_dsn`+`run_id` are
@@ -284,7 +285,7 @@ async def _backtest_over_windows(
             dec_id = _persist_decision(persist_dsn, run_id, model_name, symbol, provider_name,
                                        packet, elig, rec, fingerprint=fingerprint,
                                        llm_result=llm_result, blocked_reason=blocked,
-                                       feedback=feedback)
+                                       feedback=feedback, dataset_id=dataset_id)
         if rec.risk_approved and not blocked:
             o = _open_reconcile_persist(
                 persist_dsn, run_id, symbol, dec_id, rec.decision.direction, rec.risk.sl_pct,
@@ -396,13 +397,15 @@ def _resume_row(dsn, as_of, run_id, fingerprint, claim) -> dict:
 
 
 def _persist_decision(dsn, run_id, model_name, symbol, provider_name, packet, elig, rec, *,
-                      fingerprint, llm_result, blocked_reason=None, feedback=None) -> int | None:
+                      fingerprint, llm_result, blocked_reason=None, feedback=None,
+                      dataset_id=None) -> int | None:
     """Write snapshot -> evaluation -> decision (+ the LLM call, if any) for one decided bar.
     ATOMIC/idempotent on (input_fingerprint, run_id) via insert_decision's ON CONFLICT. Returns
-    the decision id, or None if the snapshot wasn't usable."""
+    the decision id, or None if the snapshot wasn't usable. `dataset_id` pins the snapshot to the
+    frozen replay dataset (reproducibility); None for live."""
     from database.repository import insert_decision, insert_evaluation, upsert_snapshot
 
-    status, snap_id = upsert_snapshot(dsn, packet)
+    status, snap_id = upsert_snapshot(dsn, packet, dataset_id=dataset_id)
     if snap_id is None or status == "conflict":
         return None
     eval_id = insert_evaluation(dsn, snap_id, elig)
@@ -530,6 +533,19 @@ async def _run(settings, *, count: int, run_id: str | None, maker_kind: str = "d
         aclose = getattr(provider, "aclose", None)
         if aclose:
             await aclose()
+    # A PERSISTED run pins its snapshots to a frozen, content-hashed dataset so the run is
+    # reproducible (you can prove which exact bars it ran on). Live is untouched (no dataset here).
+    dataset_id = None
+    if persist_dsn:
+        from database.repository import freeze_dataset
+        from features.version import FEATURE_PIPELINE_VERSION
+        dataset_id, _ = freeze_dataset(
+            persist_dsn, symbol=symbol, provider=settings.market_data_provider,
+            provider_symbol=provider_symbol, windows=windows,
+            pipeline_version=FEATURE_PIPELINE_VERSION,
+            source=f"{settings.market_data_provider}:{provider_symbol}",
+            provenance={"count": count, "run_id": run_id})
+        print(f"[dataset] run pinned to dataset_id={dataset_id}")
     from database.repository import BudgetExceeded
     try:
         rows = await backtest_over_windows(
@@ -538,7 +554,7 @@ async def _run(settings, *, count: int, run_id: str | None, maker_kind: str = "d
             slippage_pct=settings.slippage_pct, model_name=model_name,
             max_llm_calls=max_llm_calls if is_paid else None,
             shadow_config=shadow_config_from_settings(settings),
-            persist_dsn=persist_dsn, run_id=run_id,
+            persist_dsn=persist_dsn, run_id=run_id, dataset_id=dataset_id,
             use_feedback=use_feedback,
         )
     except BudgetExceeded as exc:

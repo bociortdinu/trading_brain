@@ -694,6 +694,39 @@ def test_llm_cap_does_not_strand_a_reservation():
         _cleanup(sym)
 
 
+def test_persisted_backtest_pins_snapshots_to_the_frozen_dataset():
+    """A persisted replay pins every snapshot to a frozen, content-hashed dataset (reproducibility):
+    the dataset_id threads backtest -> _persist_decision -> upsert_snapshot."""
+    from database.repository import freeze_dataset
+    from shadow.runner import ConfluenceStrategy, _CountingMaker, backtest_over_windows
+    from tests.helpers import run as arun
+
+    sym, run_id = "TST_" + os.urandom(3).hex(), "ds-" + os.urandom(3).hex()
+    w = _synthetic_windows()
+    did = None
+    try:
+        did, _ = freeze_dataset(DSN, symbol=sym, provider="csv", provider_symbol="C:XAUUSD",
+                                windows=w)
+        arun(backtest_over_windows(
+            w, symbol=sym, provider_name="csv", modeled_spread_pct=0.02,
+            decision_maker=_CountingMaker(ConfluenceStrategy()), persist_dsn=DSN, run_id=run_id,
+            model_name="fake", dataset_id=did))
+        with psycopg.connect(DSN) as c:
+            ds_ids = [r[0] for r in c.execute(
+                "SELECT DISTINCT dataset_id FROM market_snapshots WHERE symbol=%s", (sym,)).fetchall()]
+        assert ds_ids and all(d == did for d in ds_ids)   # every persisted snapshot is pinned
+    finally:
+        with psycopg.connect(_cleanup_dsn()) as c:
+            for t in ("trades", "decisions", "decision_reservations"):
+                c.execute(f"DELETE FROM {t} WHERE run_id=%s", (run_id,))
+            c.commit()
+        _cleanup(sym)
+        if did:
+            with psycopg.connect(_cleanup_dsn()) as c:
+                c.execute("DELETE FROM datasets WHERE dataset_id=%s", (did,))
+                c.commit()
+
+
 def test_a_stateful_run_refuses_a_second_concurrent_worker():
     """Per-bar reservations stop double PAYING, they do not make a stateful run parallelisable:
     two workers just split the bars, each tracks its own busy_until, and 'one position at a time'
