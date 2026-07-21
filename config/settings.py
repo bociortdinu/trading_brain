@@ -47,6 +47,17 @@ class Settings(BaseSettings):
     #   csv     = offline files
     market_data_provider: Literal["polygon", "csv", "xtb"] = "polygon"
     csv_dir: str | None = None
+    # Economic calendar (scheduled macro releases). Free key: fredaccount.stlouisfed.org.
+    # Unset -> the calendar is simply absent; the pipeline still runs, news status stays
+    # 'unavailable', and NO blackout is applied (fail-OPEN here is deliberate: a missing
+    # calendar must not silently halt trading, but it IS reported as unavailable so the
+    # model is never told "no events" when we simply do not know).
+    fred_api_key: str | None = None
+    calendar_blackout_minutes_before: int = Field(30, ge=0)
+    # Short by measurement, not by taste — a 15-minute after-window blocked the only winning
+    # trade in the 2026-07-14 CPI backtest. See CalendarConfig in economic_calendar.py.
+    calendar_blackout_minutes_after: int = Field(5, ge=0)
+    calendar_context_lookahead_minutes: int = Field(240, ge=0)
     # Brain symbol -> provider symbol (Polygon forex/metals ticker for gold is C:XAUUSD).
     provider_symbol_map: dict[str, str] = Field(default_factory=lambda: {"GOLD": "C:XAUUSD"})
 

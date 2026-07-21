@@ -134,6 +134,8 @@ async def _backtest_over_windows(
     fast_features: bool = True,        # precompute the indicator arrays (default); False = per-slice
     use_feedback: bool = False,        # inject the as_of-safe track record (needs persist_dsn)
     dataset_id: str | None = None,     # frozen replay dataset the snapshots belong to (repro)
+    econ_calendar=None,                # EconomicCalendar | None — scheduled macro releases
+    econ_calendar_config=None,         # CalendarConfig | None
 ) -> list[dict]:
     """Backtest over provided windows. Returns per-bar dicts:
     {as_of, stage, direction, approved, outcome(dict|None)}. When `persist_dsn`+`run_id` are
@@ -282,7 +284,9 @@ async def _backtest_over_windows(
 
         rec = await run_decision(packet, elig, decision_maker, mode="replay",
                                  prefilter_config=prefilter_config, risk_config=risk_config,
-                                 calendar=calendar, feedback=feedback)
+                                 calendar=calendar, feedback=feedback,
+                                 econ_calendar=econ_calendar,
+                                 econ_calendar_config=econ_calendar_config)
         llm_result = getattr(decision_maker, "last_result", None)
         # The position gate already ran (above), so a bar that reaches the model is one we could
         # actually act on: an approval here always becomes a trade.
@@ -551,6 +555,19 @@ async def _run(settings, *, count: int, run_id: str | None, maker_kind: str = "d
         aclose = getattr(provider, "aclose", None)
         if aclose:
             await aclose()
+    # Scheduled macro releases covering the replay window. Fetched ONCE (the schedule is static)
+    # and reused for every bar — a per-bar lookup would make a 3000-bar backtest unusable.
+    from data_collector.news.economic_calendar import build_calendar, calendar_config_from_settings
+
+    bars = windows[TRIGGER_TF]
+    econ_calendar, cal_reason = (None, "no_bars")
+    if bars:
+        econ_calendar, cal_reason = await build_calendar(
+            settings, start=bars[0].open_time.date(), end=bars[-1].close_time.date())
+    econ_calendar_config = calendar_config_from_settings(settings)
+    print(f"[calendar] {len(econ_calendar)} scheduled release(s) in window" if econ_calendar
+          else f"[calendar] unavailable ({cal_reason}) — no blackout, news reported unavailable")
+
     # A PERSISTED run pins its snapshots to a frozen, content-hashed dataset so the run is
     # reproducible (you can prove which exact bars it ran on). Live is untouched (no dataset here).
     dataset_id = None
@@ -573,7 +590,8 @@ async def _run(settings, *, count: int, run_id: str | None, maker_kind: str = "d
             max_llm_calls=max_llm_calls if is_paid else None,
             shadow_config=shadow_config_from_settings(settings),
             persist_dsn=persist_dsn, run_id=run_id, dataset_id=dataset_id,
-            use_feedback=use_feedback,
+            use_feedback=use_feedback, econ_calendar=econ_calendar,
+            econ_calendar_config=econ_calendar_config,
         )
     except BudgetExceeded as exc:
         # Fail-closed: stop cleanly at the budget. Whatever was decided before this is persisted.

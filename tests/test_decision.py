@@ -207,6 +207,106 @@ def _pipe(packet, elig, llm, mode="replay", calendar=DEFAULT_CALENDAR):
                             calendar=calendar))
 
 
+# ---- scheduled-release blackout ---- #
+def _calendar_at(when, impact="high"):
+    from data_collector.news.economic_calendar import EconomicCalendar, ScheduledEvent
+
+    return EconomicCalendar([ScheduledEvent(label="CPI", release_name="Consumer Price Index",
+                                            scheduled_at=when, impact=impact)])
+
+
+def _pipe_cal(packet, elig, llm, econ_calendar=None, econ_calendar_config=None):
+    return run(run_decision(packet, elig, llm, mode="replay",
+                            prefilter_config=PrefilterConfig(), risk_config=RiskConfig(),
+                            calendar=DEFAULT_CALENDAR, econ_calendar=econ_calendar,
+                            econ_calendar_config=econ_calendar_config))
+
+
+def test_blackout_stops_the_bar_before_the_paid_model():
+    """The money claim: a bar inside a high-impact release window must not reach the maker.
+    _ExplodingLLM raises if called, so this fails loudly rather than silently spending."""
+    rec = _pipe_cal(_packet(spread=0.05), _elig(True), _ExplodingLLM(),
+                    econ_calendar=_calendar_at(_BAR))
+    assert rec.stage == "prefiltered_out"
+    assert any(r.startswith("news_blackout:CPI@") for r in rec.prefilter.reasons)
+
+
+def test_blackout_reason_names_the_event():
+    """An unexplained skip is not auditable — the reason must identify which release caused it."""
+    rec = _pipe_cal(_packet(spread=0.05), _elig(True), _ExplodingLLM(),
+                    econ_calendar=_calendar_at(_BAR))
+    assert _BAR.isoformat() in next(r for r in rec.prefilter.reasons if "news_blackout" in r)
+
+
+def test_bar_outside_the_window_still_reaches_the_model():
+    from datetime import timedelta
+
+    llm = _FakeLLM(_out(Direction.BUY, 0.9))
+    rec = _pipe_cal(_packet(spread=0.05), _elig(True), llm,
+                    econ_calendar=_calendar_at(_BAR + timedelta(hours=6)))
+    assert llm.called == 1 and rec.stage == "decided"
+
+
+def test_medium_impact_release_does_not_blackout_by_default():
+    llm = _FakeLLM(_out(Direction.BUY, 0.9))
+    rec = _pipe_cal(_packet(spread=0.05), _elig(True), llm,
+                    econ_calendar=_calendar_at(_BAR, impact="medium"))
+    assert llm.called == 1 and rec.stage == "decided"
+
+
+def test_upcoming_release_is_passed_to_the_model_as_news():
+    """Outside the blackout the event is still decision-relevant context, not a skip."""
+    from datetime import timedelta
+
+    from data_collector.news.economic_calendar import CalendarConfig
+
+    captured = {}
+
+    class _Capture:
+        async def decide(self, inp):
+            captured["news"] = inp.news
+            return _out(Direction.BUY, 0.9)
+
+    _pipe_cal(_packet(spread=0.05), _elig(True), _Capture(),
+              econ_calendar=_calendar_at(_BAR + timedelta(minutes=90)),
+              econ_calendar_config=CalendarConfig(context_lookahead_minutes=240))
+    assert captured["news"].status == "ok"
+    assert captured["news"].items == [{"event": "CPI", "impact": "high", "in_minutes": 90}]
+
+
+def test_no_calendar_leaves_news_unavailable_and_never_blacks_out():
+    """Fail-OPEN on a missing calendar, but the model is told 'unavailable' — never 'ok, no
+    events', which would assert knowledge we do not have."""
+    llm = _FakeLLM(_out(Direction.BUY, 0.9))
+    captured = {}
+
+    class _Capture:
+        async def decide(self, inp):
+            captured["news"] = inp.news
+            return _out(Direction.BUY, 0.9)
+
+    rec = _pipe_cal(_packet(spread=0.05), _elig(True), _Capture(), econ_calendar=None)
+    assert rec.stage == "decided"
+    assert captured["news"].status == "unavailable"
+
+
+def test_explicit_news_wins_over_the_calendar():
+    captured = {}
+
+    class _Capture:
+        async def decide(self, inp):
+            captured["news"] = inp.news
+            return _out(Direction.BUY, 0.9)
+
+    from datetime import timedelta
+
+    run(run_decision(_packet(spread=0.05), _elig(True), _Capture(), mode="replay",
+                     prefilter_config=PrefilterConfig(), risk_config=RiskConfig(),
+                     calendar=DEFAULT_CALENDAR, news=NewsContext(status="unavailable"),
+                     econ_calendar=_calendar_at(_BAR + timedelta(minutes=90))))
+    assert captured["news"].status == "unavailable"
+
+
 def test_pipeline_binding_rejects_mode_mismatch():
     # replay-eligible evaluation must NOT authorize an online decision
     with pytest.raises(DecisionBindingError, match="mode"):
