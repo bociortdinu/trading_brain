@@ -531,3 +531,28 @@ def test_summarize_empty():
     from shadow.metrics import summarize
 
     assert summarize([])["trades_closed"] == 0
+
+
+# ---- cost manifest: verified-zero vs unconfigured ---- #
+def test_zero_commission_is_modelled_once_the_terms_are_sourced():
+    """A zero rate is ambiguous alone. XTB charges no commission on GOLD, so with terms_version
+    set that zero is a MODELLED fact, not a gap — and writing a token non-zero rate to force the
+    flag would put an invented number in the audit trail."""
+    from datetime import datetime, timezone
+
+    from core.models import Direction
+    from shadow.virtual_broker import ShadowConfig, cost_manifest, open_virtual_trade
+
+    trade = open_virtual_trade(Direction.BUY, 4000.0, 0.3, 0.6, spread_pct=0.02,
+                               spread_provenance="modeled", slippage_pct=0.005,
+                               opened_at=datetime(2026, 7, 21, tzinfo=timezone.utc))
+
+    unsourced = cost_manifest(trade, ShadowConfig(commission_pct=0.0))
+    assert "commission" in unsourced["not_modeled"]
+    assert "NOT net of real financing" in unsourced["note"]
+
+    sourced = cost_manifest(trade, ShadowConfig(commission_pct=0.0,
+                                                swap_long_pct_per_night=0.0331,
+                                                terms_version="xtb-gold-2026-07-21"))
+    assert "commission" in sourced["modeled"] and sourced["not_modeled"] == []
+    assert "NOT net of real financing" not in (sourced.get("note") or "")

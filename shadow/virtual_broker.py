@@ -108,19 +108,25 @@ def swap_rate_for(config: ShadowConfig, direction: Direction) -> float:
 
 
 def cost_manifest(trade: "VirtualTrade", config: ShadowConfig) -> dict:
-    """Honest cost manifest for persistence: a cost component is 'modeled' ONLY when its rate
-    is actually non-zero. Commission/swap default to 0 (real XTB terms not wired), so they
-    land in `not_modeled` — the R-multiple is NOT net of real financing, and the manifest must
-    say so instead of claiming 'modeled' with a zero rate."""
-    # A component is 'modeled' when its rate is non-zero (the reconciler APPLIES it) — including
-    # a NEGATIVE swap (a credit). Only an exactly-zero rate is not_modeled. Swap is judged by the
-    # rate that actually applies to THIS trade's direction (long vs short).
+    """Honest cost manifest for persistence.
+
+    A component is 'modeled' when its rate is non-zero (the reconciler APPLIES it) — including a
+    NEGATIVE swap, which is a credit.
+
+    A zero rate is ambiguous on its own: it can mean "we never configured this" or "we read the
+    account sheet and it really is zero". `terms_version` resolves it. XTB charges no commission
+    on GOLD CFDs, so once the terms are sourced, a zero commission is a MODELLED fact rather than
+    a gap — reporting it as not_modeled would understate a cost model that is actually complete.
+    The alternative (writing a token non-zero rate to make the flag flip) would put an invented
+    number in an audit trail, which is worse than an honest gap."""
+    # Swap is judged by the rate that actually applies to THIS trade's direction (long vs short).
     eff_swap = swap_rate_for(config, trade.direction)
+    terms_sourced = config.terms_version != "unset"
     modeled = ["spread", "gap_through_stop", "latency"]
     not_modeled: list[str] = []
     (modeled if trade.slippage_pct != 0 else not_modeled).append("slippage")
-    (modeled if config.commission_pct != 0 else not_modeled).append("commission")
-    (modeled if eff_swap != 0 else not_modeled).append("swap")
+    (modeled if (config.commission_pct != 0 or terms_sourced) else not_modeled).append("commission")
+    (modeled if (eff_swap != 0 or terms_sourced) else not_modeled).append("swap")
     manifest = {
         "spread_pct": trade.spread_pct, "spread_provenance": trade.spread_provenance,
         "slippage_pct": trade.slippage_pct,
@@ -143,16 +149,18 @@ def cost_manifest(trade: "VirtualTrade", config: ShadowConfig) -> dict:
     }
     # Honest caveats: flag whichever real-terms features are still missing.
     caveats: list[str] = []
-    if eff_swap == 0 or config.commission_pct == 0:
-        caveats.append("commission/swap rate 0 -> NOT net of real financing")
-    if config.terms_version == "unset":
-        caveats.append("financing terms_version unset (rates not sourced from the account spec)")
+    if not terms_sourced:
+        caveats.append("financing terms_version unset (rates not sourced from the account spec) "
+                       "-> R is NOT net of real financing")
     if config.triple_swap_weekday is None:
         caveats.append("no triple-swap day modelled")
     if config.rollover_tz == "UTC":
         caveats.append("rollover fixed at 22:00 UTC (no DST)")
     if caveats:
-        manifest["note"] = "; ".join(caveats) + ". Wire real XTB terms before trusting expectancy."
+        note = "; ".join(caveats)
+        if not terms_sourced:
+            note += ". Wire real XTB terms before trusting expectancy."
+        manifest["note"] = note
     return manifest
 
 
