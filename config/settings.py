@@ -113,6 +113,11 @@ class Settings(BaseSettings):
     # directionless) is NOT blocked. Overridable per run so the alternative can be measured
     # rather than argued about.
     prefilter_blocked_regimes: list[str] = Field(default_factory=lambda: ["choppy"])
+    # Where SL/TP come from: "atr" sizes them deterministically, "model" lets the decision model
+    # propose from market structure and has the Risk Engine validate the proposal. Default "atr"
+    # keeps every existing run's sizing unchanged; flip it per run to compare the two on the
+    # same bars.
+    sl_tp_source: Literal["atr", "model"] = "atr"
 
     # LIVE ORDER ROUTING (execution/live_router.py). This is the only path in trading_brain that
     # sends a real order, so every default is the safe one and enabling it must be deliberate.

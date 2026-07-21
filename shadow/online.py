@@ -306,7 +306,7 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     # already verified at the top, before any mutation.
     fingerprint = decision_fingerprint(
         input_hash=build_decision_input(packet, mode="online", feedback=feedback).input_hash(),
-        model=model_name, provider=provider_name, risk_config_version=RiskConfig().version,
+        model=model_name, provider=provider_name, risk_config_version=_risk_config(settings).version,
         execution_hash=exec_hash)
 
     # RESERVE BEFORE THE (paid) LLM. Two processes on the same run must not both call and pay: the
@@ -343,7 +343,7 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     eval_id = insert_evaluation(settings.db_dsn, snap_id, result)
     record = await run_decision(packet, result, decision_maker, mode="online",
                                 prefilter_config=_prefilter_config(settings),
-                                risk_config=RiskConfig(),
+                                risk_config=_risk_config(settings),
                                 calendar=calendar_for(provider_name), feedback=feedback)
     last = getattr(decision_maker, "last_result", None)
     if record.stage == "llm_failed":
@@ -500,6 +500,12 @@ async def shadow_tick_with_retries(settings: Settings, provider, provider_name: 
     raise AssertionError("unreachable")
 
 
+def _risk_config(settings: Settings) -> RiskConfig:
+    """Risk config for this run, carrying the sizing policy so which one was used is recorded in
+    the manifest rather than assumed."""
+    return RiskConfig(sl_tp_source=settings.sl_tp_source)
+
+
 def _prefilter_config(settings: Settings) -> PrefilterConfig:
     """Prefilter with the run's blocked-regime list, so which regimes we refuse is a measurable
     choice rather than a hardcoded one."""
@@ -650,7 +656,7 @@ def build_online_exec_manifest(settings: Settings, *, shadow_config: ShadowConfi
     manifest = execution_manifest(
         modeled_spread_pct=settings.replay_spread_pct, slippage_pct=settings.slippage_pct,
         config=shadow_config, single_position=True, cooldown_bars=0,
-        risk_config=RiskConfig().model_dump(mode="json"),
+        risk_config=_risk_config(settings).model_dump(mode="json"),
         prefilter_config=_prefilter_config(settings).model_dump(mode="json"),
         eligibility_policy=_eligibility_config(settings).as_policy(),
         calendar_version=calendar_for(provider_name).version)
