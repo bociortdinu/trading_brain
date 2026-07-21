@@ -9,6 +9,7 @@ today: backtests and the continuous online loop run the free deterministic strat
 stand-in — Claude stays gated off in the unbounded loop until it has a daily/monthly cost cap
 and safe lifecycle.)
 
+- **Start here — how to run it, step by step: [docs/PORNIRE.md](docs/PORNIRE.md)**
 - Architecture & functionality: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - Execution plan (phased): [docs/EXECUTION_PLAN.md](docs/EXECUTION_PLAN.md)
 - Current completion/readiness audit: [docs/PROJECT_COMPLETION_REPORT.md](docs/PROJECT_COMPLETION_REPORT.md)
