@@ -280,8 +280,11 @@ async def build_calendar(settings, *, start: date, end: date):
     key = getattr(settings, "fred_api_key", None)
     if not key:
         return None, "no_fred_api_key"
+    # NOT http_timeout_seconds: that is tuned for the local trading_hands calls (10s) and is far
+    # too tight for a paginated round trip to a remote API — the calendar was silently reported
+    # unavailable on timeout, which fails open and quietly removes every blackout.
     provider = FredCalendarProvider(
-        key, timeout_seconds=getattr(settings, "http_timeout_seconds", 15.0))
+        key, timeout_seconds=getattr(settings, "fred_timeout_seconds", 90.0))
     try:
         return await provider.fetch(start, end), None
     except FredCalendarError as exc:

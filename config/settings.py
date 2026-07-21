@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     # calendar must not silently halt trading, but it IS reported as unavailable so the
     # model is never told "no events" when we simply do not know).
     fred_api_key: str | None = None
+    # Generous on purpose: the calendar is fetched ONCE per run and needs several paginated
+    # round trips to FRED. The local trading_hands timeout is far too tight for it.
+    fred_timeout_seconds: float = Field(90.0, gt=0)
     calendar_blackout_minutes_before: int = Field(30, ge=0)
     # Short by measurement, not by taste — a 15-minute after-window blocked the only winning
     # trade in the 2026-07-14 CPI backtest. See CalendarConfig in economic_calendar.py.
@@ -104,10 +107,6 @@ class Settings(BaseSettings):
     paid_budget_day_usd: float = Field(0.0, ge=0)
     paid_budget_month_usd: float = Field(0.0, ge=0)
 
-    # LIVE ORDER ROUTING (execution/live_router.py). This is the only path in trading_brain that
-    # sends a real order, so every default is the safe one and enabling it must be deliberate.
-    # trading_hands has its OWN TRADING_ENABLED switch; both must be true — this flag cannot
-    # override the execution layer's refusal.
     # Regimes the prefilter refuses to trade. Default keeps the historical behaviour, but note
     # it is arguably backwards: `choppy` is the classifier's ELSE branch (ADX 20-25, or ADX>=25
     # with mixed EMA alignment — i.e. a reversal in progress), while `range` (ADX<20, genuinely
@@ -115,6 +114,10 @@ class Settings(BaseSettings):
     # rather than argued about.
     prefilter_blocked_regimes: list[str] = Field(default_factory=lambda: ["choppy"])
 
+    # LIVE ORDER ROUTING (execution/live_router.py). This is the only path in trading_brain that
+    # sends a real order, so every default is the safe one and enabling it must be deliberate.
+    # trading_hands has its OWN TRADING_ENABLED switch; both must be true — this flag cannot
+    # override the execution layer's refusal.
     live_execution_enabled: bool = False
     live_require_demo: bool = True                       # refuse to route against a live account
     live_volume: float = Field(0.01, gt=0)               # lots per order
