@@ -61,6 +61,33 @@ python -m app.jobs
 the contextual spread is a separate append-only fact, never mutating the observation).
 No orders are placed.
 
+## Phase 2.5 — harvest a persistent bar archive (do this FIRST)
+
+XTB's CoreAPI serves a **rolling window** over a session-bound connection, so a backtest that
+fetches live needs `trading_hands` authenticated, cannot run on a weekend, and is not
+reproducible — `freeze_dataset` hashes the bars but never stores them, so once the window rolls
+the exact bytes are gone. `app.harvest` writes the bars to disk in the format
+`CsvMarketDataProvider` reads, **merging** with what is already there, so repeated harvests
+accumulate history far beyond the provider's window.
+
+```bash
+# while trading_hands is up and authenticated (BRAIN_MARKET_DATA_PROVIDER=xtb):
+python -m app.harvest --out data/bars --count 10000
+
+# then every backtest runs offline, free, reproducible, no live session:
+BRAIN_MARKET_DATA_PROVIDER=csv BRAIN_CSV_DIR=data/bars \
+    python -m shadow.runner --count 2500 --persist --run-id det-smoke
+```
+
+No orders, no paid AI, no DB writes. Conflicts are **fail-closed**: if a fetched bar disagrees
+with the archived bar for the same `open_time`, the run aborts and names the bars rather than
+rewriting history (`--on-conflict keep|replace` to decide deliberately).
+
+It also reports **backtest-readiness**, and exits non-zero when the archive is not ready. Every
+timeframe needs `MIN_BARS` (200) of warmup *before* the first bar you want to evaluate, and the
+daily is usually the binding constraint — an archive with thousands of M15 bars but a shallow
+daily silently yields `bars_evaluated=0`, which is indistinguishable from a broken pipeline.
+
 ## Phase 3 / 5 — shadow backtest & temporal-fold evaluation
 
 No real money, no execution. The deterministic maker (`ConfluenceStrategy`) is free; `--maker
@@ -127,7 +154,7 @@ BRAIN_TEST_DB_DSN='postgresql://user:pw@127.0.0.1:5433/trading_brain_test' pytho
 | `data_collector/` | `MarketDataProvider` (XTB real-time, Polygon/Massive, CSV) + strict candle/series validation + session calendars + news (`as_of`) |
 | `features/` | indicators (numpy), regime/S-R engineering, MTF `FeaturePacket`, eligibility |
 | `database/` | versioned `migrations/` (0001–0027), admin-run DDL, isolated test-DB bootstrap, repository/feedback and operational telemetry |
-| `app/` | `smoke`, `collect`, `decide`, `jobs` (M15 scheduler) |
+| `app/` | `smoke`, `collect`, `decide`, `jobs` (M15 scheduler), `harvest` (persistent bar archive) |
 | `decision/` | `schema` (strict I/O contract, incl. news + feedback), `prefilter`, `llm_client` (Anthropic, fail-closed), `pipeline` |
 | `risk/` | `engine.py` — rigid gate + deterministic ATR-based SL/TP (never the LLM's job) |
 | `shadow/` | `virtual_broker`, `reconciler`, `runner` (backtest), `online` (continuous), `metrics`, `evaluation` (temporal-fold report + baselines; not true walk-forward — the maker is not trainable per fold) |

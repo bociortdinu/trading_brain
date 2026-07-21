@@ -68,6 +68,89 @@ blocantele de produs de mai sus.
 
 ---
 
+## ACTUALIZARE 2026-07-21 — arhiva de bare pe disc (pasul 0 devine executabil)
+
+**Constatare nouă (verificată în cod, nu presupusă):** „reproducibilitatea" era **unidirecțională**.
+`freeze_dataset` calculează hash-ul barelor, dar **nu le stochează** ([database/repository.py:115](../database/repository.py#L115),
+[0031_datasets.sql](../database/migrations/0031_datasets.sql)), iar `shadow.runner` cere barele de la
+`build_provider(settings)` la **fiecare** rulare ([shadow/runner.py:526-531](../shadow/runner.py#L526-L531)).
+Cum XTB CoreAPI servește o **fereastră rulantă** pe o sesiune autentificată, un `dataset_id` dovedea
+*că* datele s-au schimbat, nu *care* erau — după ce fereastra se rotea, octeții exacți deveneau
+irecuperabili. În plus, orice backtest cerea `trading_hands` viu (deci nimic în weekend).
+
+**REZOLVAT:** `python -m app.harvest` ([app/harvest.py](../app/harvest.py)) scrie barele pe disc în
+exact formatul citit de `CsvMarketDataProvider` și **face merge** cu arhiva existentă, deci harvest-uri
+repetate **acumulează** istoric dincolo de fereastra furnizorului. După un harvest, tot lanțul de
+backtest rulează **offline, gratuit, reproductibil**. Conflictele sunt **fail-closed** (o bară care
+diferă de cea arhivată oprește rularea și e numită; `--on-conflict keep|replace` e scăpărea
+deliberată), scrierea e atomică (tmp + `os.replace`).
+
+**Capcană descoperită empiric, acum raportată explicit:** un backtest pe o arhivă cu mii de bare M15
+dar cu **daily scurt** returnează tăcut `bars_evaluated=0` — identic cu un pipeline stricat. Cauza:
+`MIN_BARS=200` se cere în **fiecare** timeframe la fiecare `as_of`, iar `runner` cere `count` bare
+uniform pentru toate tf-urile. `app.harvest` calculează acum barele efectiv evaluabile, numește
+timeframe-ul care leagă (de regulă `1day`) și **iese cu cod 1** dacă arhiva nu e gata.
+
+**Verificat cap-coadă local (date sintetice, fără XTB):** harvest → arhivă → `shadow.runner` offline
+= `bars_evaluated=2301`, 186 trade-uri. (Win-rate-ul mare e artefact de trend sintetic — **nu** e
+dovadă de edge; dovada cere date XAUUSD reale.)
+
+**Stare teste:** fără-DB **324 passed** / 69 skipped; cu DB **393 passed**, 0 eșecuri.
+**Migrări:** 0001–0031 aplică **curat de la zero** (verificat pe o bază scratch, apoi ștearsă).
+
+**⚠ Constatare de mediu:** baza de date de PRODUCȚIE e la migrarea **0023**, codul livrează **0031** —
+**8 migrări neaplicate**, printre care `paid_attempts` (registrul gateway-ului financiar) și
+`datasets`. Deci controalele de buget pe calea plătită **nu au tabelele lor** în baza reală. De
+aplicat `python -m database.migrate` înainte de orice test plătit (0025 face backfill onest cu
+santinele `unknown`/`legacy`, deci cele 108 snapshoturi existente supraviețuiesc).
+
+### Execuție 2026-07-21 (aceeași sesiune) — pașii 0 și 1 sunt ACUM ÎNDEPLINIȚI
+
+- **Baza de producție migrată 0023 → 0031.** Backup logic JSON luat înainte (576 rânduri, 13 tabele,
+  în `backups/prod_backup_pre_0031`, 0600, fiindcă `pg_dump` nu e instalat). După migrare: toate
+  cele 576 de rânduri intacte, 0 identități NULL, 31 migrări. Santinelele `unknown`/`legacy` nu au
+  fost necesare — toate cele 108 snapshoturi aveau deja provider real (xtb 55, csv 51, polygon 2).
+- **`trading_hands` pornit și conectat** (cont demo `21842412`, `trading_enabled=false`, loopback).
+  Testele Go: pass (necachate), `go vet` curat, build curat. Testele launcher-ului Node: 8/8 pass.
+  Toate erau marcate „NErulate" în raportul anterior.
+- **PASUL 0 ÎNDEPLINIT — date XAUUSD REALE.** `app.harvest --count 10000` → **21.151 bare** în
+  `data/bars/`: `1day` 10.000 bare **din 1985-08-27**, `4h` 3.166, `1h` 3.869, `15min` 4.116.
+- **PASUL 1 ÎNDEPLINIT — lanțul gratuit cap-coadă pe date reale.** `shadow.runner --count 3917`
+  offline (provider csv): `bars_evaluated=3718`, `trades_opened=4`. Rulare persistată
+  `run-id=real-gold-det-2026-07-21`, `dataset_id=c17968e747079f12`; re-freeze pe aceeași arhivă dă
+  **același** dataset_id → reproductibilitatea e acum **reală**, nu doar detectabilă.
+- **Rezultatul nu spune nimic despre edge:** 4 trade-uri (win 25%, expectancy −0.333R, total
+  −1.331R). Eșantion mult prea mic pentru orice concluzie, în ambele direcții.
+
+### ⚠ CONSTATARE DE COST — estimarea anterioară era subevaluată de ~3×
+
+`decision_maker.decide()` se apelează pentru **fiecare** bară care trece prefiltrul
+([decision/pipeline.py:104-111](../decision/pipeline.py#L104-L111)), iar **position gate-ul se
+aplică DUPĂ** ([shadow/runner.py:266-272](../shadow/runner.py#L266-L272)). Deci barele blocate de
+poziția deschisă sunt **plătite și apoi aruncate**.
+
+Măsurat, nu estimat: rularea de mai sus a persistat **2255 decizii** (= 3718 − 1463 filtrate). Cu
+Claude, exact acestea ar fi fost apeluri plătite:
+
+| Model | $/decizie | 2255 decizii | Note |
+|---|---|---|---|
+| `claude-haiku-4-5` | ~0.0032 | **~$7.2** | modelul din `.env` |
+| `claude-sonnet-5` | ~0.0096 | **~$21.6** | default-ul din cod |
+
+Plus retry-uri (până la 4 încercări HTTP/decizie în worst case). Nota din memorie „~800 apeluri,
+$2–3" **nu se aplică** acestei ferestre. Din cele 2255, **44 au fost blocate de position gate** —
+cost pur pierdut, evitabil dacă gate-ul s-ar verifica înaintea makerului.
+
+**Recomandare înainte de orice rulare plătită:** (a) mută verificarea position gate ÎNAINTE de
+`decide()` (economie directă), (b) pornește cu `--max-llm-calls 1` ca smoke, (c) setează bugetul
+USD explicit în gateway (default 0 = blocat).
+
+Rămâne **NO-GO** pentru rularea plătită, dar din motive mult mai puține: rate reale GOLD
+swap/comision (`unset` → R nu e net de finanțare), Compose live + soak, CI remote verde, și
+decizia de buget de mai sus.
+
+---
+
 ## 1. Scopul aplicației
 
 Un sistem algoritmic de **shadow-trading pe aur (XAUUSD)** pe XTB, în care:
