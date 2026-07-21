@@ -34,8 +34,8 @@ from pydantic import BaseModel, Field
 from core.models import Direction
 
 # Reproducibility manifest versions (stored on every decision).
-DECISION_PROMPT_VERSION = "decision-prompt-2026.1"
-DECISION_SCHEMA_VERSION = "decision-schema-2026.3"   # 2026.3: + as_of-safe feedback context (Faza 5)
+DECISION_PROMPT_VERSION = "prompt-2026.2"   # 2026.2: news-unknown wording + model-proposed SL/TP
+DECISION_SCHEMA_VERSION = "decision-schema-2026.4"   # 2026.4: + model-proposed SL/TP (validated downstream)
 STRATEGY_VERSION = "strategy-mvp-2026.1"
 
 Mode = Literal["online", "replay"]
@@ -115,13 +115,26 @@ def decision_fingerprint(*, input_hash: str, model: str, provider: str,
 
 class DecisionOutput(BaseModel):
     """The LLM's structured decision. STRICT: only BUY/SELL/NO_TRADE, confidence in [0,1]
-    (ORDINAL), non-empty rationale. Extra fields rejected (no smuggled SL/TP/size)."""
+    (ORDINAL), non-empty rationale. Extra fields still rejected.
+
+    SL/TP are PROPOSALS, not decisions. The model sees where support and resistance sit, so a
+    stop placed beyond structure is better than one placed at an arbitrary ATR multiple that may
+    land mid-range. But a model that chooses its own stop also chooses its own risk — a very wide
+    stop with a near target flatters the win rate while being a poor strategy. So these are
+    suggestions that the Risk Engine validates against bounds the model cannot influence, and it
+    rejects or falls back rather than trusting them. Both fields are optional: a model that omits
+    them (or is run with the ATR sizing policy) simply gets the deterministic sizing."""
     model_config = {"extra": "forbid"}
 
     direction: Direction
     confidence: float = Field(ge=0.0, le=1.0)     # ordinal, not a probability
     rationale: str = Field(min_length=1, max_length=4000)
     key_factors: list[str] = Field(default_factory=list, max_length=12)
+    # Distance from entry, in PERCENT and always positive — direction is carried by `direction`,
+    # so a signed value here would be a second, contradictable source of truth.
+    proposed_sl_pct: float | None = Field(default=None, gt=0, le=10.0)
+    proposed_tp_pct: float | None = Field(default=None, gt=0, le=20.0)
+    sl_tp_rationale: str | None = Field(default=None, max_length=1000)
 
 
 class DecisionMaker(Protocol):

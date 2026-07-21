@@ -18,6 +18,8 @@ live order on `approved` alone.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from core.models import Direction
@@ -44,6 +46,10 @@ class RiskConfig(BaseModel):
     min_confidence: float = Field(0.55, ge=0.0, le=1.0)   # ORDINAL threshold
     sl_atr_mult: float = Field(1.5, gt=0)                 # SL = mult * ATR%
     reward_risk: float = Field(2.0, gt=0)                 # TP = reward_risk * SL
+    # "atr" = size the stop deterministically (the model never sees the knob). "model" = let the
+    # model propose from market structure and validate it here. The default stays "atr" so this
+    # is an opt-in experiment rather than a silent change of what every past run measured.
+    sl_tp_source: Literal["atr", "model"] = "atr"
     min_sl_pct: float = Field(0.05, gt=0)                 # reject stops tighter than this
     max_sl_pct: float = Field(3.0, gt=0)                  # reject stops wider than this
     max_spread_fraction_of_sl: float = Field(0.33, gt=0)  # spread must be < this * SL
@@ -61,6 +67,9 @@ class RiskVerdict(BaseModel):
     spread_pct: float | None = None
     spread_provenance: str = "unavailable"
     session_open: bool | None = None
+    # Where SL/TP came from, so a track record can separate model-sized from ATR-sized trades
+    # instead of averaging two different policies together.
+    sl_tp_source: str = "atr"
     execution_ready: bool = False        # always False until PENDING_EXECUTION_GATES are wired
     pending_execution_gates: list[str] = Field(default_factory=lambda: list(PENDING_EXECUTION_GATES))
     risk_config_version: str
@@ -71,6 +80,37 @@ def compute_sl_tp(atr_pct_m15: float, config: RiskConfig) -> tuple[float, float]
     sl = round(atr_pct_m15 * config.sl_atr_mult, 3)
     tp = round(sl * config.reward_risk, 3)
     return sl, tp
+
+
+def resolve_sl_tp(decision, atr_pct_m15: float, config: RiskConfig) -> tuple[float, float, str]:
+    """Pick the SL/TP this trade will use, and say WHERE it came from.
+
+    With `sl_tp_source="model"` the model's proposal is used when it is present and passes the
+    reward:risk floor; otherwise we fall back to ATR sizing rather than trading a shape the risk
+    rules do not accept. The bounds themselves (min/max SL, spread-vs-stop) are enforced by the
+    caller for BOTH sources — a proposal gets no easier a path than a computed value.
+
+    Returns (sl_pct, tp_pct, source) where source is one of:
+      "atr"                      — deterministic sizing
+      "model"                    — the model's proposal, accepted
+      "atr_fallback:no_proposal" — policy is model, but none was offered
+      "atr_fallback:rr_too_low"  — proposal offered, reward:risk below the floor
+    """
+    atr_sl, atr_tp = compute_sl_tp(atr_pct_m15, config)
+    if config.sl_tp_source != "model":
+        return atr_sl, atr_tp, "atr"
+
+    sl = getattr(decision, "proposed_sl_pct", None)
+    tp = getattr(decision, "proposed_tp_pct", None)
+    if sl is None or tp is None:
+        return atr_sl, atr_tp, "atr_fallback:no_proposal"
+
+    # The one shape check that cannot be left to the bounds below: a wide stop with a near target
+    # is exactly how a self-sized stop flatters a win rate, so the reward:risk floor is applied to
+    # the PROPOSAL, not merely to the ATR-derived pair.
+    if tp < sl * config.reward_risk:
+        return atr_sl, atr_tp, "atr_fallback:rr_too_low"
+    return round(float(sl), 3), round(float(tp), 3), "model"
 
 
 def evaluate_risk(
@@ -111,7 +151,7 @@ def evaluate_risk(
     if atr is None or atr <= 0:
         return reject("no_atr")
 
-    sl_pct, tp_pct = compute_sl_tp(atr, config)
+    sl_pct, tp_pct, sl_tp_source = resolve_sl_tp(decision, atr, config)
 
     # Bounds: reject (never clamp) an SL outside the allowed band.
     if not (config.min_sl_pct <= sl_pct <= config.max_sl_pct):
@@ -125,5 +165,5 @@ def evaluate_risk(
     return RiskVerdict(
         approved=True, reason=None, direction=d, confidence=conf, sl_pct=sl_pct, tp_pct=tp_pct,
         spread_pct=packet.spread_pct, spread_provenance=spread_provenance, session_open=session_open,
-        execution_ready=False, risk_config_version=config.version,
+        execution_ready=False, risk_config_version=config.version, sl_tp_source=sl_tp_source,
     )

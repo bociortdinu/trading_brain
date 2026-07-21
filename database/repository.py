@@ -681,7 +681,7 @@ def insert_llm_call(dsn: str, result, *, snapshot_id: int | None = None,
 
 def upsert_shadow_trade(dsn: str, *, decision_id: int, run_id: str, symbol: str, trade, outcome,
                         timeframe: str, timeout_bars: int, costs: dict | None = None,
-                        observed_at=None) -> tuple[int, str]:
+                        observed_at=None, external_id: str | None = None) -> tuple[int, str]:
     """Idempotently persist/refresh a shadow trade for (decision_id, run_id).
 
     A re-run UPSERTs the SAME row — an open trade is closed IN PLACE (entry/SL/TP stay
@@ -718,8 +718,8 @@ def upsert_shadow_trade(dsn: str, *, decision_id: int, run_id: str, symbol: str,
                 (decision_id, run_id, symbol, side, mode, entry_price, sl_price, tp_price,
                  opened_at, status, exit_price, exit_reason, closed_at, outcome_observed_at,
                  r_multiple, r_pessimistic, r_optimistic, ambiguous, timeframe, timeout_bars,
-                 spread_pct, spread_provenance, slippage_pct, costs)
-            VALUES (%s,%s,%s,%s,'shadow',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 spread_pct, spread_provenance, slippage_pct, costs, external_id)
+            VALUES (%s,%s,%s,%s,'shadow',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (decision_id, run_id) DO UPDATE SET
                 status              = EXCLUDED.status,
                 exit_price          = EXCLUDED.exit_price,
@@ -730,7 +730,10 @@ def upsert_shadow_trade(dsn: str, *, decision_id: int, run_id: str, symbol: str,
                 r_pessimistic       = EXCLUDED.r_pessimistic,
                 r_optimistic        = EXCLUDED.r_optimistic,
                 ambiguous           = EXCLUDED.ambiguous,
-                costs               = EXCLUDED.costs
+                costs               = EXCLUDED.costs,
+                -- Never clear a broker order id we already hold: a later reconcile tick passes
+                -- external_id=None, and losing the link would orphan the real position.
+                external_id         = COALESCE(EXCLUDED.external_id, trades.external_id)
             WHERE trades.status = 'open'
             RETURNING id, (xmax = 0) AS inserted
             """,
@@ -739,7 +742,7 @@ def upsert_shadow_trade(dsn: str, *, decision_id: int, run_id: str, symbol: str,
                 trade.opened_at, outcome.status, outcome.exit_price, outcome.exit_reason,
                 outcome.closed_at, observed, outcome.r_multiple, outcome.r_pessimistic,
                 outcome.r_optimistic, outcome.ambiguous, timeframe, timeout_bars, trade.spread_pct,
-                trade.spread_provenance, trade.slippage_pct, Json(cost_model),
+                trade.spread_provenance, trade.slippage_pct, Json(cost_model), external_id,
             ),
         ).fetchone()
         # MONOTONE: `WHERE trades.status = 'open'` means a conflict on an ALREADY-CLOSED trade

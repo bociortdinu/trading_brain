@@ -358,6 +358,23 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     # Build the trade (if any) BEFORE persisting, so decision + audit + open trade go in ONE
     # transaction — a crash can't leave a committed decision without its trade (online had no
     # recovery for that window, unlike the backtest).
+    # LIVE ORDER, placed BEFORE the chain is written so the broker's order id can be stored WITH
+    # the trade. Routing after the write left external_id NULL, which meant nothing could later
+    # tell which shadow trade corresponded to which real position — and therefore nothing could
+    # close it. The order is the risky half, so it happens first and its outcome is recorded
+    # whether or not it succeeded.
+    live_external_id = None
+    if live_router is not None and record.risk_approved and record.decision is not None:
+        route = await live_router.route(
+            symbol=brain_symbol, direction=record.decision.direction,
+            approved=record.risk_approved, sl_pct=record.risk.sl_pct,
+            tp_pct=record.risk.tp_pct, confidence=record.decision.confidence,
+            as_of=packet.bar_close)
+        live_external_id = route.external_id
+        summary["live"] = (f"placed:{route.external_id}" if route.placed
+                           else f"skipped:{route.reason}")
+        log.info("live route: %s", summary["live"])
+
     open_trade = None
     if record.risk_approved:
         observed_mid = None
@@ -373,7 +390,8 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
         open_trade = {"symbol": brain_symbol, "trade": trade,
                       "outcome": reconcile(trade, [], shadow_config), "timeframe": TRIGGER_TF,
                       "timeout_bars": shadow_config.timeout_bars,
-                      "costs": cost_manifest(trade, shadow_config), "observed_at": None}
+                      "costs": cost_manifest(trade, shadow_config), "observed_at": None,
+                      "external_id": live_external_id}
     dec_id, inserted = insert_decision(
         settings.db_dsn, snapshot_id=snap_id, evaluation_id=eval_id, model=model_name,
         record=record, ai_input=inp.model_dump(mode="json"),
@@ -391,20 +409,6 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     summary["outcome"] = "decided"
     if open_trade is not None:
         summary["opened_trade"] = "opened" if inserted else "exists"
-
-    # LIVE ORDER — last, and only after the decision + shadow chain are already on disk. Ordering
-    # matters: routing first would risk an order with no record of why it was sent. This way the
-    # worst case is an order placed but not yet linked, and the router's position gate catches
-    # that on the next tick because it reads the ACCOUNT rather than our own state.
-    if live_router is not None and record.risk_approved and record.decision is not None:
-        route = await live_router.route(
-            symbol=brain_symbol, direction=record.decision.direction,
-            approved=record.risk_approved, sl_pct=record.risk.sl_pct,
-            tp_pct=record.risk.tp_pct, confidence=record.decision.confidence,
-            as_of=packet.bar_close)
-        summary["live"] = (f"placed:{route.external_id}" if route.placed
-                           else f"skipped:{route.reason}")
-        log.info("live route: %s", summary["live"])
 
     return summary
 

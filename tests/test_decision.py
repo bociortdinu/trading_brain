@@ -368,3 +368,82 @@ def test_execution_config_is_part_of_the_decision_fingerprint():
     fp = lambda h: decision_fingerprint(**base, execution_hash=h)      # noqa: E731
     assert len({fp(h_a), fp(h_b), fp(h_c)}) == 3                       # -> three distinct decisions
     assert fp(h_a) == fp(h_a)                                          # deterministic
+
+
+# ---- model-proposed SL/TP (validated, never trusted) ---- #
+def _out_sl(direction=Direction.BUY, conf=0.8, sl=None, tp=None):
+    return DecisionOutput(direction=direction, confidence=conf, rationale="ok",
+                          proposed_sl_pct=sl, proposed_tp_pct=tp)
+
+
+def test_atr_policy_ignores_a_proposal_entirely():
+    """Default policy must be unaffected by anything the model proposes — otherwise every past
+    run's sizing would silently change."""
+    from risk.engine import compute_sl_tp, resolve_sl_tp
+
+    cfg = RiskConfig()                                   # sl_tp_source="atr"
+    sl, tp, source = resolve_sl_tp(_out_sl(sl=1.0, tp=9.0), 0.2, cfg)
+    assert (sl, tp) == compute_sl_tp(0.2, cfg) and source == "atr"
+
+
+def test_model_policy_uses_a_sound_proposal():
+    from risk.engine import resolve_sl_tp
+
+    cfg = RiskConfig(sl_tp_source="model")
+    sl, tp, source = resolve_sl_tp(_out_sl(sl=0.4, tp=1.2), 0.2, cfg)
+    assert (sl, tp, source) == (0.4, 1.2, "model")
+
+
+def test_a_wide_stop_with_a_near_target_is_discarded():
+    """The failure mode self-sizing invites: a huge stop and a close target flatter the win rate
+    while being a poor strategy. It must fall back, not be traded."""
+    from risk.engine import compute_sl_tp, resolve_sl_tp
+
+    cfg = RiskConfig(sl_tp_source="model")
+    sl, tp, source = resolve_sl_tp(_out_sl(sl=2.0, tp=0.3), 0.2, cfg)
+    assert (sl, tp) == compute_sl_tp(0.2, cfg)
+    assert source == "atr_fallback:rr_too_low"
+
+
+def test_missing_proposal_falls_back_and_says_so():
+    from risk.engine import compute_sl_tp, resolve_sl_tp
+
+    cfg = RiskConfig(sl_tp_source="model")
+    sl, tp, source = resolve_sl_tp(_out_sl(), 0.2, cfg)
+    assert (sl, tp) == compute_sl_tp(0.2, cfg)
+    assert source == "atr_fallback:no_proposal"
+
+
+def test_a_proposed_stop_outside_the_bounds_is_still_rejected():
+    """A proposal gets no easier a path than a computed value: the same min/max SL band applies."""
+    packet = _packet(atr=0.2, spread=0.02)
+    v = evaluate_risk(_out_sl(sl=5.0, tp=15.0), packet, RiskConfig(sl_tp_source="model"))
+    assert not v.approved and "sl_out_of_bounds" in v.reason
+
+
+def test_a_proposed_stop_the_spread_would_eat_is_rejected():
+    packet = _packet(atr=0.2, spread=0.05)
+    v = evaluate_risk(_out_sl(sl=0.06, tp=0.20), packet, RiskConfig(sl_tp_source="model"))
+    assert not v.approved and "spread_vs_sl" in v.reason
+
+
+def test_verdict_records_where_the_sizing_came_from():
+    """A track record must be able to separate model-sized from ATR-sized trades rather than
+    averaging two different policies together."""
+    packet = _packet(atr=0.2, spread=0.02)
+    model = evaluate_risk(_out_sl(sl=0.4, tp=1.2), packet, RiskConfig(sl_tp_source="model"))
+    atr = evaluate_risk(_out_sl(sl=0.4, tp=1.2), packet, RiskConfig())
+    assert model.approved and model.sl_tp_source == "model" and model.sl_pct == 0.4
+    assert atr.approved and atr.sl_tp_source == "atr"
+
+
+def test_schema_still_refuses_smuggled_fields():
+    """SL/TP are now proposable, but the output contract stays closed otherwise."""
+    with pytest.raises(ValidationError):
+        DecisionOutput(direction=Direction.BUY, confidence=0.8, rationale="x", volume=1.0)
+
+
+def test_a_negative_proposed_stop_is_rejected_by_the_schema():
+    with pytest.raises(ValidationError):
+        DecisionOutput(direction=Direction.BUY, confidence=0.8, rationale="x",
+                       proposed_sl_pct=-0.5, proposed_tp_pct=1.0)
