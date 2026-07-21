@@ -2,12 +2,17 @@
 
 Decision brain for the XTB trading system. Pure math in Python (data + indicators);
 a commercial LLM (Claude) is, *by design*, the sole directional decision-maker; a rigid
-Risk Engine gates every candidate decision. **No order is currently sent** — there is no live
-router and `execution_ready` is always `False`; the Risk Engine only approves *shadow*
-eligibility (deterministic SL/TP), and `trading_hands` is used read-only for data. (Runtime
-today: backtests and the continuous online loop run the free deterministic strategy as a
-stand-in — Claude stays gated off in the unbounded loop until it has a daily/monthly cost cap
-and safe lifecycle.)
+Risk Engine gates every candidate decision.
+
+**Real orders ARE possible now, and only deliberately.** `execution/live_router.py` routes an
+approved verdict to a real order, and `execution/position_manager.py` closes it. Both are OFF by
+default and need three separate switches to fire: `--live` on the loop, `TRADING_ENABLED=true`
+in trading_hands, and a demo account (a non-demo one is refused). Paid model calls are gated
+separately again — `BRAIN_PAID_AI_ENABLED` plus USD budgets that default to zero, so a
+configured API key is never sufficient to spend on its own.
+
+**There is still no evidence of edge.** The infrastructure is far ahead of the measurements: a
+handful of trades, no statistically meaningful sample. Treat every metric as provisional.
 
 - **Start here — how to run it, step by step: [docs/PORNIRE.md](docs/PORNIRE.md)**
 - Architecture & functionality: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
