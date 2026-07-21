@@ -341,7 +341,8 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
         )
     eval_id = insert_evaluation(settings.db_dsn, snap_id, result)
     record = await run_decision(packet, result, decision_maker, mode="online",
-                                prefilter_config=PrefilterConfig(), risk_config=RiskConfig(),
+                                prefilter_config=_prefilter_config(settings),
+                                risk_config=RiskConfig(),
                                 calendar=calendar_for(provider_name), feedback=feedback)
     last = getattr(decision_maker, "last_result", None)
     if record.stage == "llm_failed":
@@ -470,6 +471,12 @@ async def shadow_tick_with_retries(settings: Settings, provider, provider_name: 
                         attempt + 1, attempts, delay)
             await asyncio.sleep(delay)
     raise AssertionError("unreachable")
+
+
+def _prefilter_config(settings: Settings) -> PrefilterConfig:
+    """Prefilter with the run's blocked-regime list, so which regimes we refuse is a measurable
+    choice rather than a hardcoded one."""
+    return PrefilterConfig(blocked_regimes=list(settings.prefilter_blocked_regimes))
 
 
 def _shadow_config(settings: Settings) -> ShadowConfig:
@@ -617,7 +624,7 @@ def build_online_exec_manifest(settings: Settings, *, shadow_config: ShadowConfi
         modeled_spread_pct=settings.replay_spread_pct, slippage_pct=settings.slippage_pct,
         config=shadow_config, single_position=True, cooldown_bars=0,
         risk_config=RiskConfig().model_dump(mode="json"),
-        prefilter_config=PrefilterConfig().model_dump(mode="json"),
+        prefilter_config=_prefilter_config(settings).model_dump(mode="json"),
         eligibility_policy=_eligibility_config(settings).as_policy(),
         calendar_version=calendar_for(provider_name).version)
     manifest.update({

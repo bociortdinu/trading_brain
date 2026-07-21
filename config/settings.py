@@ -108,6 +108,13 @@ class Settings(BaseSettings):
     # sends a real order, so every default is the safe one and enabling it must be deliberate.
     # trading_hands has its OWN TRADING_ENABLED switch; both must be true — this flag cannot
     # override the execution layer's refusal.
+    # Regimes the prefilter refuses to trade. Default keeps the historical behaviour, but note
+    # it is arguably backwards: `choppy` is the classifier's ELSE branch (ADX 20-25, or ADX>=25
+    # with mixed EMA alignment — i.e. a reversal in progress), while `range` (ADX<20, genuinely
+    # directionless) is NOT blocked. Overridable per run so the alternative can be measured
+    # rather than argued about.
+    prefilter_blocked_regimes: list[str] = Field(default_factory=lambda: ["choppy"])
+
     live_execution_enabled: bool = False
     live_require_demo: bool = True                       # refuse to route against a live account
     live_volume: float = Field(0.01, gt=0)               # lots per order
