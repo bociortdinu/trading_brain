@@ -75,13 +75,32 @@ function fillTable(bodyId, rows, cols, emptyMsg, onRow) {
 function setCount(id, value) { const el = $(id); if (el) el.textContent = value; }
 
 // ---------------------------------------------------------------- tabs ------
+const TABS = $$(".tab").map((t) => t.dataset.tab);
+
 function activateTab(name) {
-  $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === name));
+  // Never let an unknown name (stale/tampered localStorage, bad deep link) hide EVERY panel.
+  if (!TABS.includes(name)) name = TABS[0];
+  $$(".tab").forEach((t) => {
+    const on = t.dataset.tab === name;
+    t.classList.toggle("active", on);
+    t.setAttribute("aria-selected", on ? "true" : "false");
+    t.tabIndex = on ? 0 : -1;          // roving tabindex: one stop, arrows move within
+  });
   $$(".tabpanel").forEach((p) => p.classList.toggle("active", p.id === `tab-${name}`));
   try { localStorage.setItem("brain-tab", name); } catch { /* ignore */ }
 }
 
-$$(".tab").forEach((t) => t.addEventListener("click", () => activateTab(t.dataset.tab)));
+$$(".tab").forEach((t, i) => {
+  t.addEventListener("click", () => activateTab(t.dataset.tab));
+  t.addEventListener("keydown", (e) => {
+    const step = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
+    if (!step) return;
+    e.preventDefault();
+    const next = (i + step + TABS.length) % TABS.length;
+    activateTab(TABS[next]);
+    $$(".tab")[next].focus();
+  });
+});
 $$("[data-goto]").forEach((el) => el.addEventListener("click", () => activateTab(el.dataset.goto)));
 
 // ---------------------------------------------------------------- load ------
@@ -128,8 +147,13 @@ function render(data) {
   strip.querySelector("span").textContent = hands.ok && db.ok
     ? `Sistem citibil · XTB ${hands.status?.environment || "—"} · actualizat ${timeLabel(data.generated_at, false)}`
     : `Atenție: ${!hands.ok ? "XTB deconectat" : ""} ${!db.ok ? "DB indisponibil" : ""}`;
-  setChip("#chip-xtb", "XTB", hands.ok ? (tradingEnabled === true ? "ORDINE ACTIVE" : "conectat") : "deconectat",
-    !hands.ok || tradingEnabled === true ? "bad" : "ok");
+  // A live session does NOT mean a working feed: show DEGRADED when quote/OHLCV are broken.
+  const feedDegraded = hands.session_ok && (!hands.quote_ok || !hands.candles_ok);
+  setChip("#chip-xtb", "XTB",
+    !hands.session_ok ? "deconectat"
+      : tradingEnabled === true ? "ORDINE ACTIVE"
+      : feedDegraded ? "feed degradat" : "conectat",
+    !hands.session_ok || tradingEnabled === true ? "bad" : feedDegraded ? "warn" : "ok");
   setChip("#chip-market", "Piață", data.runtime.market_open === true ? "deschisă"
     : data.runtime.market_open === false ? "închisă" : "necunoscută",
     data.runtime.market_open === true ? "ok" : "neutral");
@@ -141,9 +165,13 @@ function render(data) {
     criticals ? "bad" : alerts.length ? "warn" : "ok");
 
   // detailed status cards (Prezentare)
-  setStatusCard("#status-xtb", "XTB CoreAPI", hands.ok ? "Conectat" : "Deconectat",
-    hands.status ? `${hands.status.environment} · ordine ${tradingEnabled === false ? "DEZACTIVATE" : tradingEnabled === true ? "ACTIVE" : "NECUNOSCUT"}` : (hands.error || "fără răspuns"),
-    !hands.ok || tradingEnabled === true ? "bad" : tradingEnabled === false ? "ok" : "warn");
+  setStatusCard("#status-xtb", "XTB CoreAPI",
+    !hands.session_ok ? "Deconectat" : feedDegraded ? "Feed degradat" : "Conectat",
+    hands.status
+      ? `${hands.status.environment} · ordine ${tradingEnabled === false ? "DEZACTIVATE" : tradingEnabled === true ? "ACTIVE" : "NECUNOSCUT"}`
+        + (feedDegraded ? ` · ${!hands.quote_ok ? "fără quote" : ""}${!hands.quote_ok && !hands.candles_ok ? " + " : ""}${!hands.candles_ok ? "fără OHLCV" : ""}` : "")
+      : (hands.error || "fără răspuns"),
+    !hands.session_ok || tradingEnabled === true ? "bad" : feedDegraded ? "warn" : tradingEnabled === false ? "ok" : "warn");
   setStatusCard("#status-market", "Sesiune GOLD",
     data.runtime.market_open === true ? "Deschisă" : data.runtime.market_open === false ? "Închisă" : "Necunoscută",
     candlePayload.last_time_iso ? `bară ${ageLabel(candlePayload.last_time_iso)}` : "fără bară XTB",
@@ -243,6 +271,13 @@ function renderMetrics(summary, runId) {
   $("#metric-trades").textContent = integer(summary.trades_total);
   $("#metric-open").textContent = integer(summary.trades_open);
   $("#metric-win").textContent = pct(summary.win_rate);
+  // Quarantined trades were NEVER reconciled -> they are not "closed" and are not in the win-rate
+  // denominator. Shown separately so the number can't be mistaken for a result.
+  $("#metric-win-basis").textContent = `din ${integer(summary.trades_closed)} închise`;
+  $("#metric-closed").textContent = integer(summary.trades_closed);
+  const q = $("#metric-quarantined");
+  q.textContent = integer(summary.trades_quarantined);
+  q.className = Number(summary.trades_quarantined || 0) > 0 ? "negative" : "";
   const expectancy = summary.expectancy_r;
   const expNode = $("#metric-expectancy");
   expNode.textContent = expectancy === null || expectancy === undefined ? "—" : `${Number(expectancy) >= 0 ? "+" : ""}${n(expectancy, 3)}R`;
@@ -484,9 +519,14 @@ function renderConflicts(rows) {
 function populateRunFilter(runs, selected) {
   const select = $("#run-filter");
   const current = selected || select.value;
-  select.innerHTML = `<option value="">Toate run-urile</option>` + runs.map((row) =>
-    `<option value="${escapeHtml(row.run_id)}">${escapeHtml(row.run_id)}</option>`).join("");
-  if ([...select.options].some((option) => option.value === current)) select.value = current;
+  const ids = runs.map((r) => r.run_id);
+  // The run list is capped (LIMIT), so an OLDER selected run may not be in it. Re-add it explicitly
+  // instead of letting the filter silently fall back to "all runs" on the next refresh.
+  const options = [...ids];
+  if (current && !ids.includes(current)) options.unshift(current);
+  select.innerHTML = `<option value="">Toate run-urile</option>` + options.map((id) =>
+    `<option value="${escapeHtml(id)}">${escapeHtml(id)}${ids.includes(id) ? "" : " (selectat)"}</option>`).join("");
+  if (current) select.value = current;
 }
 
 function showDialog(title, payload) {

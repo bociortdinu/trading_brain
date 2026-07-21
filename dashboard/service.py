@@ -37,6 +37,39 @@ def json_safe(value: Any) -> Any:
     return value
 
 
+# Keys whose VALUE must never reach the browser, wherever they appear (manifests, heartbeat
+# details, pipeline results, broker payloads, error messages). Substring match, case-insensitive.
+_SECRET_KEY_PARTS = (
+    "password", "passwd", "secret", "token", "api_key", "apikey", "dsn", "authorization",
+    "auth", "credential", "ticket", "session_id", "sessionid", "account", "private", "cookie",
+)
+REDACTED = "[redactat]"
+
+# The ONLY broker /status fields the operator console needs. Anything else the service adds later
+# (account numbers, tickets, internal ids) is dropped by default rather than forwarded blindly.
+_STATUS_WHITELIST = ("connected", "environment", "trading_enabled", "symbol", "server_time")
+
+
+def redact(value: Any, _key: str = "") -> Any:
+    """Defence in depth: recursively drop values under sensitive keys. The dashboard never QUERIES
+    secrets, but nested JSONB (manifests, details, results) and broker payloads are pass-through, so
+    a future field must not silently leak. Applied to the whole response before serialization."""
+    if any(part in _key.lower() for part in _SECRET_KEY_PARTS) and value is not None:
+        return REDACTED
+    if isinstance(value, dict):
+        return {str(k): redact(v, str(k)) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact(v, _key) for v in value]
+    return value
+
+
+def whitelist_status(status: Any) -> dict[str, Any] | None:
+    """Forward only the known-safe broker status fields (never the raw payload)."""
+    if not isinstance(status, dict):
+        return None
+    return {k: status[k] for k in _STATUS_WHITELIST if k in status}
+
+
 def _dt(value: Any) -> datetime | None:
     if value is None:
         return None
@@ -85,7 +118,9 @@ class DashboardService:
         alerts = self._alerts(now=now, symbol=symbol, git=git, db=db, hands=hands,
                               market_open=market_open)
 
-        return json_safe({
+        # redact() runs over the ENTIRE response (nested manifests, heartbeat details, pipeline
+        # results, broker payloads, error text) so a sensitive value can never reach the browser.
+        return redact(json_safe({
             "generated_at": now,
             "selection": {"symbol": symbol, "run_id": run_id, "limit": limit},
             "runtime": {
@@ -124,7 +159,7 @@ class DashboardService:
             "services": db["services"],
             "pipeline_runs": db["pipeline_runs"],
             "db_tables": db["db_tables"],
-        })
+        }))
 
     def _market_open(self, now: datetime) -> bool | None:
         try:
@@ -297,10 +332,14 @@ class DashboardService:
 
                 metrics = conn.execute(
                     f"""
+                    -- A QUARANTINED trade was never reconciled: it is NOT a closed trade and must
+                    -- not enter trades_closed or the win-rate denominator (it would falsify both).
                     SELECT count(*) AS trades_total,
                            count(*) FILTER (WHERE status='open') AS trades_open,
-                           count(*) FILTER (WHERE status<>'open') AS trades_closed,
-                           count(*) FILTER (WHERE r_multiple>0) AS wins,
+                           count(*) FILTER (WHERE status IN ('closed','expired')) AS trades_closed,
+                           count(*) FILTER (WHERE status='quarantined') AS trades_quarantined,
+                           count(*) FILTER (WHERE status IN ('closed','expired')
+                                              AND r_multiple>0) AS wins,
                            round(avg(r_multiple) FILTER (WHERE r_multiple IS NOT NULL), 4)
                                AS expectancy_r,
                            count(*) FILTER (WHERE ambiguous) AS ambiguous_trades
@@ -345,7 +384,9 @@ class DashboardService:
                     ), ta AS (
                       SELECT run_id, count(*) AS trades,
                              count(*) FILTER (WHERE status='open') AS open_trades,
-                             count(*) FILTER (WHERE status<>'open') AS closed_trades,
+                             -- quarantined is NOT closed (never reconciled); counted separately
+                             count(*) FILTER (WHERE status IN ('closed','expired')) AS closed_trades,
+                             count(*) FILTER (WHERE status='quarantined') AS quarantined_trades,
                              round(avg(r_multiple) FILTER (WHERE r_multiple IS NOT NULL),4)
                                AS expectancy_r,
                              max(opened_at) AS last_trade,
@@ -353,7 +394,8 @@ class DashboardService:
                       FROM trades WHERE run_id IS NOT NULL GROUP BY run_id
                     )
                     SELECT COALESCE(da.run_id,ta.run_id) AS run_id, da.model, da.decisions,
-                           ta.trades, ta.open_trades, ta.closed_trades, ta.expectancy_r,
+                           ta.trades, ta.open_trades, ta.closed_trades, ta.quarantined_trades,
+                           ta.expectancy_r,
                            da.last_decision, ta.last_trade, rm.manifest_hash, rm.created_at,
                            rm.manifest,
                            CASE
@@ -481,18 +523,24 @@ class DashboardService:
                         ORDER BY started_at DESC LIMIT 50
                         """, (run_id, run_id),
                     ).fetchall()
+                    # `run` is NULL unless a run is actually selected — summing every historical
+                    # attempt and labelling it "this run's spend" would be a false number. The
+                    # day/month windows are pinned to real UTC midnight (date_trunc on now() alone
+                    # would follow the SESSION timezone while the label says UTC).
                     paid_spend = conn.execute(
                         """
                         SELECT
+                          (SELECT CASE WHEN CAST(%s AS text) IS NULL THEN NULL ELSE
+                             COALESCE(sum(COALESCE(actual_cost_usd,est_cost_usd)),0) END
+                             FROM paid_attempts WHERE status<>'error' AND run_id=%s) AS run,
                           (SELECT COALESCE(sum(COALESCE(actual_cost_usd,est_cost_usd)),0)
                              FROM paid_attempts WHERE status<>'error'
-                               AND (CAST(%s AS text) IS NULL OR run_id=%s)) AS run,
+                               AND started_at >= (date_trunc('day', now() AT TIME ZONE 'UTC')
+                                                  AT TIME ZONE 'UTC')) AS day,
                           (SELECT COALESCE(sum(COALESCE(actual_cost_usd,est_cost_usd)),0)
                              FROM paid_attempts WHERE status<>'error'
-                               AND started_at >= date_trunc('day', now())) AS day,
-                          (SELECT COALESCE(sum(COALESCE(actual_cost_usd,est_cost_usd)),0)
-                             FROM paid_attempts WHERE status<>'error'
-                               AND started_at >= date_trunc('month', now())) AS month,
+                               AND started_at >= (date_trunc('month', now() AT TIME ZONE 'UTC')
+                                                  AT TIME ZONE 'UTC')) AS month,
                           (SELECT count(*) FROM paid_attempts
                              WHERE status='completed' AND reconciled_console=false) AS unreconciled,
                           (SELECT count(*) FROM paid_attempts
@@ -612,7 +660,11 @@ class DashboardService:
 
     def _fetch_hands_state(self, *, symbol: str) -> dict[str, Any]:
         started = time.perf_counter()
-        state: dict[str, Any] = {"ok": False, "status": None, "quote": None, "candles": None}
+        # THREE INDEPENDENT health facts: a live session does NOT imply a usable quote or OHLCV.
+        # `ok` stays "session connected"; session_ok/quote_ok/candles_ok let the UI + alerts show a
+        # DEGRADED feed instead of a green light while the data path is broken.
+        state: dict[str, Any] = {"ok": False, "session_ok": False, "quote_ok": False,
+                                 "candles_ok": False, "status": None, "quote": None, "candles": None}
         try:
             import httpx
 
@@ -620,8 +672,10 @@ class DashboardService:
             with httpx.Client(timeout=min(5.0, self.settings.http_timeout_seconds)) as client:
                 response = client.get(f"{base}/status")
                 response.raise_for_status()
-                state["status"] = response.json()
-                state["ok"] = bool(state["status"].get("connected"))
+                # WHITELIST, never the raw payload: /status carries the XTB account number.
+                state["status"] = whitelist_status(response.json())
+                state["session_ok"] = bool((state["status"] or {}).get("connected"))
+                state["ok"] = state["session_ok"]
 
                 try:
                     quote_response = client.get(f"{base}/quote/{symbol}")
@@ -630,6 +684,7 @@ class DashboardService:
                     quote_dt = _dt(quote.get("time"))
                     quote["time_iso"] = quote_dt.isoformat() if quote_dt else None
                     state["quote"] = quote
+                    state["quote_ok"] = quote.get("bid") is not None and quote.get("ask") is not None
                 except Exception as exc:  # quote can legitimately be unavailable while closed
                     state["quote_error"] = type(exc).__name__
 
@@ -642,6 +697,7 @@ class DashboardService:
                         last_dt = _dt(candles[-1].get("t"))
                         payload["last_time_iso"] = last_dt.isoformat() if last_dt else None
                     state["candles"] = payload
+                    state["candles_ok"] = bool(candles)   # an EMPTY list is not a working feed
                 except Exception as exc:
                     state["candles_error"] = type(exc).__name__
         except Exception as exc:  # noqa: BLE001 - local service health, safely summarized
@@ -732,6 +788,21 @@ class DashboardService:
             if age is not None and age > self.settings.eligibility_max_feed_lag_seconds:
                 add("critical", "FEED_STALE",
                     f"Piața este deschisă, dar ultima bară are lag de {round(age / 60)} minute.")
+        elif market_open and hands.get("session_ok") and not broker_last:
+            # Worst case: session up, market open, but NOT A SINGLE bar. Previously silent.
+            add("critical", "FEED_STALE",
+                "Piața este deschisă și sesiunea XTB e activă, dar feedul nu returnează NICIO bară.")
+
+        # A live session does not imply a usable data path — report the two independently.
+        if hands.get("session_ok") and market_open:
+            if not hands.get("quote_ok"):
+                add("warning", "QUOTE_UNAVAILABLE",
+                    f"Sesiunea XTB e activă, dar quote-ul pentru {symbol} nu este disponibil "
+                    f"({hands.get('quote_error') or 'fără bid/ask'}); spreadul observat lipsește.")
+            if not hands.get("candles_ok"):
+                add("critical", "CANDLES_UNAVAILABLE",
+                    f"Sesiunea XTB e activă, dar OHLCV pentru {symbol} nu este disponibil "
+                    f"({hands.get('candles_error') or 'listă goală'}); brain-ul nu poate decide.")
 
         open_trades = db.get("open_trades") or []
         for trade in open_trades:

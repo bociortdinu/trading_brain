@@ -30,7 +30,12 @@ pip install -e '.[db]'
 - serverul ascultă implicit numai pe loopback (`127.0.0.1`);
 - nu există endpointuri de ordin, POST, PUT, PATCH sau DELETE;
 - fiecare conexiune PostgreSQL rulează cu `SET TRANSACTION READ ONLY`;
-- DSN-ul, cheile API, parola DB și ticketul XTB nu sunt returnate către browser;
+- redactarea este **impusă de cod**, nu doar prin convenție: răspunsul `/status` al brokerului trece
+  printr-un **whitelist** (`connected`, `environment`, `trading_enabled`, …) — numărul de cont NU
+  ajunge în browser — iar întregul răspuns trece printr-un **redactor recursiv** care înlocuiește
+  valorile de sub chei sensibile (`password`, `token`, `api_key`, `dsn`, `authorization`, `ticket`,
+  `account`, `secret`, …) oriunde ar apărea, inclusiv în manifeste, `details`, rezultate de pipeline
+  și mesaje de eroare;
 - endpointurile trading_hands folosite sunt exclusiv `GET /status`, `GET /quote` și
   `GET /candles`.
 

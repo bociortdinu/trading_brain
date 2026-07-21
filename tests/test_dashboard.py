@@ -88,6 +88,64 @@ def test_open_shadow_mark_is_indicative_and_directional():
     assert trades[0]["mark_is_indicative"] is True
 
 
+def test_status_whitelist_drops_the_broker_account_and_unknown_fields():
+    """P0/P1: /status carries the XTB account number. Only known-safe fields may reach the browser,
+    and a field added later by trading_hands must be dropped by default, not forwarded blindly."""
+    from dashboard.service import whitelist_status
+
+    out = whitelist_status({"connected": True, "environment": "demo", "trading_enabled": False,
+                            "account": "12345678", "ticket": "TGT-abc", "future_secret": "x"})
+    assert out == {"connected": True, "environment": "demo", "trading_enabled": False}
+    assert "account" not in out and "ticket" not in out and "future_secret" not in out
+    assert whitelist_status(None) is None
+
+
+def test_redact_strips_sensitive_values_anywhere_in_the_payload():
+    """Defence in depth: nested JSONB (manifests, heartbeat details, pipeline results) and error
+    text are pass-through, so a sensitive key must be redacted wherever it appears."""
+    from dashboard.service import REDACTED, redact
+
+    payload = {
+        "runs": [{"run_id": "r1", "manifest": {"db_dsn": "postgresql://u:pw@h/db", "ok": 1}}],
+        "services": [{"details": {"api_key": "sk-live-x", "phase": "deciding"}}],
+        "health": {"message": "fine", "authorization": "Bearer zzz"},
+        "nested": [[{"password": "hunter2"}]],
+        "keep": {"symbol": "GOLD", "count": 3},
+    }
+    out = redact(payload)
+    blob = json.dumps(out)
+    for leaked in ("postgresql://", "sk-live-x", "Bearer zzz", "hunter2"):
+        assert leaked not in blob, f"{leaked} reached the browser payload"
+    assert out["runs"][0]["manifest"]["db_dsn"] == REDACTED
+    assert out["services"][0]["details"]["api_key"] == REDACTED
+    assert out["nested"][0][0]["password"] == REDACTED
+    assert out["keep"] == {"symbol": "GOLD", "count": 3}      # harmless data survives
+    assert out["runs"][0]["manifest"]["ok"] == 1
+
+
+def test_alerts_split_session_from_quote_and_candles_health():
+    """P1: a live session does NOT imply a usable feed. A broken quote/OHLCV must alert instead of
+    showing green, and market-open with ZERO bars must still raise FEED_STALE (previously silent)."""
+    service = DashboardService(Settings())
+    now = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
+    db = {"health": {"ok": True, "schema_current": True}, "latest": {"market": {}},
+          "open_trades": [], "summary": {"metric_scope": "selected_run"}, "reservations": [],
+          "services": [], "pipeline_runs": []}
+    hands = {"ok": True, "session_ok": True, "quote_ok": False, "candles_ok": False,
+             "status": {"environment": "demo", "trading_enabled": False},
+             "candles": {"candles": []}, "quote_error": "ReadTimeout"}
+    codes = {a["code"] for a in service._alerts(
+        now=now, symbol="GOLD", git={"dirty": False}, db=db, hands=hands, market_open=True)}
+    assert {"QUOTE_UNAVAILABLE", "CANDLES_UNAVAILABLE", "FEED_STALE"} <= codes
+
+    # a fully healthy feed raises none of them
+    healthy = {**hands, "quote_ok": True, "candles_ok": True,
+               "candles": {"candles": [{"t": int(now.timestamp() * 1000)}]}}
+    ok_codes = {a["code"] for a in service._alerts(
+        now=now, symbol="GOLD", git={"dirty": False}, db=db, hands=healthy, market_open=True)}
+    assert not ({"QUOTE_UNAVAILABLE", "CANDLES_UNAVAILABLE", "FEED_STALE"} & ok_codes)
+
+
 class _FakeService:
     def state(self, **kwargs):
         return {"ok": True, "selection": kwargs}

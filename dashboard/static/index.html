@@ -45,13 +45,13 @@
   </div>
 
   <nav class="tabbar" role="tablist" aria-label="Secțiuni dashboard">
-    <button class="tab active" data-tab="prezentare" role="tab">Prezentare</button>
-    <button class="tab" data-tab="decizii" role="tab">Decizii <span class="tab-count" id="count-timeline"></span></button>
-    <button class="tab" data-tab="tradeuri" role="tab">Trade-uri <span class="tab-count" id="count-trades"></span></button>
-    <button class="tab" data-tab="experimente" role="tab">Experimente <span class="tab-count" id="count-runs"></span></button>
-    <button class="tab" data-tab="ai-cost" role="tab">AI &amp; Cost <span class="tab-count" id="count-paid"></span></button>
-    <button class="tab" data-tab="operational" role="tab">Operațional</button>
-    <button class="tab" data-tab="baza-de-date" role="tab">Bază de date</button>
+    <button class="tab active" data-tab="prezentare" role="tab" aria-controls="tab-prezentare">Prezentare</button>
+    <button class="tab" data-tab="decizii" role="tab" aria-controls="tab-decizii">Decizii <span class="tab-count" id="count-timeline"></span></button>
+    <button class="tab" data-tab="tradeuri" role="tab" aria-controls="tab-tradeuri">Trade-uri <span class="tab-count" id="count-trades"></span></button>
+    <button class="tab" data-tab="experimente" role="tab" aria-controls="tab-experimente">Experimente <span class="tab-count" id="count-runs"></span></button>
+    <button class="tab" data-tab="ai-cost" role="tab" aria-controls="tab-ai-cost">AI &amp; Cost <span class="tab-count" id="count-paid"></span></button>
+    <button class="tab" data-tab="operational" role="tab" aria-controls="tab-operational">Operațional</button>
+    <button class="tab" data-tab="baza-de-date" role="tab" aria-controls="tab-baza-de-date">Bază de date</button>
   </nav>
 
   <main>
@@ -94,7 +94,9 @@
             <div class="metric"><span>Decizii</span><strong id="metric-decisions">—</strong></div>
             <div class="metric"><span>Trade-uri</span><strong id="metric-trades">—</strong></div>
             <div class="metric"><span>Deschise</span><strong id="metric-open">—</strong></div>
-            <div class="metric"><span>Win rate</span><strong id="metric-win">—</strong></div>
+            <div class="metric"><span>Win rate</span><strong id="metric-win">—</strong><small id="metric-win-basis">— închise</small></div>
+            <div class="metric"><span>Carantină</span><strong id="metric-quarantined">—</strong><small>neconciliate</small></div>
+            <div class="metric"><span>Închise</span><strong id="metric-closed">—</strong><small>closed + expired</small></div>
             <div class="metric wide"><span>Expectancy</span><strong id="metric-expectancy">—</strong><small>R / trade închis</small></div>
             <div class="metric wide"><span>Cost LLM auditat</span><strong id="metric-cost">—</strong><small id="metric-llm-calls">— apeluri</small></div>
           </div>

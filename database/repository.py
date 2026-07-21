@@ -950,8 +950,8 @@ def reserve_paid_attempt(dsn: str, *, run_id: str, context: str, model: str, inp
 
         windows = (
             ("run", _spent("AND run_id = %s", (run_id,)), budget_run_usd),
-            ("day", _spent("AND started_at >= date_trunc('day', now())", ()), budget_day_usd),
-            ("month", _spent("AND started_at >= date_trunc('month', now())", ()), budget_month_usd),
+            ("day", _spent("AND started_at >= (date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')", ()), budget_day_usd),
+            ("month", _spent("AND started_at >= (date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')", ()), budget_month_usd),
         )
         for name, spent, budget in windows:
             if spent + est_cost_usd > budget + 1e-9:
@@ -999,8 +999,8 @@ def paid_spend_summary(dsn: str, run_id: str | None = None) -> dict:
 
         return {
             "run": _spent("AND run_id = %s", (run_id,)) if run_id else None,
-            "day": _spent("AND started_at >= date_trunc('day', now())", ()),
-            "month": _spent("AND started_at >= date_trunc('month', now())", ()),
+            "day": _spent("AND started_at >= (date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')", ()),
+            "month": _spent("AND started_at >= (date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')", ()),
         }
 
 
