@@ -9,18 +9,27 @@ the client that can answer them.
 Fail-closed everywhere. Every refusal returns a named reason rather than raising, so a skipped
 order is an auditable fact and never a silent no-op:
 
-  1. `router_disabled`      — off unless explicitly enabled (a config default may never trade)
-  2. `not_approved`         — the risk verdict did not approve
-  3. `trading_disabled`     — trading_hands reports trading_enabled=false; we do not override it
-  4. `not_demo`             — the account is not the demo environment (see `require_demo`)
-  5. `position_exists`      — the ACCOUNT already holds this symbol
-  6. `cooldown`             — fired too recently
-  7. `volume_out_of_bounds` — outside the configured cap
+  `router_disabled`            — off unless explicitly enabled (a default may never trade)
+  `not_approved` / `missing_sl_tp` — the risk verdict did not approve, or carried no SL/TP
+  `volume_out_of_bounds`       — our own requested size is outside the configured cap
+  `cooldown`                   — fired too recently
+  `trading_disabled`           — trading_hands reports trading_enabled=false; never overridden
+  `not_demo`                   — the account is not the demo environment (see `require_demo`)
+  `broker_volume_unknown` / `broker_volume_too_large` — see below
+  `position_exists` / `max_positions` — the ACCOUNT already holds this, or enough, positions
+  `broker_rejected` / `broker_no_action` — the broker declined
 
-Gate 5 is the one that matters most in practice. The shadow side tracks its own `busy_until`,
-but that is simulated state: after a restart it is empty while the account still holds the
-position, and a router trusting it would open a duplicate. So the truth comes from
-`/positions`, every time, immediately before the order.
+Two of these carry the weight:
+
+`position_exists` reads `/positions` immediately before every order. The shadow side tracks its
+own `busy_until`, but that is simulated state: after a restart it is empty while the account
+still holds the position, and a router trusting it would open a duplicate.
+
+`broker_volume_too_large` exists because trading_hands **ignores the request's `allocation`** and
+sizes every order from its own TRADING_VOLUME (verified live 2026-07-21: asked 0.01, got 0.02).
+We therefore cannot set position size from here — the only honest control is to refuse when the
+broker is configured to trade more than we accept. An unpublished volume (older binary) refuses
+too: an unknown position size is not a safe one.
 """
 
 from __future__ import annotations
@@ -46,7 +55,12 @@ class LiveExecutionConfig(BaseModel):
 
     enabled: bool = False
     require_demo: bool = True          # refuse to route against a non-demo account
-    volume: float = Field(0.01, gt=0)  # lots per order
+    # `volume` is what we ASK for, but trading_hands ignores the request's allocation and sizes
+    # every order from its own TRADING_VOLUME (verified live 2026-07-21: asked 0.01, got 0.02).
+    # So this cannot set the size — `max_volume` is the gate that matters: if the broker is
+    # configured to trade more than we accept, we refuse rather than send an order whose size we
+    # do not control. A cap that cannot cap would be worse than none.
+    volume: float = Field(0.01, gt=0)
     max_volume: float = Field(0.10, gt=0)
     cooldown_minutes: float = Field(15.0, ge=0)
     max_open_positions: int = Field(1, ge=1)
@@ -155,6 +169,15 @@ class LiveRouter:
         if self._config.require_demo and getattr(status, "environment", "") != "demo":
             return refuse(f"not_demo:{getattr(status, 'environment', '?')}")
 
+        # The size we will actually get, not the one we asked for. An older binary reports None;
+        # refuse then too, because an unknown position size is not a safe one.
+        gates.append("broker_volume")
+        broker_volume = getattr(status, "trading_volume", None)
+        if broker_volume is None:
+            return refuse("broker_volume_unknown")
+        if broker_volume > self._config.max_volume:
+            return refuse(f"broker_volume_too_large:{broker_volume}>{self._config.max_volume}")
+
         gates.append("existing_positions")
         positions = await self._client.positions()
         same_symbol = [p for p in positions if p.symbol == symbol]
@@ -177,7 +200,9 @@ class LiveRouter:
         return RouteResult(placed=True, external_id=result.external_id or None,
                            symbol=result.symbol or symbol,
                            side=result.side or ("buy" if direction is Direction.BUY else "sell"),
-                           volume=result.volume or volume, gates_checked=gates)
+                           # The broker's echoed volume is authoritative — it is what actually
+                           # got filled, which may differ from what we requested.
+                           volume=result.volume or broker_volume, gates_checked=gates)
 
 
 def live_config_from_settings(settings) -> LiveExecutionConfig:

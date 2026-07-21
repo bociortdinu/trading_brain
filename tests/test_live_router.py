@@ -28,10 +28,11 @@ class _Client:
     """Records what the router asked for, so a test can assert no order was attempted."""
 
     def __init__(self, *, trading_enabled=True, environment="demo", positions=None,
+                 trading_volume=0.02,
                  result=TradeResult(accepted=True, external_id="X1", symbol="GOLD",
                                     side="sell", volume=0.01)):
         self._status = Status(connected=True, account="1", environment=environment,
-                              trading_enabled=trading_enabled)
+                              trading_enabled=trading_enabled, trading_volume=trading_volume)
         self._positions = positions or []
         self._result = result
         self.purchases: list = []
@@ -190,6 +191,29 @@ def test_confidence_below_the_broker_minimum_is_clamped_not_rescaled():
     p = build_prediction(symbol="GOLD", direction=Direction.SELL, sl_pct=0.3, tp_pct=0.6,
                          confidence=0.1, volume=0.01, as_of=NOW)
     assert p.preds_proba == 0.5
+
+
+def test_broker_volume_above_our_cap_is_refused():
+    """trading_hands sizes every order from its OWN config and ignores our allocation, so the
+    only real cap is refusing to trade when its size exceeds what we accept."""
+    c = _Client(trading_volume=1.0)
+    r = _route(_router(c, max_volume=0.10))
+    assert r.reason.startswith("broker_volume_too_large") and c.purchases == []
+
+
+def test_unknown_broker_volume_is_refused():
+    """An older binary does not publish it. An unknown position size is not a safe one."""
+    c = _Client(trading_volume=None)
+    r = _route(_router(c))
+    assert r.reason == "broker_volume_unknown" and c.purchases == []
+
+
+def test_reported_volume_is_the_brokers_not_ours():
+    c = _Client(trading_volume=0.02,
+                result=TradeResult(accepted=True, external_id="X1", symbol="GOLD",
+                                   side="sell", volume=0.02))
+    r = _route(_router(c, volume=0.01))
+    assert r.placed is True and r.volume == 0.02
 
 
 def test_settings_default_to_a_disabled_router():
