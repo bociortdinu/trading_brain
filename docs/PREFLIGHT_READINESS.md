@@ -145,6 +145,39 @@ cost pur pierdut, evitabil dacă gate-ul s-ar verifica înaintea makerului.
 `decide()` (economie directă), (b) pornește cu `--max-llm-calls 1` ca smoke, (c) setează bugetul
 USD explicit în gateway (default 0 = blocat).
 
+### ACTUALIZARE 2026-07-21 (b) — gate-ul mutat + re-estimare pe tokeni MĂSURAȚI
+
+**Gate-ul e mutat** înaintea makerului ([shadow/runner.py](../shadow/runner.py), commit ulterior).
+Măsurat pe aceleași date: `decided` 2255 → **2202** (`position_gated=53`), iar **metricile sunt
+identice** (4 trade-uri, win 25%, total −1.331R) — barele gated nu deschideau oricum trade.
+Economia reală e **53 de apeluri, nu 44**: vechea numărătoare `blocked` cerea `rec.risk_approved`,
+deci 9 bare erau plătite fără să fie măcar candidate.
+
+Semantica s-a schimbat onest: nu mai putem ști dacă o bară gated *ar fi fost* aprobată, deci
+`approved == trades_opened`, iar barele sărite se raportează separat ca `position_gated`. A pretinde
+„aprobat dar blocat" ar fi inventat un răspuns pe care nu l-am cerut niciodată.
+
+**Costuri pe tokeni măsurați** (`messages.count_tokens`, endpoint **gratuit** — 0 tokeni facturați),
+pe un DecisionInput real de GOLD: **612 tokeni input/decizie** pe `claude-haiku-4-5`, **818** pe
+`claude-sonnet-5` (tokenizer nou). Output: tipic ~200 tokeni, plafon dur `max_tokens=1024`.
+
+| Model | Backtest (2202 decizii), tipic | Worst-case | Live (~58 apeluri/zi) |
+|---|---|---|---|
+| `claude-haiku-4-5` ($1/$5) | **$3.55** | $12.62 | ~$2.80/lună |
+| `claude-sonnet-5` intro ($2/$10, până 2026-08-31) | **$8.01** | $26.15 | ~$6.33/lună |
+| `claude-sonnet-5` standard ($3/$15) | **$12.01** | $39.23 | ~$9.49/lună |
+
+**Mutarea gate-ului economisește doar $0.09–$0.29 per backtest — corectă, dar NU e levierul.**
+Nu o supravinde. Levierul real e **prefiltrul**: trec **60.7%** din barele evaluate (2255/3718).
+La M15 asta înseamnă **~58 apeluri plătite/zi** în bucla live, nu „10–20/zi" cum presupunea nota
+anterioară. Dacă vrei costul jos, strânge prefiltrul — nu mai umbla la gate.
+
+**Prompt caching-ul e cod mort, nu doar „marginal".** `cache_control: ephemeral` pe `SYSTEM_RULES`
+([decision/llm_client.py:135](../decision/llm_client.py#L135)) nu poate crea NICIODATĂ o intrare de
+cache: prefixul minim cacheabil e 4096 tokeni pe Haiku 4.5, iar **promptul întreg** are 612. Și pe
+Sonnet 5 (818 tokeni) e sub orice prag minim documentat. Nu costă nimic (sub prag pur și simplu nu
+se cachează), dar nu economisește nimic — nu-l trece la „controale de cost".
+
 Rămâne **NO-GO** pentru rularea plătită, dar din motive mult mai puține: rate reale GOLD
 swap/comision (`unset` → R nu e net de finanțare), Compose live + soak, CI remote verde, și
 decizia de buget de mai sus.

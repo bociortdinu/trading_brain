@@ -78,10 +78,11 @@ def test_backtest_uptrend_produces_approved_buys_and_closed_trades():
     assert rep["metrics"]["trades_closed"] >= 1
 
 
-def test_single_position_gate_blocks_overlapping_entries():
+def test_single_position_gate_skips_bars_before_the_model():
     """Executable-realism gate: with single_position (default) no new trade opens while one is
-    open, so trades_opened < approved and the surplus approvals are counted as blocked. Turning
-    the gate off (event-study) opens every approval and blocks none."""
+    open. Those bars are skipped BEFORE the decision maker — never decided, never paid for — so
+    every approval that survives becomes a trade. Turning the gate off (event-study) decides and
+    opens everything."""
     gated = report(run(backtest_over_windows(
         _windows(step=1.0), symbol="GOLD", provider_name="csv",
         decision_maker=ConfluenceStrategy(), modeled_spread_pct=0.02)))
@@ -89,11 +90,12 @@ def test_single_position_gate_blocks_overlapping_entries():
         _windows(step=1.0), symbol="GOLD", provider_name="csv",
         decision_maker=ConfluenceStrategy(), modeled_spread_pct=0.02, single_position=False)))
 
-    assert gated["approved"] > gated["trades_opened"]          # some approvals suppressed
-    assert gated["blocked_position_open"] > 0
-    assert gated["approved"] == gated["blocked_position_open"] + gated["trades_opened"]
-    assert study["blocked_position_open"] == 0                  # event-study opens everything
+    assert gated["position_gated"] > 0                          # bars skipped while in position
+    assert gated["approved"] == gated["trades_opened"]           # an approval always trades now
+    assert study["position_gated"] == 0                          # event-study gates nothing
     assert study["trades_opened"] == study["approved"] > gated["trades_opened"]
+    # The saving is real: the gated run sends strictly fewer bars to the (paid) maker.
+    assert gated["decided"] < study["decided"]
 
 
 def test_max_llm_calls_caps_a_paid_run():
@@ -113,6 +115,27 @@ def test_max_llm_calls_caps_a_paid_run():
         _windows(step=1.0), symbol="GOLD", provider_name="csv",
         decision_maker=uncapped, modeled_spread_pct=0.02))
     assert uncapped.calls > 5                                  # cap is what stopped the first run
+
+
+def test_position_gated_bars_never_reach_the_paid_maker():
+    """The money claim: a bar skipped by the position gate must cost NOTHING. The gate runs
+    before the maker, so decide() is never called for it — verified by counting real calls, not
+    by reading the summary."""
+    from shadow.runner import _CountingMaker
+
+    gated_maker = _CountingMaker(ConfluenceStrategy())
+    gated = report(run(backtest_over_windows(
+        _windows(step=1.0), symbol="GOLD", provider_name="csv",
+        decision_maker=gated_maker, modeled_spread_pct=0.02)))
+    study_maker = _CountingMaker(ConfluenceStrategy())
+    run(backtest_over_windows(
+        _windows(step=1.0), symbol="GOLD", provider_name="csv",
+        decision_maker=study_maker, modeled_spread_pct=0.02, single_position=False))
+
+    assert gated["position_gated"] > 0
+    # Exactly the gated bars are the saving — no call was made for any of them.
+    assert gated_maker.calls == study_maker.calls - gated["position_gated"]
+    assert gated_maker.calls == gated["decided"]
 
 
 def test_backtest_fast_path_matches_slow_path():

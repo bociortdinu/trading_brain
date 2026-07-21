@@ -213,6 +213,23 @@ async def _backtest_over_windows(
                         "approved": False, "blocked": None, "outcome": None})
             break
 
+        # POSITION GATE BEFORE THE (paid) LLM. A bar decided while a position is already open can
+        # never open a trade (see the `rec.risk_approved and not blocked` guard below), so calling
+        # the model for it buys nothing — the answer is discarded whatever it says. Deciding first
+        # and gating afterwards meant those bars were PAID FOR and then thrown away (measured: 44
+        # of 2255 decisions on the 2026-07-21 GOLD run).
+        #
+        # This deliberately gives up the counterfactual: we no longer learn whether such a bar
+        # WOULD have been approved, so `approved` now equals `trades_opened` under single_position
+        # and the gated bars are reported separately as `position_gated`. Claiming they were
+        # "approved but blocked" would be inventing an answer we never asked for. Trades — and
+        # therefore every R metric — are unchanged, because a gated bar never opened one.
+        if single_position and busy_until is not None and as_of < busy_until:
+            out.append({"as_of": as_of, "stage": "position_gated", "direction": "NO_TRADE",
+                        "approved": False, "blocked": "position_open", "outcome": None,
+                        "regime": packet.regime, "confidence": None})
+            continue
+
         # RESERVE BEFORE THE (paid) LLM. A plain SELECT here would not stop two concurrent
         # workers from both missing it and both paying — uniqueness only discards the loser's
         # ROW, never the CHARGE. The claim below is atomic: exactly one worker may call the model.
@@ -267,11 +284,9 @@ async def _backtest_over_windows(
                                  prefilter_config=prefilter_config, risk_config=risk_config,
                                  calendar=calendar, feedback=feedback)
         llm_result = getattr(decision_maker, "last_result", None)
-        # Decide the BLOCKED disposition before persisting, so the decision row records it and a
-        # resume can tell "approved and traded" from "approved but a position was already open".
-        blocked = ("position_open" if (rec.risk_approved and single_position
-                                       and busy_until is not None and as_of < busy_until)
-                   else None)
+        # The position gate already ran (above), so a bar that reaches the model is one we could
+        # actually act on: an approval here always becomes a trade.
+        blocked = None
         row = {"as_of": as_of, "stage": rec.stage,
                "direction": rec.decision.direction.value if rec.decision else "NO_TRADE",
                "approved": rec.risk_approved, "blocked": blocked, "outcome": None,
@@ -444,17 +459,20 @@ def _persist_trade(dsn, run_id, symbol, dec_id, trade, outcome, shadow_config) -
 
 
 def report(rows: list[dict]) -> dict:
-    """Backtest summary: bars evaluated, approvals, position-gate blocks, and edge metrics over
-    the trades ACTUALLY opened. `approved` counts every risk-approved signal; `blocked` are
-    approvals suppressed because a position was already open; `trades_opened` is what the
-    metrics are computed over. With single_position, approved == blocked + trades_opened."""
+    """Backtest summary: bars evaluated, approvals, position-gated bars, and edge metrics over the
+    trades ACTUALLY opened.
+
+    `position_gated` bars were skipped BEFORE the model because a position was already open — they
+    were never decided and never paid for, so we do not know whether they would have been approved
+    and must not pretend otherwise. `approved` therefore counts risk-approved signals among the
+    bars actually decided, and under single_position approved == trades_opened."""
     outcomes = [r["outcome"] for r in rows if r["outcome"] is not None]
-    blocked = sum(1 for r in rows if r.get("blocked"))
     return {
         "bars_evaluated": len(rows),
         "prefiltered_out": sum(1 for r in rows if r["stage"] == "prefiltered_out"),
+        "position_gated": sum(1 for r in rows if r["stage"] == "position_gated"),
         "approved": sum(1 for r in rows if r["approved"]),
-        "blocked_position_open": blocked,
+        "decided": sum(1 for r in rows if r["stage"] == "decided"),
         "trades_opened": len(outcomes),
         "metrics": summarize(outcomes),
     }
@@ -570,8 +588,8 @@ async def _run(settings, *, count: int, run_id: str | None, maker_kind: str = "d
     calls = getattr(maker, "calls", 0)
     print(f"[backtest] provider={settings.market_data_provider} symbol={symbol} "
           f"bars_evaluated={rep['bars_evaluated']} prefiltered_out={rep['prefiltered_out']} "
-          f"approved={rep['approved']} blocked_position_open={rep['blocked_position_open']} "
-          f"trades_opened={rep['trades_opened']} llm_calls={calls}"
+          f"position_gated={rep['position_gated']} decided={rep['decided']} "
+          f"approved={rep['approved']} trades_opened={rep['trades_opened']} llm_calls={calls}"
           + (f" persisted run_id={run_id}" if run_id else ""))
     print(f"[metrics] {rep['metrics']}")
 
