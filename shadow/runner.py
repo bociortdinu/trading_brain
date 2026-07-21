@@ -136,6 +136,7 @@ async def _backtest_over_windows(
     dataset_id: str | None = None,     # frozen replay dataset the snapshots belong to (repro)
     econ_calendar=None,                # EconomicCalendar | None — scheduled macro releases
     econ_calendar_config=None,         # CalendarConfig | None
+    decision_stride: int = 1,          # decide on every Nth trigger bar (1 = every bar)
 ) -> list[dict]:
     """Backtest over provided windows. Returns per-bar dicts:
     {as_of, stage, direction, approved, outcome(dict|None)}. When `persist_dsn`+`run_id` are
@@ -171,7 +172,8 @@ async def _backtest_over_windows(
         risk_config=risk_config.model_dump(mode="json"),
         prefilter_config=prefilter_config.model_dump(mode="json"),
         eligibility_policy=eligibility_config.as_policy(),
-        calendar_version=calendar_for(provider_name).version)
+        calendar_version=calendar_for(provider_name).version,
+        decision_stride=decision_stride)
     from database.operations import git_metadata
     exec_manifest.update({
         "run_kind": "executable_backtest" if single_position else "event_study",
@@ -195,10 +197,23 @@ async def _backtest_over_windows(
     bar_seconds = _bar_seconds(m15)
     counting = isinstance(decision_maker, _CountingMaker)
     worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
+    # `decision_stride` thins the DECISION cadence only. Exits are still reconciled against the
+    # full trigger series, so a strided run resolves SL/TP at the same granularity as a dense one
+    # — it decides less often, it does not manage trades more coarsely. stride=4 on M15 is
+    # "decide hourly, execute on M15".
+    #
+    # It also makes a small paid sample representative: 300 calls taken densely cover the first
+    # ~5 days of the window (one market regime), while the same 300 strided span the whole window.
+    decided_bars = 0
     for as_of in (c.close_time for c in m15):
         sliced = _slice(windows, as_of)
         if any(len(sliced.get(tf, [])) < min_bars for tf in windows):
             continue  # not enough history on some timeframe yet
+        # Counted AFTER the warm-up skip so the stride walks usable bars, not raw index.
+        if decision_stride > 1 and decided_bars % decision_stride:
+            decided_bars += 1
+            continue
+        decided_bars += 1
         packet = build_feature_packet(
             symbol, sliced, as_of=as_of, provider=provider_name, provider_symbol=symbol,
             ingested_at=as_of, spread_pct=modeled_spread_pct, calendar=calendar,
@@ -535,7 +550,8 @@ def _confirm_paid_run(model: str, max_calls: int, max_tokens: int, assume_yes: b
 
 
 async def _run(settings, *, count: int, run_id: str | None, maker_kind: str = "deterministic",
-               max_llm_calls: int = 50, assume_yes: bool = False, use_feedback: bool = False) -> None:
+               max_llm_calls: int = 50, assume_yes: bool = False, use_feedback: bool = False,
+               decision_stride: int = 1) -> None:
     persist_dsn = settings.db_dsn if run_id else None
     maker, model_name, is_paid = _build_maker(settings, maker_kind, run_id=run_id,
                                               persist_dsn=persist_dsn)
@@ -591,7 +607,7 @@ async def _run(settings, *, count: int, run_id: str | None, maker_kind: str = "d
             shadow_config=shadow_config_from_settings(settings),
             persist_dsn=persist_dsn, run_id=run_id, dataset_id=dataset_id,
             use_feedback=use_feedback, econ_calendar=econ_calendar,
-            econ_calendar_config=econ_calendar_config,
+            econ_calendar_config=econ_calendar_config, decision_stride=decision_stride,
         )
     except BudgetExceeded as exc:
         # Fail-closed: stop cleanly at the budget. Whatever was decided before this is persisted.
@@ -629,12 +645,20 @@ def main() -> int:
     parser.add_argument("--feedback", action="store_true",
                         help="inject the as_of-safe track record into the input (needs --persist; "
                              "for the with-feedback vs without comparison under --maker claude)")
+    parser.add_argument("--stride", type=int, default=1,
+                        help="decide on every Nth trigger bar (1 = every bar). Thins the DECISION "
+                             "cadence only — exits are still reconciled on every bar. Use it to "
+                             "spread a small paid sample across the whole window instead of "
+                             "burning it all on the first few days.")
     args = parser.parse_args()
+    if args.stride < 1:
+        parser.error("--stride must be >= 1")
     run_id = None
     if args.persist:
         run_id = args.run_id or f"backtest-{args.maker}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
     asyncio.run(_run(load_settings(), count=args.count, run_id=run_id, maker_kind=args.maker,
-                     max_llm_calls=args.max_llm_calls, assume_yes=args.yes, use_feedback=args.feedback))
+                     max_llm_calls=args.max_llm_calls, assume_yes=args.yes,
+                     use_feedback=args.feedback, decision_stride=args.stride))
     return 0
 
 

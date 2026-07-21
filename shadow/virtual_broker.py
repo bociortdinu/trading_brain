@@ -160,7 +160,8 @@ def execution_manifest(*, modeled_spread_pct: float, slippage_pct: float, config
                        single_position: bool, cooldown_bars: int,
                        risk_config: dict, prefilter_config: dict,
                        eligibility_policy: dict | None = None,
-                       calendar_version: str | None = None) -> dict:
+                       calendar_version: str | None = None,
+                       decision_stride: int = 1) -> dict:
     """EVERY parameter that can change a decision's outcome — so it can rebuild the exact same trade
     from a persisted decision (crash recovery) and so a config change is a DIFFERENT decision.
 
@@ -184,6 +185,9 @@ def execution_manifest(*, modeled_spread_pct: float, slippage_pct: float, config
         "timeout_bars": config.timeout_bars,
         "single_position": single_position,
         "cooldown_bars": cooldown_bars,
+        # Decision cadence: 1 = every trigger bar, N = every Nth. Part of the manifest because
+        # it changes WHICH bars are decided, hence the whole run — not a display setting.
+        "decision_stride": decision_stride,
         # Full canonical policy — not just the version strings (execution_hash sorts keys).
         "risk_config": risk_config,
         "prefilter_config": prefilter_config,
