@@ -227,7 +227,7 @@ async def _fetch_finer_bars(provider, provider_symbol: str, tf: str, timeout_bar
 
 async def shadow_tick(settings: Settings, provider, provider_name: str, *, decision_maker,
                       run_id: str, model_name: str = "deterministic-confluence",
-                      shadow_config: ShadowConfig | None = None) -> dict:
+                      shadow_config: ShadowConfig | None = None, live_router=None) -> dict:
     shadow_config = shadow_config or ShadowConfig()
     now = datetime.now(timezone.utc)
     brain_symbol = settings.symbol_query
@@ -391,13 +391,27 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     if open_trade is not None:
         summary["opened_trade"] = "opened" if inserted else "exists"
 
+    # LIVE ORDER — last, and only after the decision + shadow chain are already on disk. Ordering
+    # matters: routing first would risk an order with no record of why it was sent. This way the
+    # worst case is an order placed but not yet linked, and the router's position gate catches
+    # that on the next tick because it reads the ACCOUNT rather than our own state.
+    if live_router is not None and record.risk_approved and record.decision is not None:
+        route = await live_router.route(
+            symbol=brain_symbol, direction=record.decision.direction,
+            approved=record.risk_approved, sl_pct=record.risk.sl_pct,
+            tp_pct=record.risk.tp_pct, confidence=record.decision.confidence,
+            as_of=packet.bar_close)
+        summary["live"] = (f"placed:{route.external_id}" if route.placed
+                           else f"skipped:{route.reason}")
+        log.info("live route: %s", summary["live"])
+
     return summary
 
 
 async def observed_shadow_tick(settings: Settings, provider, provider_name: str, *,
                                decision_maker, run_id: str, model_name: str,
                                shadow_config: ShadowConfig,
-                               telemetry: OperationalTelemetry) -> dict:
+                               telemetry: OperationalTelemetry, live_router=None) -> dict:
     """Run and audit one online shadow tick without changing the decision semantics."""
     operation_id = telemetry.start_run(
         "shadow_tick", symbol=settings.symbol_query, experiment_id=run_id)
@@ -406,7 +420,8 @@ async def observed_shadow_tick(settings: Settings, provider, provider_name: str,
     try:
         summary = await shadow_tick(
             settings, provider, provider_name, decision_maker=decision_maker,
-            run_id=run_id, model_name=model_name, shadow_config=shadow_config)
+            run_id=run_id, model_name=model_name, shadow_config=shadow_config,
+            live_router=live_router)
     except asyncio.CancelledError as exc:
         telemetry.finish_run(operation_id, "cancelled", error=exc)
         raise
@@ -436,7 +451,8 @@ async def shadow_tick_with_retries(settings: Settings, provider, provider_name: 
                                    decision_maker, run_id: str, model_name: str,
                                    shadow_config: ShadowConfig,
                                    telemetry: OperationalTelemetry,
-                                   attempts: int = 3, base_delay_seconds: float = 5.0) -> dict:
+                                   attempts: int = 3, base_delay_seconds: float = 5.0,
+                                   live_router=None) -> dict:
     """Retry only declared transient failures, soon enough not to lose the M15 decision bar."""
     if attempts < 1:
         raise ValueError("attempts must be >= 1")
@@ -445,7 +461,7 @@ async def shadow_tick_with_retries(settings: Settings, provider, provider_name: 
             return await observed_shadow_tick(
                 settings, provider, provider_name, decision_maker=decision_maker,
                 run_id=run_id, model_name=model_name, shadow_config=shadow_config,
-                telemetry=telemetry)
+                telemetry=telemetry, live_router=live_router)
         except TRANSIENT:
             if attempt == attempts:
                 raise
@@ -508,7 +524,8 @@ def _calls_made(maker) -> int:
     return getattr(maker, "calls", 0)
 
 
-async def _once(settings: Settings, run_id: str, maker, model_name: str) -> None:
+async def _once(settings: Settings, run_id: str, maker, model_name: str,
+                live_router=None) -> None:
     provider = build_provider(settings)
     telemetry = OperationalTelemetry(settings.db_dsn, "shadow_online_once")
     telemetry.heartbeat("starting", details={"run_id": run_id, "maker": model_name})
@@ -516,7 +533,7 @@ async def _once(settings: Settings, run_id: str, maker, model_name: str) -> None
         summary = await observed_shadow_tick(
             settings, provider, settings.market_data_provider, decision_maker=maker,
             run_id=run_id, model_name=model_name, shadow_config=_shadow_config(settings),
-            telemetry=telemetry)
+            telemetry=telemetry, live_router=live_router)
     finally:
         try:
             telemetry.stop()
@@ -532,7 +549,7 @@ async def _once(settings: Settings, run_id: str, maker, model_name: str) -> None
 
 async def _loop(settings: Settings, run_id: str, maker, model_name: str,
                 offset_seconds: float = 5.0, max_llm_calls: int | None = None,
-                deadline=None) -> None:
+                deadline=None, live_router=None) -> None:
     """Continuous shadow-online. `max_llm_calls` and `deadline` bound a PAID run: the cap is
     checked before each tick (never mid-decision, so a decision is never half-paid-for), and the
     deadline ends a timed session. Both stop the loop cleanly through the same finally that
@@ -556,7 +573,8 @@ async def _loop(settings: Settings, run_id: str, maker, model_name: str,
                 summary = await shadow_tick_with_retries(
                     settings, provider, settings.market_data_provider,
                     decision_maker=maker, run_id=run_id, model_name=model_name,
-                    shadow_config=_shadow_config(settings), telemetry=telemetry)
+                    shadow_config=_shadow_config(settings), telemetry=telemetry,
+                    live_router=live_router)
                 log.info("shadow tick: %s", summary)
             except Exception as exc:  # noqa: BLE001 — a tick error must not kill the loop
                 tick_error = exc
@@ -648,6 +666,10 @@ def main() -> int:
     parser.add_argument("--minutes", type=float, default=None,
                         help="stop after this many minutes (timed session)")
     parser.add_argument("--yes", action="store_true", help="skip the paid-run confirmation prompt")
+    parser.add_argument("--live", action="store_true",
+                        help="ROUTE REAL ORDERS for approved verdicts (demo account by default). "
+                             "trading_hands must also have TRADING_ENABLED=true — this flag "
+                             "cannot override its refusal.")
     args = parser.parse_args()
     settings = load_settings()            # Settings validators run here (bad config -> hard exit)
     _shadow_config(settings)              # build+validate the ShadowConfig ONCE at startup, not per tick
@@ -671,16 +693,30 @@ def main() -> int:
         from shadow.runner import _confirm_paid_run
         _confirm_paid_run(model_name, args.max_llm_calls, settings.decision_max_tokens, args.yes,
                           http_attempts_per_call=settings.paid_max_http_attempts)
+    live_router = None
+    if args.live:
+        from brokers_bridge.trading_hands import TradingHandsClient
+        from execution.live_router import LiveRouter, live_config_from_settings
+
+        live_cfg = live_config_from_settings(settings).model_copy(update={"enabled": True})
+        live_client = TradingHandsClient(settings.trading_hands_url,
+                                         settings.http_timeout_seconds)
+        live_router = LiveRouter(live_client, live_cfg)
+        log.warning("LIVE ORDER ROUTING ENABLED: volume=%s max_positions=%d cooldown=%.0fm "
+                    "demo_only=%s", live_cfg.volume, live_cfg.max_open_positions,
+                    live_cfg.cooldown_minutes, live_cfg.require_demo)
+
     deadline = (datetime.now(timezone.utc) + timedelta(minutes=args.minutes)
                 if args.minutes else None)
     log.info("shadow online run_id=%s maker=%s cap=%s deadline=%s",
              run_id, model_name, args.max_llm_calls, deadline)
     try:
         if args.once:
-            asyncio.run(_once(settings, run_id, maker, model_name))
+            asyncio.run(_once(settings, run_id, maker, model_name, live_router=live_router))
         else:
             asyncio.run(_loop(settings, run_id, maker, model_name,
-                              max_llm_calls=args.max_llm_calls, deadline=deadline))
+                              max_llm_calls=args.max_llm_calls, deadline=deadline,
+                              live_router=live_router))
     except KeyboardInterrupt:
         log.info("shadow online stopped by operator")
         return 130

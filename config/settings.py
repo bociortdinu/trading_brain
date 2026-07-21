@@ -104,6 +104,17 @@ class Settings(BaseSettings):
     paid_budget_day_usd: float = Field(0.0, ge=0)
     paid_budget_month_usd: float = Field(0.0, ge=0)
 
+    # LIVE ORDER ROUTING (execution/live_router.py). This is the only path in trading_brain that
+    # sends a real order, so every default is the safe one and enabling it must be deliberate.
+    # trading_hands has its OWN TRADING_ENABLED switch; both must be true — this flag cannot
+    # override the execution layer's refusal.
+    live_execution_enabled: bool = False
+    live_require_demo: bool = True                       # refuse to route against a live account
+    live_volume: float = Field(0.01, gt=0)               # lots per order
+    live_max_volume: float = Field(0.10, gt=0)           # hard ceiling on the above
+    live_cooldown_minutes: float = Field(15.0, ge=0)     # min gap between accepted orders
+    live_max_open_positions: int = Field(1, ge=1)
+
     # Shadow backtest: a MODELED spread for historical (replay) bars — we never borrow the
     # current live quote for a past bar. ~XTB gold spread observed live (~0.018-0.02%).
     replay_spread_pct: float = Field(0.02, ge=0)
