@@ -32,11 +32,15 @@ def _ev(label, when, impact="high"):
 def test_classifies_gold_relevant_releases():
     assert classify_release("Consumer Price Index").label == "CPI"
     assert classify_release("Employment Situation").label == "NFP"
-    assert classify_release("FOMC Press Conference").label == "FOMC"
+    assert classify_release("Personal Income and Outlays").label == "PCE"
 
 
-def test_matching_is_case_insensitive():
-    assert classify_release("consumer price index").label == "CPI"
+def test_matching_is_exact_not_substring():
+    """Substring matching classified "Research Consumer Price Index" as CPI and "Debt to Gross
+    Domestic Product Ratios" as GDP — neither is the market-moving release it was mistaken for."""
+    assert classify_release("Research Consumer Price Index") is None
+    assert classify_release("Debt to Gross Domestic Product Ratios") is None
+    assert classify_release("consumer price index") is None      # exact, so case matters
 
 
 def test_unknown_release_is_not_classified():
@@ -94,10 +98,34 @@ def test_release_time_is_dst_correct():
     assert winter.scheduled_at == datetime(2026, 1, 13, 13, 30, tzinfo=timezone.utc)
 
 
-def test_fomc_uses_its_own_afternoon_release_time():
-    ev = parse_release_dates(_payload([
-        {"release_name": "FOMC Press Conference", "date": "2026-07-29"}]))[0]
-    assert ev.scheduled_at == datetime(2026, 7, 29, 18, 0, tzinfo=timezone.utc)  # 14:00 ET
+def test_fomc_comes_from_the_curated_list_not_fred():
+    """FRED's "FOMC Press Release" reports data-series updates, not meetings: 20 dates in one
+    quarter, including consecutive days, which produced a daily 18:00 UTC blackout."""
+    from data_collector.news.economic_calendar import fomc_events
+
+    assert parse_release_dates(_payload([
+        {"release_name": "FOMC Press Release", "date": "2026-08-25"}])) == []
+
+    evs = fomc_events(date(2026, 7, 1), date(2026, 9, 30))
+    assert [e.scheduled_at for e in evs] == [
+        datetime(2026, 7, 29, 18, 0, tzinfo=timezone.utc),      # 14:00 ET
+        datetime(2026, 9, 16, 18, 0, tzinfo=timezone.utc)]
+    assert all(e.impact == "high" for e in evs)
+
+
+def test_a_flooding_release_is_ignored():
+    """Defensive: a FRED series that reports many dates per quarter is not an announcement
+    schedule, and treating it as one would blanket the window in false blackouts."""
+    rows = [{"release_name": "Consumer Price Index", "date": f"2026-07-{d:02d}"}
+            for d in range(1, 21)]
+    assert parse_release_dates(_payload(rows), start=date(2026, 7, 1),
+                               end=date(2026, 9, 30)) == []
+
+
+def test_fomc_coverage_is_reported_so_staleness_is_detectable():
+    from data_collector.news.economic_calendar import fomc_coverage_ends
+
+    assert fomc_coverage_ends() >= date(2026, 12, 1)
 
 
 # ---- blackout ---- #

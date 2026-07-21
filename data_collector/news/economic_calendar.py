@@ -41,40 +41,66 @@ Impact = Literal["low", "medium", "high"]
 
 
 class ReleaseSpec(BaseModel):
-    """How a FRED release maps onto a tradeable event: when in the day it lands, and how hard
-    it hits gold. `match` is matched case-insensitively as a substring of the release name."""
-    match: str
+    """How a FRED release maps onto a tradeable event.
+
+    `release_name` is matched EXACTLY. Substring matching was tried and is wrong: "Research
+    Consumer Price Index" is not CPI, and "Debt to Gross Domestic Product Ratios" is not GDP —
+    both would have been classified as market-moving releases they have nothing to do with.
+    """
+    release_name: str
     label: str
     local_time: time
     impact: Impact
 
 
 # Curated, gold-relevant releases. Gold is driven by real yields, the dollar and Fed policy
-# expectations, so the FOMC and the inflation/labour prints that move them dominate. Anything
-# not matched here is treated as low impact and never triggers a blackout.
+# expectations, so the inflation and labour prints that move them dominate.
+#
+# FOMC IS DELIBERATELY ABSENT. FRED's "FOMC Press Release" is not a meeting calendar — it
+# reports when that data series was updated, which was 20 separate dates in one quarter,
+# including consecutive days. Treating those as events produced a daily 18:00 UTC blackout.
+# Real FOMC meeting dates come from _FOMC_MEETINGS below instead.
 _RELEASE_SPECS: tuple[ReleaseSpec, ...] = (
-    ReleaseSpec(match="FOMC", label="FOMC", local_time=time(14, 0), impact="high"),
-    ReleaseSpec(match="Federal Open Market Committee", label="FOMC", local_time=time(14, 0),
-                impact="high"),
-    ReleaseSpec(match="Consumer Price Index", label="CPI", local_time=time(8, 30), impact="high"),
-    ReleaseSpec(match="Employment Situation", label="NFP", local_time=time(8, 30), impact="high"),
-    ReleaseSpec(match="Personal Income and Outlays", label="PCE", local_time=time(8, 30),
-                impact="high"),
-    ReleaseSpec(match="Producer Price Index", label="PPI", local_time=time(8, 30), impact="medium"),
-    ReleaseSpec(match="Advance Monthly Sales for Retail", label="RetailSales",
+    ReleaseSpec(release_name="Consumer Price Index", label="CPI",
+                local_time=time(8, 30), impact="high"),
+    ReleaseSpec(release_name="Employment Situation", label="NFP",
+                local_time=time(8, 30), impact="high"),
+    ReleaseSpec(release_name="Personal Income and Outlays", label="PCE",
+                local_time=time(8, 30), impact="high"),
+    ReleaseSpec(release_name="Producer Price Index", label="PPI",
                 local_time=time(8, 30), impact="medium"),
-    ReleaseSpec(match="Gross Domestic Product", label="GDP", local_time=time(8, 30),
-                impact="medium"),
-    ReleaseSpec(match="Job Openings and Labor Turnover", label="JOLTS", local_time=time(10, 0),
-                impact="medium"),
+    ReleaseSpec(release_name="Advance Monthly Sales for Retail and Food Services",
+                label="RetailSales", local_time=time(8, 30), impact="medium"),
+    ReleaseSpec(release_name="Gross Domestic Product", label="GDP",
+                local_time=time(8, 30), impact="medium"),
+    ReleaseSpec(release_name="Job Openings and Labor Turnover Survey", label="JOLTS",
+                local_time=time(10, 0), impact="medium"),
 )
+
+# FOMC decision days, 14:00 ET. The Fed publishes these years ahead, so a short curated list is
+# both accurate and replay-safe — but it EXPIRES. `fomc_coverage_ends` lets callers detect that
+# the list has run out rather than silently losing the single most important event for gold.
+_FOMC_MEETINGS: tuple[date, ...] = (
+    date(2026, 1, 28), date(2026, 3, 18), date(2026, 4, 29), date(2026, 6, 17),
+    date(2026, 7, 29), date(2026, 9, 16), date(2026, 11, 4), date(2026, 12, 16),
+)
+
+# A single release should fire a handful of times per quarter. Far more means the FRED series is
+# reporting data-update dates rather than announcements (as FOMC does), and treating those as
+# events would blanket the calendar in false blackouts.
+_MAX_DATES_PER_RELEASE_PER_QUARTER = 6
+
+
+def fomc_coverage_ends() -> date:
+    """Last FOMC date we know about. Past this, the calendar is silently missing FOMC."""
+    return max(_FOMC_MEETINGS)
 
 
 def classify_release(release_name: str) -> ReleaseSpec | None:
-    """The spec for a FRED release name, or None when it is not a release we react to."""
-    name = release_name.casefold()
+    """The spec for a FRED release name, or None when it is not a release we react to.
+    EXACT match — see ReleaseSpec for why substring matching is wrong."""
     for spec in _RELEASE_SPECS:
-        if spec.match.casefold() in name:
+        if spec.release_name == release_name:
             return spec
     return None
 
@@ -193,30 +219,56 @@ class FredCalendarProvider:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def fetch(self, start: date, end: date, *, limit: int = 1000) -> EconomicCalendar:
-        """Fetch every scheduled release between `start` and `end` and keep the ones we react to."""
-        params = {
-            "api_key": self._api_key,
-            "file_type": "json",
-            "realtime_start": start.isoformat(),
-            "realtime_end": end.isoformat(),
-            "include_release_dates_with_no_data": "true",
-            "limit": limit,
-        }
-        try:
-            resp = await self._client.get("/fred/releases/dates", params=params)
-        except httpx.HTTPError as exc:
-            raise FredCalendarError(f"FRED request failed: {exc}") from exc
-        if resp.status_code != 200:
-            raise FredCalendarError(f"FRED returned HTTP {resp.status_code}")
-        try:
-            payload = resp.json()
-        except ValueError as exc:
-            raise FredCalendarError("FRED response is not JSON") from exc
-        if "error_message" in payload:
-            raise FredCalendarError(f"FRED error: {payload['error_message']}")
-        return EconomicCalendar(parse_release_dates(payload, start=start, end=end))
+    async def fetch(self, start: date, end: date, *, page_size: int = 1000,
+                    max_pages: int = 10) -> EconomicCalendar:
+        """Fetch every scheduled release between `start` and `end`, then add FOMC.
 
+        Paginated because FRED caps `limit` at 1000 while a quarter can return ~2400 rows —
+        a single request silently truncated the calendar.
+
+        `include_release_dates_with_no_data=true` is REQUIRED and was verified: with it false FRED
+        returns only releases whose data has already landed, i.e. the PAST. A future CPI has no
+        data yet, so the flag that looks like noise reduction silently removes every event a
+        blackout could ever act on (measured: false -> CPI 2026-07-14 only; true -> 07-14, 08-12,
+        09-11, matching the BLS schedule).
+
+        The cost of `true` is that some FRED series then report data-update dates rather than
+        announcements — that is what `_MAX_DATES_PER_RELEASE_PER_QUARTER` and exact-name matching
+        exist to absorb, and why FOMC comes from the curated list instead.
+        """
+        rows: list[dict] = []
+        for page in range(max_pages):
+            params = {
+                "api_key": self._api_key,
+                "file_type": "json",
+                "realtime_start": start.isoformat(),
+                "realtime_end": end.isoformat(),
+                "include_release_dates_with_no_data": "true",
+                "limit": page_size,
+                "offset": page * page_size,
+            }
+            try:
+                resp = await self._client.get("/fred/releases/dates", params=params)
+            except httpx.HTTPError as exc:
+                raise FredCalendarError(f"FRED request failed: {exc}") from exc
+            if resp.status_code != 200:
+                raise FredCalendarError(f"FRED returned HTTP {resp.status_code}")
+            try:
+                payload = resp.json()
+            except ValueError as exc:
+                raise FredCalendarError("FRED response is not JSON") from exc
+            if "error_message" in payload:
+                raise FredCalendarError(f"FRED error: {payload['error_message']}")
+            batch = payload.get("release_dates")
+            if not isinstance(batch, list):
+                raise FredCalendarError("FRED payload has no 'release_dates' list")
+            rows.extend(batch)
+            if len(batch) < page_size:
+                break
+
+        events = parse_release_dates({"release_dates": rows}, start=start, end=end)
+        events.extend(fomc_events(start, end))
+        return EconomicCalendar(events)
 
 async def build_calendar(settings, *, start: date, end: date):
     """Fetch the release schedule for a run, or return (None, reason) when unavailable.
@@ -228,7 +280,8 @@ async def build_calendar(settings, *, start: date, end: date):
     key = getattr(settings, "fred_api_key", None)
     if not key:
         return None, "no_fred_api_key"
-    provider = FredCalendarProvider(key, timeout_seconds=getattr(settings, "http_timeout_seconds", 15.0))
+    provider = FredCalendarProvider(
+        key, timeout_seconds=getattr(settings, "http_timeout_seconds", 15.0))
     try:
         return await provider.fetch(start, end), None
     except FredCalendarError as exc:
@@ -240,9 +293,17 @@ async def build_calendar(settings, *, start: date, end: date):
 def calendar_config_from_settings(settings) -> CalendarConfig:
     return CalendarConfig(
         blackout_minutes_before=getattr(settings, "calendar_blackout_minutes_before", 30),
-        blackout_minutes_after=getattr(settings, "calendar_blackout_minutes_after", 15),
+        blackout_minutes_after=getattr(settings, "calendar_blackout_minutes_after", 5),
         context_lookahead_minutes=getattr(settings, "calendar_context_lookahead_minutes", 240),
     )
+
+
+def fomc_events(start: date, end: date) -> list[ScheduledEvent]:
+    """FOMC decision days in range, at 14:00 ET. Sourced from the curated list rather than FRED —
+    see _RELEASE_SPECS for why FRED's "FOMC Press Release" dates are not meetings."""
+    return [ScheduledEvent(label="FOMC", release_name="FOMC decision",
+                           scheduled_at=_to_utc(d, time(14, 0)), impact="high")
+            for d in _FOMC_MEETINGS if start <= d <= end]
 
 
 def parse_release_dates(payload: dict, *, start: date | None = None,
@@ -256,12 +317,23 @@ def parse_release_dates(payload: dict, *, start: date | None = None,
     if not isinstance(rows, list):
         raise FredCalendarError("FRED payload has no 'release_dates' list")
 
+    # Guard against a FRED series that reports data-update dates rather than announcements:
+    # such a release floods the window and would blanket it in false blackouts.
+    from collections import Counter
+
+    per_release = Counter(r.get("release_name") for r in rows if isinstance(r, dict))
+    span_quarters = max(1.0, ((end - start).days / 91.0)) if (start and end) else 1.0
+    noisy = {name for name, n in per_release.items()
+             if name and n / span_quarters > _MAX_DATES_PER_RELEASE_PER_QUARTER}
+
     events: list[ScheduledEvent] = []
     for row in rows:
         name = row.get("release_name")
         raw_date = row.get("date")
         if not name or not raw_date:
             continue
+        if name in noisy:
+            continue          # not an announcement schedule — see the guard above
         spec = classify_release(name)
         if spec is None:
             continue
