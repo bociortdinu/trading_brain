@@ -460,26 +460,52 @@ def _shadow_config(settings: Settings) -> ShadowConfig:
     return shadow_config_from_settings(settings)
 
 
-def _build_maker(settings: Settings, kind: str):
+class CallCapReached(RuntimeError):
+    """The online loop hit its logical paid-call cap and must stop."""
+
+
+def _build_maker(settings: Settings, kind: str, *, run_id: str | None = None,
+                 persist_dsn: str | None = None):
     """Select the shadow decision maker. Returns (maker, model_name) so the persisted decision
     records which maker produced it.
 
-    `claude` is DELIBERATELY REFUSED here. The backtest runner guards a paid run (a hard
-    --max-llm-calls cap, a worst-case cost estimate, an explicit confirmation, and closing the
-    Anthropic client in a finally); this loop has NONE of that and runs unbounded, so enabling it
-    would mean an open-ended spend with no ceiling and a leaked client. Fail closed until those
-    guards exist here too — an unbounded paid loop is not something to leave one flag away.
+    `claude` was refused outright here until this loop grew the same guards the backtest runner
+    has, because an unbounded paid loop is not something to leave one flag away. It now requires
+    ALL of them and still fails closed if any is missing:
+      - a hard `--max-llm-calls` cap, enforced by _CountingMaker and checked BEFORE each tick;
+      - persistence + run_id, so every call lands in the audit ledger (the gateway demands it);
+      - the central financial gateway (master switch, model allowlist, USD budgets, per-attempt
+        audit) — the same one the runner uses;
+      - an explicit cost confirmation at startup;
+      - the Anthropic client closed in a finally (see _close_maker).
     """
     if kind == "deterministic":
-        return ConfluenceStrategy(), "deterministic-confluence"
+        return ConfluenceStrategy(), "deterministic-confluence", False
     if kind == "claude":
-        raise SystemExit(
-            "--maker claude is disabled for shadow-online: this loop has no call cap, no cost "
-            "estimate/confirmation and does not close the Anthropic client, so it would spend "
-            "without a ceiling. Use `python -m shadow.runner --maker claude --max-llm-calls N` "
-            "(guarded) to measure the model, or run online with --maker deterministic."
-        )
+        if not (run_id and persist_dsn):
+            raise SystemExit(
+                "--maker claude needs a run_id and a database: every paid call must land in the "
+                "audit ledger. Configure BRAIN_DB_DSN and pass --run-id.")
+        from decision.paid_gateway import PaidAiGateway
+        from shadow.runner import _CountingMaker
+
+        gateway = PaidAiGateway(settings, run_id=run_id, persist_dsn=persist_dsn,
+                                context="shadow.online")
+        return _CountingMaker(gateway), settings.decision_model, True
     raise SystemExit(f"unknown --maker {kind!r} (expected deterministic|claude)")
+
+
+async def _close_maker(maker) -> None:
+    """Close the Anthropic client a paid maker holds. The loop is long-lived, so leaking the
+    client here is not a tidy-up detail — it leaks a connection pool for the process lifetime."""
+    inner = getattr(maker, "inner", maker)
+    aclose = getattr(inner, "aclose", None)
+    if aclose is not None:
+        await aclose()
+
+
+def _calls_made(maker) -> int:
+    return getattr(maker, "calls", 0)
 
 
 async def _once(settings: Settings, run_id: str, maker, model_name: str) -> None:
@@ -495,20 +521,36 @@ async def _once(settings: Settings, run_id: str, maker, model_name: str) -> None
         try:
             telemetry.stop()
         finally:
-            aclose = getattr(provider, "aclose", None)
-            if aclose:
-                await aclose()
+            try:
+                aclose = getattr(provider, "aclose", None)
+                if aclose:
+                    await aclose()
+            finally:
+                await _close_maker(maker)
     print(f"[shadow-online] {summary}")
 
 
 async def _loop(settings: Settings, run_id: str, maker, model_name: str,
-                offset_seconds: float = 5.0) -> None:
+                offset_seconds: float = 5.0, max_llm_calls: int | None = None,
+                deadline=None) -> None:
+    """Continuous shadow-online. `max_llm_calls` and `deadline` bound a PAID run: the cap is
+    checked before each tick (never mid-decision, so a decision is never half-paid-for), and the
+    deadline ends a timed session. Both stop the loop cleanly through the same finally that
+    closes the provider and the maker."""
     provider = build_provider(settings)
     telemetry = OperationalTelemetry(settings.db_dsn, "shadow_online")
     telemetry.heartbeat("starting", details={"run_id": run_id, "maker": model_name,
                                               "provider": settings.market_data_provider})
     try:
         while True:
+            # Budget/time checks BEFORE the tick: stopping mid-decision would leave a paid call
+            # without its persisted chain.
+            if max_llm_calls is not None and _calls_made(maker) >= max_llm_calls:
+                log.info("call cap reached (%d) — stopping", max_llm_calls)
+                return
+            if deadline is not None and datetime.now(timezone.utc) >= deadline:
+                log.info("deadline reached — stopping after %d call(s)", _calls_made(maker))
+                return
             tick_error = None
             try:
                 summary = await shadow_tick_with_retries(
@@ -524,14 +566,25 @@ async def _loop(settings: Settings, run_id: str, maker, model_name: str,
                                 next_wake_at=wake, error=tick_error,
                                 details={"phase": "sleeping", "run_id": run_id,
                                          "maker": model_name})
-            await asyncio.sleep(max(1.0, (wake - datetime.now(timezone.utc)).total_seconds()))
+            # Never sleep past the deadline — a timed session must end on time, not at the next
+            # M15 close after it.
+            sleep_for = max(1.0, (wake - datetime.now(timezone.utc)).total_seconds())
+            if deadline is not None:
+                remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
+                if remaining <= 0:
+                    return
+                sleep_for = min(sleep_for, remaining)
+            await asyncio.sleep(sleep_for)
     finally:
         try:
             telemetry.stop()
         finally:
-            aclose = getattr(provider, "aclose", None)
-            if aclose:
-                await aclose()
+            try:
+                aclose = getattr(provider, "aclose", None)
+                if aclose:
+                    await aclose()
+            finally:
+                await _close_maker(maker)
 
 
 def build_online_exec_manifest(settings: Settings, *, shadow_config: ShadowConfig,
@@ -590,18 +643,44 @@ def main() -> int:
                         help="experiment id (else BRAIN_RUN_ID, else a strategy-versioned default)")
     parser.add_argument("--maker", choices=["deterministic", "claude"], default="deterministic",
                         help="decision maker: deterministic (free) or claude (paid API)")
+    parser.add_argument("--max-llm-calls", type=int, default=None,
+                        help="hard cap on paid decisions; REQUIRED with --maker claude")
+    parser.add_argument("--minutes", type=float, default=None,
+                        help="stop after this many minutes (timed session)")
+    parser.add_argument("--yes", action="store_true", help="skip the paid-run confirmation prompt")
     args = parser.parse_args()
     settings = load_settings()            # Settings validators run here (bad config -> hard exit)
     _shadow_config(settings)              # build+validate the ShadowConfig ONCE at startup, not per tick
-    maker, model_name = _build_maker(settings, args.maker)
+
+    # A paid ONLINE loop must be bounded before it starts. Without a cap this runs forever, so
+    # the cap is required rather than defaulted — a default would be a number nobody chose.
+    if args.maker == "claude" and args.max_llm_calls is None:
+        raise SystemExit("--maker claude requires --max-llm-calls N (this loop would otherwise "
+                         "run unbounded)")
+    if args.max_llm_calls is not None and args.max_llm_calls < 1:
+        raise SystemExit("--max-llm-calls must be >= 1")
+
+    persist_dsn = settings.db_dsn
+    provisional_run_id = resolve_run_id(args.run_id, settings, model_name=settings.decision_model,
+                                        provider_name=settings.market_data_provider)
+    maker, model_name, is_paid = _build_maker(settings, args.maker, run_id=provisional_run_id,
+                                              persist_dsn=persist_dsn)
     run_id = resolve_run_id(args.run_id, settings, model_name=model_name,
                             provider_name=settings.market_data_provider)
-    log.info("shadow online run_id=%s", run_id)
+    if is_paid:
+        from shadow.runner import _confirm_paid_run
+        _confirm_paid_run(model_name, args.max_llm_calls, settings.decision_max_tokens, args.yes,
+                          http_attempts_per_call=settings.paid_max_http_attempts)
+    deadline = (datetime.now(timezone.utc) + timedelta(minutes=args.minutes)
+                if args.minutes else None)
+    log.info("shadow online run_id=%s maker=%s cap=%s deadline=%s",
+             run_id, model_name, args.max_llm_calls, deadline)
     try:
         if args.once:
             asyncio.run(_once(settings, run_id, maker, model_name))
         else:
-            asyncio.run(_loop(settings, run_id, maker, model_name))
+            asyncio.run(_loop(settings, run_id, maker, model_name,
+                              max_llm_calls=args.max_llm_calls, deadline=deadline))
     except KeyboardInterrupt:
         log.info("shadow online stopped by operator")
         return 130

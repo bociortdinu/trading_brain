@@ -24,7 +24,7 @@ from core.models import Direction
 from data_collector.session import DEFAULT_CALENDAR, XauUsdCalendar
 from decision.schema import DecisionOutput
 
-RISK_CONFIG_VERSION = "risk-mvp-2026.2"   # 2026.2: mandatory spread, session gate, exec-readiness
+RISK_CONFIG_VERSION = "risk-mvp-2026.3"   # 2026.3: min_confidence 0.60 -> 0.55 (measured)
 
 # Gates required for a LIVE order that are STATEFUL and not yet implemented. Until these are
 # wired, no verdict is execution-ready (only shadow-eligible).
@@ -32,7 +32,16 @@ PENDING_EXECUTION_GATES = ["cooldown_frequency", "existing_positions"]
 
 
 class RiskConfig(BaseModel):
-    min_confidence: float = Field(0.60, ge=0.0, le=1.0)   # ORDINAL threshold
+    # Lowered 0.60 -> 0.55 on measurement (2026-07-21, run claude-sonnet5-probe): across 109 paid
+    # Sonnet-5 decisions the risk engine rejected 50 of 56 directional calls, and EVERY rejection
+    # was low_confidence. Claude's conviction clusters just under the old threshold (0.42, 0.45,
+    # 0.52, 0.55, 0.58), so 0.60 was not filtering weak signals so much as filtering nearly all of
+    # them: 6 trades from 56 signals. At 0.55 the same sample yields ~42 — the difference between a
+    # strategy that can be measured and one that almost never acts.
+    # This is a RISK threshold, not a tuning knob: raise it again if the extra trades prove to be
+    # noise. `confidence` is ORDINAL, so these numbers are not probabilities and only compare
+    # within one model — re-measure before reusing this value on a different model.
+    min_confidence: float = Field(0.55, ge=0.0, le=1.0)   # ORDINAL threshold
     sl_atr_mult: float = Field(1.5, gt=0)                 # SL = mult * ATR%
     reward_risk: float = Field(2.0, gt=0)                 # TP = reward_risk * SL
     min_sl_pct: float = Field(0.05, gt=0)                 # reject stops tighter than this
