@@ -30,6 +30,21 @@ sudo systemctl start postgresql
 
 Ăsta e serviciul Go care vorbește cu brokerul. Fără el nu ai date live și nu poți executa.
 
+**Verifică ÎNTÂI dacă nu rulează deja:**
+
+```bash
+curl -s http://127.0.0.1:4000/status
+```
+
+Dacă primești un JSON cu `"connected":true`, **e deja pornit — sari peste pasul ăsta.**
+
+> De ce contează: dacă dai `npm start` cât rulează o instanță, se face un login NOU la XTB
+> (consumă un tichet), apoi serviciul găsește portul 4000 ocupat, scrie
+> `bind: address already in use` și se închide singur. Nu strică nimic, dar pare că a eșuat
+> pornirea când de fapt totul era în regulă.
+
+Dacă NU răspunde nimic, atunci îl pornești:
+
 ```bash
 cd ~/WORKSPACE/XTB/trading_hands/browser-auth
 npm start
@@ -39,12 +54,31 @@ Ce face: deschide un browser invizibil, se loghează la XTB cu datele din
 `trading_hands/config/.env`, ia un tichet de sesiune și pornește serviciul Go. Durează ~20 de
 secunde. **Tichetul e de unică folosință** — dacă repornești, se face un login nou.
 
-Îl lași să ruleze în terminalul lui. Ca să meargă în fundal:
+Îl lași să ruleze în terminalul lui — se închide dacă închizi terminalul. Ca să meargă
+independent:
 
 ```bash
 cd ~/WORKSPACE/XTB/trading_hands/browser-auth
 setsid nohup npm start > /tmp/hands.log 2>&1 < /dev/null & disown
 ```
+
+### Cum îl repornești corect
+
+Dacă vrei să-l repornești (de exemplu după ce ai schimbat `TRADING_ENABLED`), oprește-l
+întâi, altfel dai peste conflictul de port de mai sus:
+
+```bash
+pkill -f "launcher.mjs"                        # oprește lansatorul
+pkill -f "exe/trading_hands"                   # oprește serviciul Go
+sleep 3
+ss -ltn | grep 4000 || echo "port liber"       # confirmă că s-a eliberat
+```
+
+Abia apoi `npm start` din nou.
+
+> **Atenție la `pkill`:** nu folosi `pkill -f trading_hands`, fiindcă tiparul se potrivește și
+> cu propriul tău shell dacă ești în directorul `trading_hands` — îți omori terminalul. Am
+> pățit-o. Folosește tiparele exacte de mai sus.
 
 ### Verifici că merge
 
