@@ -414,11 +414,15 @@ def test_missing_proposal_falls_back_and_says_so():
     assert source == "atr_fallback:no_proposal"
 
 
-def test_a_proposed_stop_outside_the_bounds_is_still_rejected():
-    """A proposal gets no easier a path than a computed value: the same min/max SL band applies."""
+def test_an_absurd_proposal_falls_back_rather_than_being_traded():
+    """A proposal far outside the ATR multiple is discarded before the absolute band is even
+    reached, and the trade proceeds on deterministic sizing. The fallback is deliberate — the
+    direction signal is still the model's, only its sizing was unusable — and it is RECORDED, so
+    a run where most trades read atr_fallback tells you the proposals are not usable."""
     packet = _packet(atr=0.2, spread=0.02)
     v = evaluate_risk(_out_sl(sl=5.0, tp=15.0), packet, RiskConfig(sl_tp_source="model"))
-    assert not v.approved and "sl_out_of_bounds" in v.reason
+    assert v.approved and v.sl_pct == 0.3            # the ATR stop, not the proposal
+    assert v.sl_tp_source == "atr_fallback:sl_too_wide"
 
 
 def test_a_proposed_stop_the_spread_would_eat_is_rejected():
@@ -447,3 +451,39 @@ def test_a_negative_proposed_stop_is_rejected_by_the_schema():
     with pytest.raises(ValidationError):
         DecisionOutput(direction=Direction.BUY, confidence=0.8, rationale="x",
                        proposed_sl_pct=-0.5, proposed_tp_pct=1.0)
+
+
+def test_a_proposal_far_wider_than_atr_is_rejected():
+    """The reward:risk floor constrains the SHAPE but not the SCALE: a stop and target scaled up
+    together satisfy it at any width. Without an ATR-relative bound a model could propose a stop
+    10x the deterministic one, pass every check, and risk 10x the money for the same R — which
+    the metrics would not show, because R normalises it away."""
+    from risk.engine import compute_sl_tp, resolve_sl_tp
+
+    cfg = RiskConfig(sl_tp_source="model", max_sl_atr_multiple=2.5)
+    atr_sl, _ = compute_sl_tp(0.2, cfg)                      # 0.3
+    sl, tp, source = resolve_sl_tp(_out_sl(sl=2.9, tp=7.25), 0.2, cfg)
+    assert source == "atr_fallback:sl_too_wide" and sl == atr_sl
+
+
+def test_a_proposal_inside_the_atr_multiple_is_accepted():
+    from risk.engine import resolve_sl_tp
+
+    cfg = RiskConfig(sl_tp_source="model", max_sl_atr_multiple=2.5)
+    sl, tp, source = resolve_sl_tp(_out_sl(sl=0.7, tp=1.75), 0.2, cfg)   # 0.7 <= 2.5 * 0.3
+    assert source == "model" and sl == 0.7
+
+
+def test_widening_can_no_longer_buy_past_the_spread_gate():
+    """The incentive this closes: the spread-vs-stop gate is relative to the stop, so a wider
+    stop unlocks bars a normal one cannot trade. A proposal cannot widen its way in any more."""
+    # 0.15 exceeds 33% of the 0.3 ATR stop, but is comfortably inside 33% of a 2.9 one.
+    packet = _packet(atr=0.2, spread=0.15)
+    wide = evaluate_risk(_out_sl(sl=2.9, tp=7.25), packet,
+                         RiskConfig(sl_tp_source="model", max_sl_atr_multiple=2.5))
+    assert not wide.approved and "spread_vs_sl" in wide.reason
+
+    # Same bar, same spread, an unbounded policy: the wide stop WOULD have bought its way in.
+    unbounded = evaluate_risk(_out_sl(sl=2.9, tp=7.25), packet,
+                              RiskConfig(sl_tp_source="model", max_sl_atr_multiple=99.0))
+    assert unbounded.approved and unbounded.sl_pct == 2.9

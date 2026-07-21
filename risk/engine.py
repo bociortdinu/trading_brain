@@ -26,7 +26,7 @@ from core.models import Direction
 from data_collector.session import DEFAULT_CALENDAR, XauUsdCalendar
 from decision.schema import DecisionOutput
 
-RISK_CONFIG_VERSION = "risk-mvp-2026.3"   # 2026.3: min_confidence 0.60 -> 0.55 (measured)
+RISK_CONFIG_VERSION = "risk-mvp-2026.4"   # 2026.4: model-proposed SL/TP bounded to an ATR multiple
 
 # Gates required for a LIVE order that are STATEFUL and not yet implemented. Until these are
 # wired, no verdict is execution-ready (only shadow-eligible).
@@ -50,6 +50,13 @@ class RiskConfig(BaseModel):
     # model propose from market structure and validate it here. The default stays "atr" so this
     # is an opt-in experiment rather than a silent change of what every past run measured.
     sl_tp_source: Literal["atr", "model"] = "atr"
+    # A proposal may deviate from the deterministic size, but only so far. Without this the only
+    # ceiling was max_sl_pct (3.0%) against a typical ATR stop of ~0.28%, so a model could
+    # propose a stop 10x wider and pass every check — and WIDENING IS REWARDED, because the
+    # spread-vs-stop gate is relative to the stop, so a wider stop unlocks bars a normal one
+    # cannot trade. Worse, R hides it: at fixed volume a 10x stop risks 10x the money for the
+    # same R, so the track record would look unchanged while real drawdown scaled with it.
+    max_sl_atr_multiple: float = Field(2.5, gt=0)
     min_sl_pct: float = Field(0.05, gt=0)                 # reject stops tighter than this
     max_sl_pct: float = Field(3.0, gt=0)                  # reject stops wider than this
     max_spread_fraction_of_sl: float = Field(0.33, gt=0)  # spread must be < this * SL
@@ -95,6 +102,7 @@ def resolve_sl_tp(decision, atr_pct_m15: float, config: RiskConfig) -> tuple[flo
       "model"                    — the model's proposal, accepted
       "atr_fallback:no_proposal" — policy is model, but none was offered
       "atr_fallback:rr_too_low"  — proposal offered, reward:risk below the floor
+      "atr_fallback:sl_too_wide" — proposal exceeds max_sl_atr_multiple x the ATR stop
     """
     atr_sl, atr_tp = compute_sl_tp(atr_pct_m15, config)
     if config.sl_tp_source != "model":
@@ -110,6 +118,10 @@ def resolve_sl_tp(decision, atr_pct_m15: float, config: RiskConfig) -> tuple[flo
     # the PROPOSAL, not merely to the ATR-derived pair.
     if tp < sl * config.reward_risk:
         return atr_sl, atr_tp, "atr_fallback:rr_too_low"
+    # Bound the deviation from the deterministic size. The reward:risk floor constrains the
+    # SHAPE but not the SCALE — a proportionally-scaled stop and target satisfy it at any width.
+    if sl > atr_sl * config.max_sl_atr_multiple:
+        return atr_sl, atr_tp, "atr_fallback:sl_too_wide"
     return round(float(sl), 3), round(float(tp), 3), "model"
 
 

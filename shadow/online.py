@@ -503,7 +503,8 @@ async def shadow_tick_with_retries(settings: Settings, provider, provider_name: 
 def _risk_config(settings: Settings) -> RiskConfig:
     """Risk config for this run, carrying the sizing policy so which one was used is recorded in
     the manifest rather than assumed."""
-    return RiskConfig(sl_tp_source=settings.sl_tp_source)
+    return RiskConfig(sl_tp_source=settings.sl_tp_source,
+                      max_sl_atr_multiple=settings.max_sl_atr_multiple)
 
 
 def _prefilter_config(settings: Settings) -> PrefilterConfig:

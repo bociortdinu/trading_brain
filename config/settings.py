@@ -118,6 +118,9 @@ class Settings(BaseSettings):
     # keeps every existing run's sizing unchanged; flip it per run to compare the two on the
     # same bars.
     sl_tp_source: Literal["atr", "model"] = "atr"
+    # How far a model proposal may deviate from the ATR-derived stop. See RiskConfig for why an
+    # absolute ceiling alone is not enough.
+    max_sl_atr_multiple: float = Field(2.5, gt=0)
 
     # LIVE ORDER ROUTING (execution/live_router.py). This is the only path in trading_brain that
     # sends a real order, so every default is the safe one and enabling it must be deliberate.
