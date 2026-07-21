@@ -241,10 +241,16 @@ def evaluations_for(dsn: str, snapshot_id: int) -> list[dict]:
 
 
 def _open_trade_row(conn, *, decision_id: int, run_id: str, symbol: str, trade, outcome,
-                    timeframe: str, timeout_bars: int, costs: dict, observed_at):
+                    timeframe: str, timeout_bars: int, costs: dict, observed_at,
+                    external_id: str | None = None):
     """INSERT a FRESH open (or immediately-closed) trade on an EXISTING connection — used to
     persist a decision and its trade in ONE transaction (online), so a crash can never leave a
-    committed decision with no trade. Fresh decision_id -> no conflict is possible."""
+    committed decision with no trade. Fresh decision_id -> no conflict is possible.
+
+    `external_id` is the broker order id when this decision was ALSO routed live. Its presence
+    is what makes the row mode='live': the position is then owned by the broker, and its exit
+    must be read back from the account rather than simulated. A row without it stays 'shadow'
+    and is reconciled against bars as before."""
     from psycopg.types.json import Json
 
     from core.models import Direction
@@ -257,14 +263,16 @@ def _open_trade_row(conn, *, decision_id: int, run_id: str, symbol: str, trade, 
             (decision_id, run_id, symbol, side, mode, entry_price, sl_price, tp_price,
              opened_at, status, exit_price, exit_reason, closed_at, outcome_observed_at,
              r_multiple, r_pessimistic, r_optimistic, ambiguous, timeframe, timeout_bars,
-             spread_pct, spread_provenance, slippage_pct, costs)
-        VALUES (%s,%s,%s,%s,'shadow',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+             spread_pct, spread_provenance, slippage_pct, costs, external_id)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """,
-        (decision_id, run_id, symbol, side, trade.entry_mid, trade.sl_price, trade.tp_price,
+        (decision_id, run_id, symbol, side,
+         "live" if external_id else "shadow",
+         trade.entry_mid, trade.sl_price, trade.tp_price,
          trade.opened_at, outcome.status, outcome.exit_price, outcome.exit_reason, outcome.closed_at,
          observed, outcome.r_multiple, outcome.r_pessimistic, outcome.r_optimistic, outcome.ambiguous,
          timeframe, timeout_bars, trade.spread_pct, trade.spread_provenance, trade.slippage_pct,
-         Json(costs)),
+         Json(costs), external_id),
     )
 
 
@@ -1072,3 +1080,51 @@ def sweep_started_attempts_to_unknown(dsn: str, older_than_seconds: int = 300) -
             (older_than_seconds,))
         conn.commit()
         return cur.rowcount
+
+
+def open_live_trades(dsn: str, *, symbol: str | None = None) -> list[dict]:
+    """OPEN trades that were routed to the broker (mode='live', external_id present).
+
+    These are NOT reconciled against bars: the position belongs to the account, so its exit is
+    read back from the broker. Returned across ALL runs — a position opened by a previous run_id
+    still has to be closed."""
+    import psycopg
+    from psycopg.rows import dict_row
+
+    sql = ("SELECT id, decision_id, run_id, symbol, side, external_id, entry_price, sl_price, "
+           "tp_price, opened_at, timeout_bars, timeframe, costs FROM trades "
+           "WHERE mode = 'live' AND status = 'open' AND external_id IS NOT NULL")
+    params: tuple = ()
+    if symbol:
+        sql += " AND symbol = %s"
+        params = (symbol,)
+    with psycopg.connect(dsn, row_factory=dict_row) as conn:
+        return list(conn.execute(sql + " ORDER BY opened_at", params))
+
+
+def close_live_trade(dsn: str, *, trade_id: int, exit_price: float | None, exit_reason: str,
+                     closed_at, realized_pnl: float | None, r_multiple: float | None,
+                     observed_at=None) -> str:
+    """Record the REAL exit of a live position.
+
+    `exit_price` may be None: the xStation CoreAPI does not publish a closed position's fill, so
+    when the broker closes on SL/TP we may know the P&L (from the account balance delta) without
+    the price. The schema requires a price for status='closed', so a priceless exit is recorded
+    as 'expired' with the true reason rather than inventing a fill — a fabricated price would
+    silently become the basis of every R computed from it."""
+    import psycopg
+
+    status = "closed" if exit_price is not None else "expired"
+    with psycopg.connect(dsn) as conn:
+        row = conn.execute(
+            """
+            UPDATE trades SET status = %s, exit_price = %s, exit_reason = %s, closed_at = %s,
+                   outcome_observed_at = %s, pnl = %s, r_multiple = %s
+            WHERE id = %s AND status = 'open'
+            RETURNING id
+            """,
+            (status, exit_price, exit_reason, closed_at, observed_at or closed_at,
+             realized_pnl, r_multiple, trade_id),
+        ).fetchone()
+        conn.commit()
+    return "closed" if row else "unchanged"
