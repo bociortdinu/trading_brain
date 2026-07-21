@@ -88,6 +88,24 @@ class LivePositionManager:
         self._dsn = dsn
         self._now = now_fn or (lambda: datetime.now(timezone.utc))
 
+    @staticmethod
+    def _realized_pnl(trade, balance_now, vanished, open_trades) -> tuple[float | None, str]:
+        """Realized P&L for a position the broker closed, from the account balance delta.
+
+        Returns (pnl, why) — `why` explains a None so a missing figure is never mistaken for a
+        zero result. Attribution is refused unless this is the only live position we are
+        tracking: with several in flight the delta covers every realization between the two
+        instants and cannot honestly be split.
+        """
+        baseline = trade.get("balance_at_open")
+        if baseline is None:
+            return None, "no opening balance recorded (trade predates the column)"
+        if balance_now is None:
+            return None, "balance unavailable"
+        if len(open_trades) > 1:
+            return None, f"{len(open_trades)} live positions tracked — delta not attributable"
+        return round(float(balance_now) - float(baseline), 2), "single position in flight"
+
     async def sweep(self, *, symbol: str | None = None) -> ManagerReport:
         from database.repository import close_live_trade, open_live_trades
 
@@ -96,6 +114,13 @@ class LivePositionManager:
         positions = await self._client.positions()
         held = {p.external_id: p for p in positions}
         report.checked = len(open_trades)
+
+        # Balance is read ONCE per sweep, and only when something has actually disappeared —
+        # there is nothing to price otherwise. Balance moves on REALIZATION only (an open
+        # position marks equity, not balance), so the delta from a trade's opening balance is
+        # its realized result.
+        vanished = [t for t in open_trades if t["external_id"] not in held]
+        balance_now = (await self._client.balance()).balance if vanished else None
 
         # A position at the broker that no trade row claims. It cannot be managed — we do not
         # know its horizon or intent — so it is reported, never silently closed.
@@ -112,16 +137,17 @@ class LivePositionManager:
                 # exit at the SL or TP level would be the tempting move and the wrong one —
                 # slippage and gaps mean the fill is frequently NOT that level, and every R
                 # derived from it would inherit the fiction.
+                pnl, why = self._realized_pnl(trade, balance_now, vanished, open_trades)
                 close_live_trade(
                     self._dsn, trade_id=trade["id"], exit_price=None,
                     exit_reason="manual", closed_at=now,
-                    realized_pnl=None, r_multiple=None, observed_at=now)
+                    realized_pnl=pnl, r_multiple=None, observed_at=now)
                 report.exits.append(ManagedExit(
                     trade_id=trade["id"], external_id=eid, action="closed_by_broker",
-                    exit_reason="broker_sl_or_tp",
-                    detail="fill price and level unknown: the CoreAPI does not publish a closed "
-                           "position's outcome (see IPAX_CLOSED_POSITIONS.md). Recorded without "
-                           "a price rather than inventing one."))
+                    exit_reason="broker_sl_or_tp", realized_pnl=pnl,
+                    detail=f"P&L from balance delta ({why}); fill price and level unknown — the "
+                           f"CoreAPI does not publish a closed position's outcome, and it is not "
+                           f"invented here (see IPAX_CLOSED_POSITIONS.md)"))
                 continue
 
             deadline = trade["opened_at"] + horizon_for(trade)

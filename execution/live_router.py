@@ -77,6 +77,10 @@ class RouteResult(BaseModel):
     symbol: str | None = None
     side: str | None = None
     volume: float | None = None
+    # Account balance at the instant the order was accepted. Balance moves only on REALIZATION,
+    # so this is the baseline that prices the exit when the broker closes without reporting a
+    # fill. Captured here because it must be read before the position exists.
+    balance_at_open: float | None = None
     gates_checked: list[str] = Field(default_factory=list)
 
 
@@ -186,6 +190,12 @@ class LiveRouter:
         if len(positions) >= self._config.max_open_positions:
             return refuse(f"max_positions:{len(positions)}>={self._config.max_open_positions}")
 
+        balance_at_open = None
+        try:
+            balance_at_open = (await self._client.balance()).balance
+        except Exception:   # noqa: BLE001 — never block an order on a balance read
+            pass
+
         prediction = build_prediction(symbol=symbol, direction=direction, sl_pct=sl_pct,
                                       tp_pct=tp_pct, confidence=confidence, volume=volume,
                                       as_of=as_of)
@@ -202,7 +212,8 @@ class LiveRouter:
                            side=result.side or ("buy" if direction is Direction.BUY else "sell"),
                            # The broker's echoed volume is authoritative — it is what actually
                            # got filled, which may differ from what we requested.
-                           volume=result.volume or broker_volume, gates_checked=gates)
+                           volume=result.volume or broker_volume,
+                           balance_at_open=balance_at_open, gates_checked=gates)
 
 
 def live_config_from_settings(settings) -> LiveExecutionConfig:

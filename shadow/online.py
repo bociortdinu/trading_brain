@@ -383,7 +383,7 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
     # tell which shadow trade corresponded to which real position — and therefore nothing could
     # close it. The order is the risky half, so it happens first and its outcome is recorded
     # whether or not it succeeded.
-    live_external_id = None
+    live_external_id = live_balance_at_open = None
     if live_router is not None and record.risk_approved and record.decision is not None:
         route = await live_router.route(
             symbol=brain_symbol, direction=record.decision.direction,
@@ -391,6 +391,7 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
             tp_pct=record.risk.tp_pct, confidence=record.decision.confidence,
             as_of=packet.bar_close)
         live_external_id = route.external_id
+        live_balance_at_open = route.balance_at_open
         summary["live"] = (f"placed:{route.external_id}" if route.placed
                            else f"skipped:{route.reason}")
         log.info("live route: %s", summary["live"])
@@ -411,7 +412,8 @@ async def shadow_tick(settings: Settings, provider, provider_name: str, *, decis
                       "outcome": reconcile(trade, [], shadow_config), "timeframe": TRIGGER_TF,
                       "timeout_bars": shadow_config.timeout_bars,
                       "costs": cost_manifest(trade, shadow_config), "observed_at": None,
-                      "external_id": live_external_id}
+                      "external_id": live_external_id,
+                      "balance_at_open": live_balance_at_open}
     dec_id, inserted = insert_decision(
         settings.db_dsn, snapshot_id=snap_id, evaluation_id=eval_id, model=model_name,
         record=record, ai_input=inp.model_dump(mode="json"),

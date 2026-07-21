@@ -26,13 +26,15 @@ def _trade(**kw):
     base = dict(id=1, decision_id=10, run_id="r1", symbol="GOLD", side="sell",
                 external_id="X1", entry_price=4000.0, sl_price=4012.0, tp_price=3976.0,
                 opened_at=NOW - timedelta(hours=1), timeout_bars=96, timeframe="15min",
-                costs={})
+                costs={}, balance_at_open=50000.0)
     base.update(kw)
     return base
 
 
 class _Client:
-    def __init__(self, positions=(), close_accepted=True, bid=3990.0, ask=3990.7):
+    def __init__(self, positions=(), close_accepted=True, bid=3990.0, ask=3990.7,
+                 balance=50000.0):
+        self._balance = balance
         self._positions = list(positions)
         self._close_accepted = close_accepted
         self._quote = Quote(symbol="GOLD", bid=bid, ask=ask, time=0)
@@ -42,8 +44,8 @@ class _Client:
         return list(self._positions)
 
     async def balance(self):
-        return Balance(balance=50000.0, equity=50000.0, free_margin=50000.0,
-                       currency="RON", account="1")
+        return Balance(balance=self._balance, equity=self._balance,
+                       free_margin=self._balance, currency="RON", account="1")
 
     async def quote(self, symbol):
         return self._quote
@@ -131,16 +133,18 @@ def test_a_rejected_close_is_reported_and_retried_not_recorded(monkeypatch):
 def test_a_broker_closed_position_is_recorded_without_an_invented_price(monkeypatch):
     """The CoreAPI publishes neither the fill nor which level fired. Recording the exit AT the
     SL or TP would look like a measurement and frequently be wrong (slippage, gaps), and every R
-    derived from it would inherit that."""
-    client = _Client(positions=[])                    # gone from the account
+    derived from it would inherit that.
+
+    P&L is still known — it comes from the balance delta — but the PRICE is not, and therefore
+    neither is R. The two travel separately on purpose."""
+    client = _Client(positions=[], balance=50000.0)   # gone from the account, flat result
     recorded: list = []
     report = run(_manager(monkeypatch, client, [_trade()], recorded).sweep())
 
     exit_ = report.exits[0]
     assert exit_.action == "closed_by_broker"
-    assert exit_.r_multiple is None and exit_.realized_pnl is None
+    assert exit_.r_multiple is None                   # no price -> no R, ever
     assert recorded[0]["exit_price"] is None and recorded[0]["r_multiple"] is None
-    assert "not inventing" in (exit_.detail or "") or "without" in (exit_.detail or "")
     assert client.closed == []                        # nothing to close, it is already gone
 
 
@@ -167,3 +171,50 @@ def test_multiple_positions_are_each_resolved(monkeypatch):
     actions = {e.external_id: e.action for e in report.exits}
     assert actions == {"X1": "held", "X2": "closed_by_broker"}
     assert report.checked == 2
+
+
+# ---- realized P&L from the balance delta ---- #
+def test_pnl_comes_from_the_balance_delta_when_the_broker_closes(monkeypatch):
+    """Balance moves only on REALIZATION (an open position marks equity, not balance), so the
+    delta from the opening balance IS the realized result — exact, and with no modelling."""
+    client = _Client(positions=[], balance=49986.69)
+    recorded: list = []
+    report = run(_manager(monkeypatch, client, [_trade(balance_at_open=50000.0)],
+                          recorded).sweep())
+    assert report.exits[0].realized_pnl == pytest.approx(-13.31)
+    assert recorded[0]["realized_pnl"] == pytest.approx(-13.31)
+
+
+def test_pnl_is_refused_when_several_positions_are_in_flight(monkeypatch):
+    """With more than one live position the delta covers every realization between the two
+    instants and cannot honestly be split — a None is recorded, not a guess."""
+    client = _Client(positions=[_pos("X1")], balance=49986.69)
+    recorded: list = []
+    trades = [_trade(id=1, external_id="X1"), _trade(id=2, external_id="X2")]
+    report = run(_manager(monkeypatch, client, trades, recorded).sweep())
+    gone = next(e for e in report.exits if e.external_id == "X2")
+    assert gone.realized_pnl is None
+    assert "not attributable" in gone.detail
+
+
+def test_a_missing_baseline_is_reported_not_treated_as_zero(monkeypatch):
+    """A row written before the column existed has no baseline. None must not read as break-even."""
+    client = _Client(positions=[], balance=49986.69)
+    recorded: list = []
+    report = run(_manager(monkeypatch, client, [_trade(balance_at_open=None)], recorded).sweep())
+    assert report.exits[0].realized_pnl is None
+    assert "no opening balance" in report.exits[0].detail
+
+
+def test_the_balance_is_not_read_when_nothing_closed(monkeypatch):
+    """A sweep where every position is still held must not make a needless account call."""
+    calls = {"n": 0}
+
+    class _Counting(_Client):
+        async def balance(self):
+            calls["n"] += 1
+            return await super().balance()
+
+    client = _Counting(positions=[_pos("X1")])
+    run(_manager(monkeypatch, client, [_trade()], []).sweep())
+    assert calls["n"] == 0

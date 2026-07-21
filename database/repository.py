@@ -242,7 +242,7 @@ def evaluations_for(dsn: str, snapshot_id: int) -> list[dict]:
 
 def _open_trade_row(conn, *, decision_id: int, run_id: str, symbol: str, trade, outcome,
                     timeframe: str, timeout_bars: int, costs: dict, observed_at,
-                    external_id: str | None = None):
+                    external_id: str | None = None, balance_at_open: float | None = None):
     """INSERT a FRESH open (or immediately-closed) trade on an EXISTING connection — used to
     persist a decision and its trade in ONE transaction (online), so a crash can never leave a
     committed decision with no trade. Fresh decision_id -> no conflict is possible.
@@ -263,8 +263,8 @@ def _open_trade_row(conn, *, decision_id: int, run_id: str, symbol: str, trade, 
             (decision_id, run_id, symbol, side, mode, entry_price, sl_price, tp_price,
              opened_at, status, exit_price, exit_reason, closed_at, outcome_observed_at,
              r_multiple, r_pessimistic, r_optimistic, ambiguous, timeframe, timeout_bars,
-             spread_pct, spread_provenance, slippage_pct, costs, external_id)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+             spread_pct, spread_provenance, slippage_pct, costs, external_id, balance_at_open)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """,
         (decision_id, run_id, symbol, side,
          "live" if external_id else "shadow",
@@ -272,7 +272,7 @@ def _open_trade_row(conn, *, decision_id: int, run_id: str, symbol: str, trade, 
          trade.opened_at, outcome.status, outcome.exit_price, outcome.exit_reason, outcome.closed_at,
          observed, outcome.r_multiple, outcome.r_pessimistic, outcome.r_optimistic, outcome.ambiguous,
          timeframe, timeout_bars, trade.spread_pct, trade.spread_provenance, trade.slippage_pct,
-         Json(costs), external_id),
+         Json(costs), external_id, balance_at_open),
     )
 
 
@@ -1092,7 +1092,7 @@ def open_live_trades(dsn: str, *, symbol: str | None = None) -> list[dict]:
     from psycopg.rows import dict_row
 
     sql = ("SELECT id, decision_id, run_id, symbol, side, external_id, entry_price, sl_price, "
-           "tp_price, opened_at, timeout_bars, timeframe, costs FROM trades "
+           "tp_price, opened_at, timeout_bars, timeframe, costs, balance_at_open FROM trades "
            "WHERE mode = 'live' AND status = 'open' AND external_id IS NOT NULL")
     params: tuple = ()
     if symbol:
