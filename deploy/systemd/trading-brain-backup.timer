@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily trading_brain PostgreSQL backup
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+# Persistent: run on next boot if the machine was off at the scheduled time.
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

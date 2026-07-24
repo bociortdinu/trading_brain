@@ -1,10 +1,19 @@
 .venv/
 __pycache__/
 *.pyc
-# Secrets — NEVER commit (real DB/Polygon/Anthropic creds). .env.example IS committed.
+# Secrets — NEVER commit (real DB/Polygon/Anthropic creds). The *.example files ARE committed.
 .env
 .env.*
 !.env.example
+!.env.compose.example
+!.env.brain.example
+# Local DB dumps written by `make backup`.
+backups/
+*.dump
+# Harvested bar archive (app.harvest). Kept OUT of git — it is broker market data and it grows.
+# NOTE: it is NOT regenerable. XTB serves a rolling window, so once it rolls past, those bars
+# are gone for good. Back this directory up like data you cannot re-fetch, because you cannot.
+data/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/

@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]        # run on every branch, not just main (a feature push must trigger CI)
+  pull_request:
+  workflow_dispatch:        # allow a manual run
+
+jobs:
+  # Fast lane: everything that needs no infrastructure. Repository/operations tests skip
+  # themselves when BRAIN_TEST_DB_DSN is absent, so this stays green without a database.
+  no-db:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install (dev extras, pinned)
+        run: pip install -e '.[dev]' -c requirements.lock
+
+      - name: Test (no infrastructure; DB-gated tests skip)
+        run: python -m pytest -q
+
+  # Full lane: an isolated PostgreSQL, migrations applied FROM SCRATCH through the project's
+  # own admin/app-role split, then the complete suite against the `_test` database.
+  db:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # Admin (privileged) creds do DDL; the least-privilege app role only ever gets DML.
+      BRAIN_ADMIN_DB_DSN: postgresql://postgres:postgres@localhost:5432/postgres
+      BRAIN_DB_DSN: postgresql://trading_brain_app:ci_app_password@localhost:5432/trading_brain
+      BRAIN_TEST_DB_DSN: postgresql://trading_brain_app:ci_app_password@localhost:5432/trading_brain_test
+      # admin/owner for append-only cleanup (the app role cannot DELETE the immutable fact tables)
+      BRAIN_TEST_ADMIN_DB_DSN: postgresql://postgres:postgres@localhost:5432/trading_brain_test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install (dev + db extras)
+        run: pip install -e '.[dev,db]' -c requirements.lock
+
+      - name: Bootstrap runtime role + database (admin DDL creates the app role)
+        run: python -m database.bootstrap
+
+      - name: Apply migrations from scratch (runtime DB)
+        run: python -m database.migrate
+
+      - name: Migrations are idempotent (re-apply must be a clean no-op)
+        run: python -m database.migrate
+
+      - name: Bootstrap the isolated `_test` DB and migrate it from scratch
+        run: python -m database.bootstrap_test
+
+      - name: Full suite against the isolated test database
+        run: python -m pytest -q
+
+  # Proves the backup is genuinely restorable: dump the runtime DB, restore into a fresh DB, and
+  # assert the applied-migration count matches. The scripts' shell logic is unit-tested in
+  # tests/test_backup.py; this job exercises the real pg_dump/pg_restore round-trip.
+  backup-restore:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      BRAIN_ADMIN_DB_DSN: postgresql://postgres:postgres@localhost:5432/postgres
+      BRAIN_DB_DSN: postgresql://trading_brain_app:ci_app_password@localhost:5432/trading_brain
+      SRC_DSN: postgresql://postgres:postgres@localhost:5432/trading_brain
+      DST_DSN: postgresql://postgres:postgres@localhost:5432/trading_brain_test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install PostgreSQL client 17 (must be >= server major to dump it)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-client-17
+
+      - name: Install (dev + db extras)
+        run: pip install -e '.[dev,db]' -c requirements.lock
+
+      - name: Create + migrate the source runtime DB
+        run: python -m database.bootstrap && python -m database.migrate
+
+      - name: Insert a sentinel row (real data incl. a JSONB payload) into the source
+        run: |
+          psql "$SRC_DSN" -v ON_ERROR_STOP=1 -c \
+            "INSERT INTO run_manifests (run_id, manifest_hash, manifest) \
+             VALUES ('ci-sentinel', 'deadbeef', '{\"sentinel\": true, \"n\": 42}'::jsonb)"
+
+      - name: Back up the source DB
+        run: BACKUP_DIR="$RUNNER_TEMP/backups" scripts/db_backup.sh "$SRC_DSN"
+
+      - name: Create an empty restore-target DB
+        run: psql "$BRAIN_ADMIN_DB_DSN" -v ON_ERROR_STOP=1 -c 'CREATE DATABASE trading_brain_test'
+
+      - name: Restore the dump into the target (the _test guard permits it)
+        run: |
+          dump="$(ls -1t "$RUNNER_TEMP"/backups/trading_brain_*.dump | head -1)"
+          scripts/db_restore.sh "$DST_DSN" "$dump"
+
+      - name: Verify the restore (migrations match, and the sentinel data round-trips)
+        run: |
+          src="$(psql "$SRC_DSN" -tAc 'SELECT count(*) FROM schema_migrations')"
+          dst="$(psql "$DST_DSN" -tAc 'SELECT count(*) FROM schema_migrations')"
+          echo "migrations: source=$src restored=$dst"
+          test "$src" = "$dst" && test "$src" -gt 0
+          # the JSONB payload survived
+          n="$(psql "$DST_DSN" -tAc "SELECT manifest->>'n' FROM run_manifests WHERE run_id='ci-sentinel'")"
+          echo "sentinel manifest.n=$n"
+          test "$n" = "42"

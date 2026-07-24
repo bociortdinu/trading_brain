@@ -25,12 +25,15 @@ from config.settings import Settings, load_settings
 from data_collector.providers.base import MarketDataProvider, only_closed, timeframe_minutes
 from data_collector.providers.factory import build_provider
 from data_collector.providers.polygon import ProviderError
+from features.version import FEATURE_PIPELINE_VERSION
 from database.repository import (
     insert_evaluation,
+    insert_spread_observation,
     latest_snapshot_bar_close,
-    snapshot_enrichment_status,
+    snapshot_spread_status,
     upsert_snapshot,
 )
+from database.operations import OperationalTelemetry
 
 log = logging.getLogger(__name__)
 M15 = timedelta(minutes=15)
@@ -97,23 +100,43 @@ class WindowCache:
         return window
 
 
+def should_observe_spread(market_mode: str, is_latest: bool) -> bool:
+    """May we attach a LIVE quote to this bar?
+
+    A quote describes NOW, so it belongs only to the LATEST bar, and only in ONLINE mode. Taking
+    the wall-clock quote for a replayed historical bar contaminates the record with a price from
+    the future of that bar. Fail-closed: anything not explicitly "online" observes nothing."""
+    return is_latest and market_mode == "online"
+
+
 async def _finalize_and_store(settings, windows, as_of, *, brain_symbol, provider_name,
                               provider_symbol, ingested_at, mode, now, observe_spread: bool) -> str:
     packet = build_packet_from_windows(
         windows, as_of, brain_symbol=brain_symbol, provider_name=provider_name,
         provider_symbol=provider_symbol, ingested_at=ingested_at,
     )
-    quote_time = None
+    quote_time = observed_at = None
+    spread_pct = basis = None
     if observe_spread:
         spread_pct, basis = await observe_xtb_spread(settings, packet.price, packet.bar_close)
         if basis is not None:
             packet = packet.model_copy(update={"spread_pct": spread_pct, "basis_observed": basis})
             if basis.get("quote_time"):
                 quote_time = datetime.fromisoformat(basis["quote_time"])
-    # Persist the immutable observation first, then its separate mode+policy eligibility.
+            if basis.get("observed_at"):
+                observed_at = datetime.fromisoformat(basis["observed_at"])
+    # Persist the IMMUTABLE observation first, then — as SEPARATE, append-only facts about it —
+    # the contextual spread and the mode+policy eligibility. Neither mutates the snapshot.
     status, snap_id = upsert_snapshot(settings.db_dsn, packet)
     if snap_id is not None and status != "conflict":
-        result = compute_eligibility(windows, as_of, settings, mode=mode, now=now, quote_time=quote_time)
+        if basis is not None and spread_pct is not None:
+            insert_spread_observation(
+                settings.db_dsn, snapshot_id=snap_id, spread_pct=spread_pct,
+                provenance="observed_xtb", observed_at=observed_at or now,
+                quote_time=quote_time, basis=basis,
+            )
+        result = compute_eligibility(windows, as_of, settings, mode=mode, now=now,
+                                     quote_time=quote_time, provider_name=provider_name)
         insert_evaluation(settings.db_dsn, snap_id, result)
     return status
 
@@ -132,7 +155,9 @@ async def catch_up(settings: Settings, provider: MarketDataProvider, provider_na
                    for tf in settings.timeframes}
 
     closes = m15_closes(windows)
-    last_done = latest_snapshot_bar_close(settings.db_dsn, brain_symbol)
+    last_done = latest_snapshot_bar_close(
+        settings.db_dsn, brain_symbol, settings.market_data_provider,
+        provider_symbol=provider_symbol, pipeline_version=FEATURE_PIPELINE_VERSION)
     targets = select_targets(closes, last_done, max_backfill)
     latest = closes[-1] if closes else None
 
@@ -143,14 +168,18 @@ async def catch_up(settings: Settings, provider: MarketDataProvider, provider_na
         status = await _finalize_and_store(
             settings, windows, as_of, brain_symbol=brain_symbol, provider_name=provider_name,
             provider_symbol=provider_symbol, ingested_at=now,
-            mode=(settings.market_mode if is_latest else "replay"), now=now, observe_spread=is_latest,
+            mode=(settings.market_mode if is_latest else "replay"), now=now,
+            observe_spread=should_observe_spread(settings.market_mode, is_latest),
         )
         results[status] = results.get(status, 0) + 1
         log.info("bar %s -> %s", as_of.isoformat(), status)
 
-    # Enrichment retry: latest already stored but still missing spread/basis.
-    if latest is not None and latest not in targets:
-        exists, needs = snapshot_enrichment_status(settings.db_dsn, brain_symbol, latest)
+    # Retry the quote for a latest bar that is stored but still has NO spread observation.
+    # Online only — same rule as above.
+    if should_observe_spread(settings.market_mode, True) and latest is not None and latest not in targets:
+        exists, needs = snapshot_spread_status(
+            settings.db_dsn, brain_symbol, latest, provider=provider_name,
+            provider_symbol=provider_symbol, pipeline_version=FEATURE_PIPELINE_VERSION)
         if exists and needs:
             status = await _finalize_and_store(
                 settings, windows, latest, brain_symbol=brain_symbol, provider_name=provider_name,
@@ -158,7 +187,7 @@ async def catch_up(settings: Settings, provider: MarketDataProvider, provider_na
                 mode=settings.market_mode, now=now, observe_spread=True,
             )
             results[f"retry_{status}"] = results.get(f"retry_{status}", 0) + 1
-            log.info("enrichment retry %s -> %s", latest.isoformat(), status)
+            log.info("spread retry %s -> %s", latest.isoformat(), status)
     return results
 
 
@@ -175,19 +204,64 @@ async def safe_catch_up(settings: Settings, provider: MarketDataProvider, provid
         raise
 
 
+def _processed_bars(result: dict) -> int:
+    """Count completed bar actions without treating booleans/errors as observations."""
+    return sum(value for key, value in result.items()
+               if key != "error" and isinstance(value, int) and not isinstance(value, bool))
+
+
+async def observed_catch_up(settings: Settings, provider: MarketDataProvider, provider_name: str,
+                            telemetry: OperationalTelemetry, max_backfill: int = 8,
+                            cache: WindowCache | None = None) -> dict:
+    """Run one collector tick and persist its lifecycle for the operator dashboard."""
+    run_id = telemetry.start_run("collector_tick", symbol=settings.symbol_query)
+    telemetry.heartbeat("healthy", details={"phase": "collecting", "run_id": run_id})
+    try:
+        result = await catch_up(settings, provider, provider_name, max_backfill, cache)
+    except asyncio.CancelledError as exc:
+        telemetry.finish_run(run_id, "cancelled", error=exc)
+        raise
+    except TRANSIENT as exc:
+        log.warning("scheduler tick: transient error (continuing): %s", exc)
+        telemetry.finish_run(run_id, "transient_error", error=exc)
+        telemetry.heartbeat("degraded", error=exc, details={"run_id": run_id})
+        return {"error": str(exc)}
+    except Exception as exc:
+        log.exception("scheduler tick: UNEXPECTED error (escalating)")
+        telemetry.finish_run(run_id, "failed", error=exc)
+        telemetry.heartbeat("error", error=exc, details={"run_id": run_id})
+        raise
+    telemetry.finish_run(run_id, "success", bars_processed=_processed_bars(result), result=result)
+    telemetry.heartbeat("healthy", success=True,
+                        details={"run_id": run_id, "result": result})
+    return result
+
+
 async def run_scheduler(settings: Settings, offset_seconds: float = 5.0) -> None:
     provider = build_provider(settings)
     provider_name = settings.market_data_provider
     cache = WindowCache()
+    telemetry = OperationalTelemetry(settings.db_dsn, "collector_scheduler")
+    telemetry.heartbeat("starting", details={"provider": provider_name,
+                                              "symbol": settings.symbol_query})
     try:
         while True:
-            await safe_catch_up(settings, provider, provider_name, cache=cache)
+            result = await observed_catch_up(
+                settings, provider, provider_name, telemetry, cache=cache)
             wake = next_m15(datetime.now(timezone.utc)) + timedelta(seconds=offset_seconds)
+            telemetry.heartbeat("degraded" if "error" in result else "healthy",
+                                next_wake_at=wake,
+                                details={"phase": "sleeping", "provider": provider_name,
+                                         "last_result": (result if "error" not in result
+                                                         else {"error": "transient_error"})})
             await asyncio.sleep(max(1.0, (wake - datetime.now(timezone.utc)).total_seconds()))
     finally:  # runs on CancelledError too
-        aclose = getattr(provider, "aclose", None)
-        if aclose:
-            await aclose()
+        try:
+            telemetry.stop()
+        finally:
+            aclose = getattr(provider, "aclose", None)
+            if aclose:
+                await aclose()
 
 
 def main() -> int:
@@ -199,18 +273,29 @@ def main() -> int:
     settings = load_settings()
     if args.once:
         provider = build_provider(settings)
+        telemetry = OperationalTelemetry(settings.db_dsn, "collector_once")
 
         async def _once() -> dict:
+            telemetry.heartbeat("starting", details={"provider": settings.market_data_provider,
+                                                      "symbol": settings.symbol_query})
             try:
-                return await catch_up(settings, provider, settings.market_data_provider)
+                return await observed_catch_up(
+                    settings, provider, settings.market_data_provider, telemetry)
             finally:
-                aclose = getattr(provider, "aclose", None)
-                if aclose:
-                    await aclose()
+                try:
+                    telemetry.stop()
+                finally:
+                    aclose = getattr(provider, "aclose", None)
+                    if aclose:
+                        await aclose()
 
         print(f"[scheduler] {asyncio.run(_once())}")
         return 0
-    asyncio.run(run_scheduler(settings))
+    try:
+        asyncio.run(run_scheduler(settings))
+    except KeyboardInterrupt:
+        log.info("collector scheduler stopped by operator")
+        return 130
     return 0
 
 

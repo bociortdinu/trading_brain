@@ -62,6 +62,36 @@ def test_intraday_gap_is_unexpected():
     assert classify_gap(gap, "15min") == UNEXPECTED_MISSING_BAR
 
 
+def test_xtb_calendar_sunday_open_differs_from_polygon():
+    from data_collector.session import POLYGON_XAUUSD_CALENDAR, XTB_XAUUSD_CALENDAR, calendar_for
+
+    # Sunday 21:00 UTC (17:00 EDT): Polygon considers it OPEN, XTB still CLOSED (opens 18:00 ET).
+    sun_2100 = datetime(2026, 7, 12, 21, tzinfo=UTC)
+    assert POLYGON_XAUUSD_CALENDAR.is_open(sun_2100)
+    assert not XTB_XAUUSD_CALENDAR.is_open(sun_2100)
+    assert XTB_XAUUSD_CALENDAR.is_open(datetime(2026, 7, 12, 22, tzinfo=UTC))  # 18:00 EDT -> open
+    assert calendar_for("xtb").version == "xauusd-xtb-2026.1"
+    assert calendar_for("polygon").version == "xauusd-polygon-2026.1"
+
+
+def test_xtb_daily_break_and_friday_close_match_et_rollover():
+    from data_collector.session import XTB_XAUUSD_CALENDAR as cal
+
+    assert not cal.is_open(datetime(2026, 7, 8, 21, tzinfo=UTC))   # Wed 17:00 EDT -> break
+    assert cal.is_open(datetime(2026, 7, 8, 22, tzinfo=UTC))       # Wed 18:00 EDT -> open
+    assert not cal.is_open(datetime(2026, 7, 10, 21, tzinfo=UTC))  # Fri 17:00 EDT -> weekly close
+
+
+def test_calendar_for_unknown_provider_fails_closed():
+    from data_collector.session import calendar_for
+
+    try:
+        calendar_for("mystery")
+        assert False, "expected fail-closed"
+    except ValueError:
+        pass
+
+
 def test_timeframe_quality_verdicts():
     weekend = SeriesGap(after=datetime(2026, 7, 10, 21, tzinfo=UTC),
                         before=datetime(2026, 7, 12, 21, tzinfo=UTC), missing_bars=192)

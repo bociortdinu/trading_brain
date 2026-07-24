@@ -45,10 +45,16 @@ FROZEN_INPUT = DecisionInput(
 )
 
 
-async def _run(model: str, api_key: str) -> int:
-    from decision.llm_client import AnthropicDecisionMaker
+async def _run(settings, model: str) -> int:
+    from datetime import datetime, timezone
 
-    maker = AnthropicDecisionMaker(api_key, model, max_tokens=1024)
+    from decision.paid_gateway import PaidAiGateway
+
+    # Route through the central gateway so the smoke call is budgeted + audited (paid_attempts),
+    # not a bypass. A unique run_id keeps its spend isolated in the ledger.
+    run_id = f"smoke-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    maker = PaidAiGateway(settings, run_id=run_id, persist_dsn=settings.db_dsn,
+                          context="app.llm_smoke", model=model)
     try:
         res = await maker.call(FROZEN_INPUT)
     finally:
@@ -73,15 +79,19 @@ async def _run(model: str, api_key: str) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="One Anthropic API smoke-test (no execution).")
+    parser = argparse.ArgumentParser(description="One PAID Anthropic API smoke-test (no execution).")
     parser.add_argument("--benchmark", action="store_true", help="use the benchmark model")
+    parser.add_argument("--yes", action="store_true", help="skip the paid-call confirmation")
     args = parser.parse_args()
     settings = load_settings()
-    if not settings.anthropic_api_key:
-        print("SKIPPED: BRAIN_ANTHROPIC_API_KEY not set (no real API call made).")
-        return 0
     model = settings.benchmark_model if args.benchmark else settings.decision_model
-    return asyncio.run(_run(model, settings.anthropic_api_key))
+    # This ALWAYS makes a real paid call -> master gate + explicit confirmation first. A configured
+    # key alone is NOT sufficient (was: key presence -> immediate charge).
+    from decision.paid_guard import confirm_paid_call, require_paid_ai_enabled
+    require_paid_ai_enabled(settings, context="app.llm_smoke")
+    confirm_paid_call(context="app.llm_smoke", model=model, assume_yes=args.yes,
+                      extra="(one frozen request; no execution)")
+    return asyncio.run(_run(settings, model))
 
 
 if __name__ == "__main__":

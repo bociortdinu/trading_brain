@@ -36,32 +36,90 @@ _XAUUSD_EXCEPTIONS: dict[date, object] = {
 }
 
 
-class XauUsdCalendar:
-    """Gold / FX session in America/New_York: week Sun 17:00 -> Fri 17:00 ET,
-    daily maintenance break 17:00-18:00 ET, plus confirmed exceptions."""
+class SessionCalendar:
+    """DST-aware gold/FX session calendar, PARAMETERIZED by its local session timezone and
+    boundary hours so that different SOURCES can carry their own boundaries. The same
+    instrument on two providers can have different UTC boundaries — a broker anchors the
+    trading day to its OWN server time, so e.g. the daily rollover can differ by ~1h from a
+    data vendor that expresses it in America/New_York. Hence the calendar is provider-specific
+    and versioned; `calendar_for(provider)` selects it.
 
-    version = XAUUSD_CALENDAR_VERSION
+    Boundaries (local `tz` hours): week opens Sun `open_hour`, closes Fri `close_hour`; daily
+    maintenance break at `break_hour` (1h, Mon-Thu). `exceptions` are CONFIRMED only.
+    """
+
+    def __init__(self, *, version: str, tz: ZoneInfo, open_hour: int, close_hour: int,
+                 break_hour: int, exceptions: dict[date, object] | None = None) -> None:
+        self.version = version
+        self._tz = tz
+        self._open_hour = open_hour
+        self._close_hour = close_hour
+        self._break_hour = break_hour
+        self._exceptions = exceptions or {}
 
     def is_open(self, dt_utc: datetime) -> bool:
-        et = dt_utc.astimezone(_NY)
-        exc = _XAUUSD_EXCEPTIONS.get(et.date())
+        lt = dt_utc.astimezone(self._tz)
+        exc = self._exceptions.get(lt.date())
         if exc == "closed":
             return False
-        if isinstance(exc, tuple) and exc[0] == "early_close" and et.hour >= exc[1]:
+        if isinstance(exc, tuple) and exc[0] == "early_close" and lt.hour >= exc[1]:
             return False
-        wd = et.weekday()  # Mon=0 .. Sun=6
+        wd = lt.weekday()  # Mon=0 .. Sun=6
         if wd == 5:  # Saturday
             return False
-        if wd == 6:  # Sunday: opens 17:00 ET
-            return et.hour >= 17
-        if wd == 4 and et.hour >= 17:  # Friday close
+        if wd == 6:  # Sunday: opens at open_hour
+            return lt.hour >= self._open_hour
+        if wd == 4 and lt.hour >= self._close_hour:  # Friday close
             return False
-        if et.hour == 17:  # daily maintenance break, Mon-Thu 17:00-18:00 ET
+        if lt.hour == self._break_hour:  # daily maintenance break (1h), Mon-Thu
             return False
         return True
 
 
-DEFAULT_CALENDAR = XauUsdCalendar()
+# Polygon C:XAUUSD — validated: week Sun 17:00 -> Fri 17:00 ET, daily break 17:00-18:00 ET.
+POLYGON_XAUUSD_CALENDAR = SessionCalendar(
+    version=XAUUSD_CALENDAR_VERSION, tz=_NY, open_hour=17, close_hour=17, break_hour=17,
+    exceptions=_XAUUSD_EXCEPTIONS,
+)
+
+# Backward-compatible aliases (existing code/tests import these).
+XauUsdCalendar = SessionCalendar
+DEFAULT_CALENDAR = POLYGON_XAUUSD_CALENDAR
+
+# XTB GOLD — DERIVED + validated from live H1/M15 gaps (summer/EDT, 2026-07): daily break
+# 21:00-22:00 UTC (17:00-18:00 ET) and Friday close 21:00 UTC (17:00 ET) match the global
+# 17:00-ET spot-gold rollover, but XTB's Sunday OPEN is 22:00 UTC = 18:00 ET (its first bar
+# is 18:00 ET; the 17:00-18:00 ET hour carries no data). Expressed in ET so the 17:00-ET
+# rollover stays DST-correct. NOTE: only the summer (EDT) boundaries are validated with live
+# data; winter (EST) is inferred from the ET anchoring — bump the version if it differs.
+_XTB_XAUUSD_EXCEPTIONS: dict[date, object] = {
+    date(2026, 7, 3): ("early_close", 13),  # US Independence Day (observed): XTB ends ~13:00 ET
+}
+XTB_XAUUSD_CALENDAR = SessionCalendar(
+    version="xauusd-xtb-2026.1", tz=_NY, open_hour=18, close_hour=17, break_hour=17,
+    exceptions=_XTB_XAUUSD_EXCEPTIONS,
+)
+
+# Provider -> validated calendar. Same instrument, different provider = different session
+# boundaries (see above): fail-closed for an unknown provider rather than misapplying one.
+_CALENDARS: dict[str, SessionCalendar] = {
+    "polygon": POLYGON_XAUUSD_CALENDAR,
+    "xtb": XTB_XAUUSD_CALENDAR,
+    "csv": POLYGON_XAUUSD_CALENDAR,  # offline gold uses the general (Polygon) calendar
+}
+
+
+def calendar_for(provider: str) -> SessionCalendar:
+    """Select the validated market calendar for a data provider. Fail-closed: an unknown
+    provider (e.g. 'xtb' before its calendar is empirically validated) raises rather than
+    misapplying another provider's session boundaries."""
+    cal = _CALENDARS.get(provider)
+    if cal is None:
+        raise ValueError(
+            f"no validated market calendar for provider {provider!r} "
+            "(XTB calendar pending derivation from live gaps)"
+        )
+    return cal
 
 
 def classify_gap(gap: SeriesGap, timeframe: str, calendar: XauUsdCalendar = DEFAULT_CALENDAR) -> str:

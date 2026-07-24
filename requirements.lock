@@ -1,0 +1,38 @@
+# Pinned dependency versions for reproducible installs (transitive closure of the runtime + dev +
+# db + llm extras). Use as a CONSTRAINTS file so `pip install -e .` resolves to these exact
+# versions:  pip install -e '.[dev,db,llm]' -c requirements.lock
+#
+# Regenerate after changing pyproject deps:
+#   pip install -e '.[dev,db,llm]' && pip freeze --exclude-editable > requirements.lock
+# NOTE: version pins only (no --hash). Cryptographic hash pinning needs pip-compile/pip download
+# with network access — tracked as a follow-up; do not claim hash-locked until then.
+annotated-types==0.7.0
+anthropic==0.116.0
+anyio==4.14.1
+certifi==2026.6.17
+distro==1.9.0
+docstring_parser==0.18.0
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.18
+iniconfig==2.3.0
+jiter==0.16.0
+numpy==2.5.1
+packaging==26.2
+pandas==3.0.3
+pluggy==1.6.0
+psycopg==3.3.4
+psycopg-binary==3.3.4
+pydantic==2.13.4
+pydantic-settings==2.14.2
+pydantic_core==2.46.4
+Pygments==2.20.0
+pytest==9.1.1
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.2
+PyYAML==6.0.3
+six==1.17.0
+sniffio==1.3.1
+typing-inspection==0.4.2
+typing_extensions==4.16.0

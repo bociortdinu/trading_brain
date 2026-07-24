@@ -1,0 +1,120 @@
+name: trading_brain
+
+# One command brings up the operable core: PostgreSQL, a one-shot migrate, and the read-only
+# dashboard. The market-data loop (collector + shadow.online) needs an external data source
+# (a running trading_hands, or Polygon/CSV), so it lives behind the `data` profile — enable it
+# with `docker compose --profile data up -d` once a provider is configured.
+#
+# CREDENTIAL SCOPING (least privilege):
+#   - the ADMIN DSN (postgres superuser) reaches ONLY the one-shot `migrate` service;
+#   - dashboard/collector/online get ONLY the least-privilege APP DSN;
+#   - the Polygon key reaches only the data services; the Anthropic key only `online`;
+#   - non-secret runtime settings (costs, reconcile tf, run id, ...) come from .env.brain (env_file);
+#   - secrets (passwords, API keys) live in .env.compose and are used for SUBSTITUTION only —
+#     they are NOT blanket-injected into every container.
+
+x-app-env: &app-env
+  # Least-privilege application role (DML only), reachable by every app service.
+  BRAIN_DB_DSN: postgresql://${BRAIN_APP_USER:-trading_brain_app}:${BRAIN_APP_PASSWORD:?set BRAIN_APP_PASSWORD in .env.compose}@db:5432/${BRAIN_DB_NAME:-trading_brain}
+
+x-runtime-file: &runtime-file
+  # Non-secret runtime settings (never secrets) passed into app containers.
+  - path: .env.brain
+    required: false
+
+x-build: &build
+  build:
+    context: .
+    args:
+      BRAIN_GIT_COMMIT: ${BRAIN_GIT_COMMIT:-unknown}
+      BRAIN_GIT_BRANCH: ${BRAIN_GIT_BRANCH:-unknown}
+      BRAIN_GIT_DIRTY: ${BRAIN_GIT_DIRTY:-unknown}
+  image: trading_brain:local
+
+services:
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.compose}
+      POSTGRES_DB: postgres
+    ports:
+      - 127.0.0.1:${BRAIN_DB_PORT:-5433}:5432
+    volumes:
+      - brain-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: create the app role + runtime DB (admin DDL), then apply migrations. The ADMIN DSN
+  # is scoped to THIS service only. Every other service waits for it to succeed.
+  migrate:
+    <<: *build
+    environment:
+      <<: *app-env
+      BRAIN_ADMIN_DB_DSN: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.compose}@db:5432/postgres
+    command: ["sh", "-c", "python -m database.bootstrap && python -m database.migrate"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  dashboard:
+    <<: *build
+    environment:
+      <<: *app-env                       # app DSN only — no admin, no API keys
+    env_file: *runtime-file
+    command: ["python", "-m", "dashboard", "--host", "0.0.0.0", "--port", "8080"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    # The dashboard probes trading_hands (`/status`) on the host, so it needs host-gateway too.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - 127.0.0.1:${BRAIN_DASHBOARD_PORT:-8080}:8080
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/state?limit=1', timeout=4).status==200 else 1)\""]
+      interval: 15s
+      timeout: 6s
+      retries: 5
+      start_period: 10s
+
+  # --- data loop (opt-in: `--profile data`) — needs a reachable market-data source ----------
+  collector:
+    <<: *build
+    environment:
+      <<: *app-env
+      BRAIN_POLYGON_API_KEY: ${BRAIN_POLYGON_API_KEY:-}   # data service may fetch from Polygon
+    env_file: *runtime-file
+    command: ["python", "-m", "app.jobs"]
+    profiles: ["data"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  online:
+    <<: *build
+    environment:
+      <<: *app-env
+      BRAIN_POLYGON_API_KEY: ${BRAIN_POLYGON_API_KEY:-}
+      BRAIN_ANTHROPIC_API_KEY: ${BRAIN_ANTHROPIC_API_KEY:-}   # ONLY the maker service gets the key
+    env_file: *runtime-file
+    command: ["python", "-m", "shadow.online"]
+    profiles: ["data"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  brain-postgres-data:

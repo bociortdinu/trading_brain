@@ -69,6 +69,13 @@ class Status(BaseModel):
     connected: bool
     account: str
     environment: str
+    # Explicit safety fact exposed by trading_hands. Optional only for compatibility while an
+    # older service binary is still running; the dashboard warns when it is absent.
+    trading_enabled: bool | None = None
+    # The lot size trading_hands will actually use. PurchaseHandler ignores the request's
+    # `allocation` and uses its own configured volume, so this is the ONLY way a caller can know
+    # the real position size. None on an older binary that does not publish it.
+    trading_volume: float | None = None
 
 
 class Balance(BaseModel):

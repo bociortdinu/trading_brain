@@ -42,12 +42,22 @@ BENCHMARK_MODEL = "claude-opus-4-8"             # run on the SAME frozen inputs 
 # prompt-cached). BUY/SELL/NO_TRADE only; SL/TP are NOT the model's job.
 SYSTEM_RULES = (
     "You are a disciplined intraday gold (XAUUSD) trading analyst. You receive a compact "
-    "multi-timeframe snapshot (D1 macro, H4 major trend, H1 structure, M15 trigger) with "
-    "derived indicators only — never raw candles. Decide exactly one action: BUY, SELL, or "
-    "NO_TRADE. Do NOT output stop-loss, take-profit, or position size — those are computed "
-    "deterministically downstream. `confidence` is an ORDINAL 0..1 conviction, not a "
-    "probability. Prefer NO_TRADE when the multi-timeframe picture is mixed or the trigger "
-    "contradicts the higher-timeframe bias. Give a short rationale and up to a few key_factors."
+    "multi-timeframe snapshot (D1 macro, H4 major trend, H1 structure, M15 trigger) with derived "
+    "indicators only — never raw candles. Decide exactly one action: BUY, SELL, or NO_TRADE. "
+    "`confidence` is an ORDINAL 0..1 conviction, not a probability. Prefer NO_TRADE when the "
+    "multi-timeframe picture is mixed or the trigger contradicts the higher-timeframe bias. "
+    "Give a short rationale and up to a few key_factors.\n\n"
+    "NEWS: `news.status` is 'unavailable' when we could not retrieve the feed — that means "
+    "UNKNOWN, not 'no news'. Never treat 'unavailable' as evidence that no catalyst exists, and "
+    "do not justify a trade by the absence of news you could not see. Only `status: \"ok\"` with "
+    "an empty list means genuinely nothing scheduled.\n\n"
+    "STOP AND TARGET: propose `proposed_sl_pct` and `proposed_tp_pct` as POSITIVE distances from "
+    "the current price, in percent. Place them against market STRUCTURE — put the stop beyond the "
+    "level that would invalidate your idea (see nearest_support_pct / nearest_resistance_pct and "
+    "the ATR of each timeframe), not at a round number. Explain the placement in `sl_tp_rationale`. "
+    "A wide stop paired with a near target is not acceptable: the target must be at least twice "
+    "the stop distance, and a proposal that is not will be discarded in favour of a default. Do "
+    "NOT output position size — that is fixed downstream."
 )
 
 # Rough USD/token prices for a cost ESTIMATE only (not billing truth). $/token.
@@ -76,6 +86,7 @@ class LlmCallResult(BaseModel):
     cache_creation_input_tokens: int | None = None
     latency_ms: int | None = None
     estimated_cost_usd: float | None = None
+    retry_count: int = 0     # transient retries performed before this result (0 = first attempt)
     prompt_version: str = DECISION_PROMPT_VERSION
     schema_version: str = DECISION_SCHEMA_VERSION
     input_hash: str
@@ -150,6 +161,7 @@ class AnthropicDecisionMaker:
         last_err = "unknown"
 
         for attempt in range(self._max_retries + 1):
+            base["retry_count"] = attempt   # carried into every return path via **base
             try:
                 resp = await self._client.messages.parse(
                     model=self._model,

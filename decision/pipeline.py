@@ -18,6 +18,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from data_collector.session import XauUsdCalendar
 from decision.prefilter import PrefilterConfig, PrefilterResult, prefilter
 from decision.schema import (
     DECISION_PROMPT_VERSION,
@@ -52,7 +53,7 @@ def _manifest(inp: DecisionInput, prefilter_cfg: PrefilterConfig, risk_cfg: Risk
 
 
 class DecisionRecord(BaseModel):
-    stage: Literal["prefiltered_out", "decided"]
+    stage: Literal["prefiltered_out", "decided", "llm_failed"]
     symbol: str
     as_of: object
     mode: str
@@ -61,6 +62,7 @@ class DecisionRecord(BaseModel):
     risk: RiskVerdict | None = None
     input_hash: str
     manifest: dict
+    llm_error: str | None = None   # set when the LLM call failed (stage == "llm_failed")
 
     @property
     def risk_approved(self) -> bool:
@@ -85,14 +87,37 @@ async def run_decision(
     mode: str,
     prefilter_config: PrefilterConfig,
     risk_config: RiskConfig,
+    calendar: XauUsdCalendar,   # REQUIRED: the PROVIDER's calendar. No default -> no silent
+                                # fallback to Polygon (which would open the session gate when
+                                # XTB is closed, e.g. Sunday 21:00-22:00 UTC).
     news: NewsContext | None = None,
+    feedback=None,
+    econ_calendar=None,          # EconomicCalendar | None — scheduled macro releases
+    econ_calendar_config=None,   # CalendarConfig | None
 ) -> DecisionRecord:
     # Fail-closed binding: right mode, right bar. Raises before any LLM call.
     _bind_evaluation(eligibility, packet, mode)
 
-    inp = build_decision_input(packet, mode=mode, news=news)
+    # The scheduled-release calendar feeds BOTH halves of the news story, from one source:
+    #   - `blackout`  -> a deterministic skip, resolved before the (paid) model is reached;
+    #   - `news`      -> the upcoming events the model should weigh when it IS reached.
+    # An explicitly supplied `news` wins, so callers can inject a fixture or another feed.
+    blackout = None
+    if econ_calendar is not None:
+        from data_collector.news.economic_calendar import CalendarConfig
+
+        cal_cfg = econ_calendar_config or CalendarConfig()
+        blackout = econ_calendar.blackout(packet.bar_close, cal_cfg)
+        if news is None:
+            news = NewsContext(
+                status="ok",
+                items=[e.to_digest(packet.bar_close)
+                       for e in econ_calendar.upcoming(packet.bar_close, cal_cfg)],
+            )
+
+    inp = build_decision_input(packet, mode=mode, news=news, feedback=feedback)
     manifest = _manifest(inp, prefilter_config, risk_config, eligibility)
-    pf = prefilter(packet, eligibility, prefilter_config)
+    pf = prefilter(packet, eligibility, prefilter_config, blackout=blackout)
 
     # Gate the LLM: no call on an ineligible / low-value bar.
     if not pf.passed:
@@ -101,8 +126,17 @@ async def run_decision(
             prefilter=pf, decision=None, risk=None, input_hash=inp.input_hash(), manifest=manifest,
         )
 
-    decision = await decision_maker.decide(inp)   # THE LLM (injected)
-    risk = evaluate_risk(decision, packet, risk_config, spread_provenance=inp.spread_provenance)
+    try:
+        decision = await decision_maker.decide(inp)   # THE LLM (injected)
+    except Exception as exc:  # noqa: BLE001 — a failed LLM call is auditable, not a crash
+        return DecisionRecord(
+            stage="llm_failed", symbol=inp.symbol, as_of=inp.as_of, mode=mode,
+            prefilter=pf, decision=None, risk=None, input_hash=inp.input_hash(),
+            manifest=manifest, llm_error=type(exc).__name__,
+        )
+
+    risk = evaluate_risk(decision, packet, risk_config,
+                         spread_provenance=inp.spread_provenance, calendar=calendar)
     return DecisionRecord(
         stage="decided", symbol=inp.symbol, as_of=inp.as_of, mode=mode,
         prefilter=pf, decision=decision, risk=risk, input_hash=inp.input_hash(), manifest=manifest,

@@ -18,13 +18,15 @@ live order on `approved` alone.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from core.models import Direction
 from data_collector.session import DEFAULT_CALENDAR, XauUsdCalendar
 from decision.schema import DecisionOutput
 
-RISK_CONFIG_VERSION = "risk-mvp-2026.2"   # 2026.2: mandatory spread, session gate, exec-readiness
+RISK_CONFIG_VERSION = "risk-mvp-2026.4"   # 2026.4: model-proposed SL/TP bounded to an ATR multiple
 
 # Gates required for a LIVE order that are STATEFUL and not yet implemented. Until these are
 # wired, no verdict is execution-ready (only shadow-eligible).
@@ -32,9 +34,29 @@ PENDING_EXECUTION_GATES = ["cooldown_frequency", "existing_positions"]
 
 
 class RiskConfig(BaseModel):
-    min_confidence: float = Field(0.60, ge=0.0, le=1.0)   # ORDINAL threshold
+    # Lowered 0.60 -> 0.55 on measurement (2026-07-21, run claude-sonnet5-probe): across 109 paid
+    # Sonnet-5 decisions the risk engine rejected 50 of 56 directional calls, and EVERY rejection
+    # was low_confidence. Claude's conviction clusters just under the old threshold (0.42, 0.45,
+    # 0.52, 0.55, 0.58), so 0.60 was not filtering weak signals so much as filtering nearly all of
+    # them: 6 trades from 56 signals. At 0.55 the same sample yields ~42 — the difference between a
+    # strategy that can be measured and one that almost never acts.
+    # This is a RISK threshold, not a tuning knob: raise it again if the extra trades prove to be
+    # noise. `confidence` is ORDINAL, so these numbers are not probabilities and only compare
+    # within one model — re-measure before reusing this value on a different model.
+    min_confidence: float = Field(0.55, ge=0.0, le=1.0)   # ORDINAL threshold
     sl_atr_mult: float = Field(1.5, gt=0)                 # SL = mult * ATR%
     reward_risk: float = Field(2.0, gt=0)                 # TP = reward_risk * SL
+    # "atr" = size the stop deterministically (the model never sees the knob). "model" = let the
+    # model propose from market structure and validate it here. The default stays "atr" so this
+    # is an opt-in experiment rather than a silent change of what every past run measured.
+    sl_tp_source: Literal["atr", "model"] = "atr"
+    # A proposal may deviate from the deterministic size, but only so far. Without this the only
+    # ceiling was max_sl_pct (3.0%) against a typical ATR stop of ~0.28%, so a model could
+    # propose a stop 10x wider and pass every check — and WIDENING IS REWARDED, because the
+    # spread-vs-stop gate is relative to the stop, so a wider stop unlocks bars a normal one
+    # cannot trade. Worse, R hides it: at fixed volume a 10x stop risks 10x the money for the
+    # same R, so the track record would look unchanged while real drawdown scaled with it.
+    max_sl_atr_multiple: float = Field(2.5, gt=0)
     min_sl_pct: float = Field(0.05, gt=0)                 # reject stops tighter than this
     max_sl_pct: float = Field(3.0, gt=0)                  # reject stops wider than this
     max_spread_fraction_of_sl: float = Field(0.33, gt=0)  # spread must be < this * SL
@@ -52,6 +74,9 @@ class RiskVerdict(BaseModel):
     spread_pct: float | None = None
     spread_provenance: str = "unavailable"
     session_open: bool | None = None
+    # Where SL/TP came from, so a track record can separate model-sized from ATR-sized trades
+    # instead of averaging two different policies together.
+    sl_tp_source: str = "atr"
     execution_ready: bool = False        # always False until PENDING_EXECUTION_GATES are wired
     pending_execution_gates: list[str] = Field(default_factory=lambda: list(PENDING_EXECUTION_GATES))
     risk_config_version: str
@@ -62,6 +87,42 @@ def compute_sl_tp(atr_pct_m15: float, config: RiskConfig) -> tuple[float, float]
     sl = round(atr_pct_m15 * config.sl_atr_mult, 3)
     tp = round(sl * config.reward_risk, 3)
     return sl, tp
+
+
+def resolve_sl_tp(decision, atr_pct_m15: float, config: RiskConfig) -> tuple[float, float, str]:
+    """Pick the SL/TP this trade will use, and say WHERE it came from.
+
+    With `sl_tp_source="model"` the model's proposal is used when it is present and passes the
+    reward:risk floor; otherwise we fall back to ATR sizing rather than trading a shape the risk
+    rules do not accept. The bounds themselves (min/max SL, spread-vs-stop) are enforced by the
+    caller for BOTH sources — a proposal gets no easier a path than a computed value.
+
+    Returns (sl_pct, tp_pct, source) where source is one of:
+      "atr"                      — deterministic sizing
+      "model"                    — the model's proposal, accepted
+      "atr_fallback:no_proposal" — policy is model, but none was offered
+      "atr_fallback:rr_too_low"  — proposal offered, reward:risk below the floor
+      "atr_fallback:sl_too_wide" — proposal exceeds max_sl_atr_multiple x the ATR stop
+    """
+    atr_sl, atr_tp = compute_sl_tp(atr_pct_m15, config)
+    if config.sl_tp_source != "model":
+        return atr_sl, atr_tp, "atr"
+
+    sl = getattr(decision, "proposed_sl_pct", None)
+    tp = getattr(decision, "proposed_tp_pct", None)
+    if sl is None or tp is None:
+        return atr_sl, atr_tp, "atr_fallback:no_proposal"
+
+    # The one shape check that cannot be left to the bounds below: a wide stop with a near target
+    # is exactly how a self-sized stop flatters a win rate, so the reward:risk floor is applied to
+    # the PROPOSAL, not merely to the ATR-derived pair.
+    if tp < sl * config.reward_risk:
+        return atr_sl, atr_tp, "atr_fallback:rr_too_low"
+    # Bound the deviation from the deterministic size. The reward:risk floor constrains the
+    # SHAPE but not the SCALE — a proportionally-scaled stop and target satisfy it at any width.
+    if sl > atr_sl * config.max_sl_atr_multiple:
+        return atr_sl, atr_tp, "atr_fallback:sl_too_wide"
+    return round(float(sl), 3), round(float(tp), 3), "model"
 
 
 def evaluate_risk(
@@ -102,7 +163,7 @@ def evaluate_risk(
     if atr is None or atr <= 0:
         return reject("no_atr")
 
-    sl_pct, tp_pct = compute_sl_tp(atr, config)
+    sl_pct, tp_pct, sl_tp_source = resolve_sl_tp(decision, atr, config)
 
     # Bounds: reject (never clamp) an SL outside the allowed band.
     if not (config.min_sl_pct <= sl_pct <= config.max_sl_pct):
@@ -116,5 +177,5 @@ def evaluate_risk(
     return RiskVerdict(
         approved=True, reason=None, direction=d, confidence=conf, sl_pct=sl_pct, tp_pct=tp_pct,
         spread_pct=packet.spread_pct, spread_provenance=spread_provenance, session_open=session_open,
-        execution_ready=False, risk_config_version=config.version,
+        execution_ready=False, risk_config_version=config.version, sl_tp_source=sl_tp_source,
     )

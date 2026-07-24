@@ -57,6 +57,24 @@ def test_declared_packages_import_from_foreign_cwd():
     assert res.returncode == 0 and "ok" in res.stdout, res.stderr
 
 
+def test_dockerfile_does_not_unpin_pip():
+    """R3-8: the build must not run `pip install --upgrade pip` (unpinned) — that pulls a
+    non-deterministic pip on every build, defeating the point of a lock file. Use the base image's
+    tag-pinned pip instead."""
+    df = (ROOT / "Dockerfile").read_text()
+    assert "install --upgrade pip" not in df, "Dockerfile re-introduced an UNPINNED pip upgrade"
+
+
+def test_requirements_lock_is_honest_about_hash_pinning():
+    """R3-8: the lock pins VERSIONS, not hashes. Until `--hash` pins exist, the lock must SAY so
+    (so nobody claims 'hash-locked' / immutable inputs prematurely). This guard fails if the hashes
+    land (drop the caveat then) OR if the caveat is removed while hashes are still absent."""
+    lock = (ROOT / "requirements.lock").read_text()
+    has_hashes = "--hash=" in lock
+    caveat = "no --hash" in lock.lower() or "hash pinning" in lock.lower()
+    assert has_hashes or caveat, "requirements.lock has no hashes AND no honesty caveat about it"
+
+
 def test_anthropic_sdk_supports_parse():
     # `anthropic>=0.40` is NOT proof of Structured Outputs; assert the ACTUAL installed SDK
     # exposes messages.parse + the error types the client depends on, and meets the floor.

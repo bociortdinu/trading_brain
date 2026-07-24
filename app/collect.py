@@ -25,6 +25,7 @@ from config.settings import Settings, load_settings
 from data_collector.providers.base import Candle, MarketDataProvider, only_closed
 from data_collector.providers.csv_provider import CsvMarketDataProvider
 from data_collector.providers.factory import build_provider
+from data_collector.session import DEFAULT_CALENDAR, calendar_for
 from database.repository import insert_evaluation, upsert_snapshot
 from features.eligibility import EligibilityConfig, EligibilityResult, evaluate_eligibility
 from features.mtf import TRIGGER_TF, FeaturePacket, build_feature_packet
@@ -46,12 +47,13 @@ def slice_to_as_of(windows: dict[str, list[Candle]], as_of: datetime) -> dict[st
 
 def build_packet_from_windows(
     windows, as_of, *, brain_symbol, provider_name, provider_symbol, ingested_at,
-    spread_pct=None, basis_observed=None, news_digest=None,
+    spread_pct=None, basis_observed=None, news_digest=None, calendar=None,
 ) -> FeaturePacket:
+    cal = calendar or calendar_for(provider_name)
     return build_feature_packet(
         brain_symbol, slice_to_as_of(windows, as_of), as_of=as_of, provider=provider_name,
         provider_symbol=provider_symbol, ingested_at=ingested_at, spread_pct=spread_pct,
-        basis_observed=basis_observed, news_digest=news_digest,
+        basis_observed=basis_observed, news_digest=news_digest, calendar=cal,
     )
 
 
@@ -65,13 +67,37 @@ def _eligibility_config(settings: Settings) -> EligibilityConfig:
 
 def compute_eligibility(
     windows, as_of, settings: Settings, *, mode: str, now: datetime,
-    quote_time: datetime | None = None,
+    quote_time: datetime | None = None, provider_name: str | None = None,
 ) -> EligibilityResult:
-    """Contextual verdict for this bar — separate from the (immutable) snapshot."""
+    """Contextual verdict for this bar — separate from the (immutable) snapshot. Uses the
+    provider's own market calendar (XTB and Polygon have different session boundaries)."""
+    cal = calendar_for(provider_name) if provider_name else DEFAULT_CALENDAR
     return evaluate_eligibility(
         slice_to_as_of(windows, as_of), TRIGGER_TF, as_of, mode=mode, now=now,
-        config=_eligibility_config(settings), quote_time=quote_time, evaluated_at=now,
+        config=_eligibility_config(settings), quote_time=quote_time, evaluated_at=now, calendar=cal,
     )
+
+
+def compute_basis(feed_price, bid, ask, bar_close, observed_at, quote_time, *,
+                  max_lag_seconds: float) -> dict:
+    """Feed-vs-broker basis at a bar. RELIABLE only when the quote is observed close to the
+    bar close: beyond `max_lag_seconds` the (feed_price - broker_mid) difference is dominated
+    by price MOVEMENT between the two instants, not a genuine feed-vs-broker basis — so the
+    basis magnitudes are withheld and `basis_reliable=False`. The instantaneous spread is
+    always kept (it does not depend on the lag)."""
+    mid = (bid + ask) / 2 if bid and ask else None
+    lag = (observed_at - bar_close).total_seconds()
+    reliable = lag <= max_lag_seconds
+    return {
+        "feed_price": feed_price, "xtb_bid": bid, "xtb_ask": ask,
+        "xtb_spread_pct": round((ask - bid) / ask * 100, 4) if ask else 0.0,
+        "quote_time": quote_time.isoformat() if quote_time else None,
+        "observed_at": observed_at.isoformat(), "bar_close": bar_close.isoformat(),
+        "observation_lag_seconds": round(lag, 1),
+        "basis_reliable": reliable,
+        "basis_abs": round(feed_price - mid, 4) if (mid and reliable) else None,
+        "basis_pct": round((feed_price - mid) / mid * 100, 4) if (mid and reliable) else None,
+    }
 
 
 async def observe_xtb_spread(settings, feed_price, bar_close) -> tuple[float | None, dict | None]:
@@ -82,16 +108,8 @@ async def observe_xtb_spread(settings, feed_price, bar_close) -> tuple[float | N
             return None, None
     observed_at = datetime.now(timezone.utc)
     quote_time = datetime.fromtimestamp(q.time / 1000, tz=timezone.utc) if q.time else None
-    mid = (q.bid + q.ask) / 2 if q.bid and q.ask else None
-    basis = {
-        "feed_price": feed_price, "xtb_bid": q.bid, "xtb_ask": q.ask,
-        "xtb_spread_pct": round(q.spread_pct, 4),
-        "quote_time": quote_time.isoformat() if quote_time else None,
-        "observed_at": observed_at.isoformat(), "bar_close": bar_close.isoformat(),
-        "observation_lag_seconds": round((observed_at - bar_close).total_seconds(), 1),
-        "basis_abs": round(feed_price - mid, 4) if mid else None,
-        "basis_pct": round((feed_price - mid) / mid * 100, 4) if mid else None,
-    }
+    basis = compute_basis(feed_price, q.bid, q.ask, bar_close, observed_at, quote_time,
+                          max_lag_seconds=settings.max_basis_lag_seconds)
     return round(q.spread_pct, 4), basis
 
 
@@ -144,7 +162,8 @@ def main() -> int:
         # is not earlier than the quote (a quote timestamped after `now` would look like the
         # future and is fail-closed by evaluate_eligibility).
         eval_now = datetime.now(timezone.utc)
-        result = compute_eligibility(windows, as_of, settings, mode=mode, now=eval_now, quote_time=quote_time)
+        result = compute_eligibility(windows, as_of, settings, mode=mode, now=eval_now,
+                                     quote_time=quote_time, provider_name=provider_name)
         return packet, result
 
     packet, result = asyncio.run(_run())

@@ -34,8 +34,8 @@ from pydantic import BaseModel, Field
 from core.models import Direction
 
 # Reproducibility manifest versions (stored on every decision).
-DECISION_PROMPT_VERSION = "decision-prompt-2026.1"
-DECISION_SCHEMA_VERSION = "decision-schema-2026.2"   # 2026.2: per-tf view + news status + spread provenance
+DECISION_PROMPT_VERSION = "prompt-2026.2"   # 2026.2: news-unknown wording + model-proposed SL/TP
+DECISION_SCHEMA_VERSION = "decision-schema-2026.4"   # 2026.4: + model-proposed SL/TP (validated downstream)
 STRATEGY_VERSION = "strategy-mvp-2026.1"
 
 Mode = Literal["online", "replay"]
@@ -64,6 +64,13 @@ class NewsContext(BaseModel):
     items: list[dict] = Field(default_factory=list)
 
 
+class FeedbackContext(BaseModel):
+    """The shadow track record so far (Faza 5), as_of-safe. Only trades CLOSED before this
+    decision's as_of are ever included (see database.feedback). Empty for a fresh run."""
+    regime_performance: list[dict] = Field(default_factory=list)  # per-regime win_rate/expectancy
+    recent_trades: list[dict] = Field(default_factory=list)       # last K closed trades, verbatim-ish
+
+
 class DecisionInput(BaseModel):
     symbol: str
     as_of: datetime
@@ -77,6 +84,7 @@ class DecisionInput(BaseModel):
     spread_provenance: SpreadProvenance = "unavailable"
     timeframes: dict[str, TimeframeView] = Field(default_factory=dict)
     news: NewsContext = Field(default_factory=NewsContext)
+    feedback: FeedbackContext = Field(default_factory=FeedbackContext)
     feature_pipeline_version: str
     schema_version: str = DECISION_SCHEMA_VERSION
 
@@ -87,15 +95,46 @@ class DecisionInput(BaseModel):
         return hashlib.sha256(self.canonical().encode()).hexdigest()
 
 
+def decision_fingerprint(*, input_hash: str, model: str, provider: str,
+                         prompt_version: str = DECISION_PROMPT_VERSION,
+                         strategy_version: str = STRATEGY_VERSION,
+                         risk_config_version: str, execution_hash: str = "") -> str:
+    """Run-scoped decision identity for idempotency: the SAME frozen input decided by the SAME
+    model + prompt + strategy + risk config + data provider is the SAME decision. Changing any
+    of these (a new prompt, a different provider) is a DIFFERENT decision and must NOT be
+    deduped against the old one. Hashed so it fits a single indexed column.
+
+    `execution_hash` folds in the EXECUTION config (modeled spread, slippage, commission, swap,
+    rollover, partial-entry policy) — the parameters a crash-recovery uses to REBUILD the trade.
+    Including it means a config change is a different fingerprint, so recovery can only ever reuse
+    a decision produced under the IDENTICAL config; it can't silently rebuild a different trade."""
+    parts = [input_hash, model, provider, prompt_version, strategy_version, risk_config_version,
+             execution_hash]
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+
 class DecisionOutput(BaseModel):
     """The LLM's structured decision. STRICT: only BUY/SELL/NO_TRADE, confidence in [0,1]
-    (ORDINAL), non-empty rationale. Extra fields rejected (no smuggled SL/TP/size)."""
+    (ORDINAL), non-empty rationale. Extra fields still rejected.
+
+    SL/TP are PROPOSALS, not decisions. The model sees where support and resistance sit, so a
+    stop placed beyond structure is better than one placed at an arbitrary ATR multiple that may
+    land mid-range. But a model that chooses its own stop also chooses its own risk — a very wide
+    stop with a near target flatters the win rate while being a poor strategy. So these are
+    suggestions that the Risk Engine validates against bounds the model cannot influence, and it
+    rejects or falls back rather than trusting them. Both fields are optional: a model that omits
+    them (or is run with the ATR sizing policy) simply gets the deterministic sizing."""
     model_config = {"extra": "forbid"}
 
     direction: Direction
     confidence: float = Field(ge=0.0, le=1.0)     # ordinal, not a probability
     rationale: str = Field(min_length=1, max_length=4000)
     key_factors: list[str] = Field(default_factory=list, max_length=12)
+    # Distance from entry, in PERCENT and always positive — direction is carried by `direction`,
+    # so a signed value here would be a second, contradictable source of truth.
+    proposed_sl_pct: float | None = Field(default=None, gt=0, le=10.0)
+    proposed_tp_pct: float | None = Field(default=None, gt=0, le=20.0)
+    sl_tp_rationale: str | None = Field(default=None, max_length=1000)
 
 
 class DecisionMaker(Protocol):
@@ -115,8 +154,11 @@ def _spread_provenance(packet, mode: str) -> SpreadProvenance:
     return "observed_xtb" if mode == "online" else "modeled"
 
 
-def build_decision_input(packet, *, mode: str, news: NewsContext | None = None) -> DecisionInput:
-    """Deterministically project a FeaturePacket into the LLM-facing input."""
+def build_decision_input(packet, *, mode: str, news: NewsContext | None = None,
+                         feedback: FeedbackContext | None = None) -> DecisionInput:
+    """Deterministically project a FeaturePacket into the LLM-facing input. `feedback` is the
+    as_of-safe shadow track record (database.feedback); empty when not supplied. It IS part of
+    the input hash — a decision made with feedback X differs from one made with feedback Y."""
     tfs = {k: TimeframeView(**packet.timeframes.get(k, {})) for k in _TF_KEYS if k in packet.timeframes}
     return DecisionInput(
         symbol=packet.symbol,
@@ -131,5 +173,6 @@ def build_decision_input(packet, *, mode: str, news: NewsContext | None = None) 
         spread_provenance=_spread_provenance(packet, mode),
         timeframes=tfs,
         news=news if news is not None else NewsContext(status="unavailable"),
+        feedback=feedback if feedback is not None else FeedbackContext(),
         feature_pipeline_version=packet.pipeline_version,
     )

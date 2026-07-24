@@ -102,6 +102,7 @@ def test_rate_limit_retried_then_success():
     m = _maker(behavior, max_retries=2)
     res = run(m.call(_inp()))
     assert res.ok and res.output.direction.value == "SELL"
+    assert res.retry_count == 1   # one 429 retry before success -> recorded for the cost audit
 
 
 def test_client_4xx_not_retried():
@@ -123,6 +124,7 @@ def test_server_5xx_retried_then_exhausted():
     m = _maker(behavior, max_retries=2)
     res = run(m.call(_inp()))
     assert not res.ok and "api_status:503" in res.error
+    assert res.retry_count == 2   # exhausted all retries -> recorded
 
 
 def test_timeout_retried_then_exhausted():

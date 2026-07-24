@@ -8,7 +8,14 @@ import numpy as np
 import pytest
 
 from data_collector.providers.base import only_closed
-from features.engineering import classify_regime, nearest_resistance_pct, nearest_support_pct, timeframe_features
+from features.engineering import (
+    MIN_BARS,
+    TimeframeSeries,
+    classify_regime,
+    nearest_resistance_pct,
+    nearest_support_pct,
+    timeframe_features,
+)
 from features.mtf import build_feature_packet, confluence
 from tests.synthetic import oscillating, trend
 
@@ -73,6 +80,20 @@ def test_timeframe_features_shape():
 def test_timeframe_features_requires_enough_bars():
     with pytest.raises(ValueError):
         timeframe_features(trend(n=50))
+
+
+@pytest.mark.parametrize("candles", [
+    trend(n=400, step=1.0),        # clean uptrend
+    trend(n=400, step=-1.0),       # downtrend
+    oscillating(n=400),            # range/choppy -> exercises every regime branch + S/R pivots
+])
+def test_timeframe_series_features_at_equals_per_slice(candles):
+    """THE equivalence guard for the O(n^2)->O(n) optimization: reading precomputed arrays at
+    position p must be BYTE-for-BYTE identical to recomputing timeframe_features over the prefix
+    candles[:p+1]. If this ever drifts, the fast path is silently changing the backtest."""
+    series = TimeframeSeries(candles)
+    for p in range(MIN_BARS - 1, len(candles)):
+        assert series.features_at(p) == timeframe_features(candles[: p + 1]), f"mismatch at bar {p}"
 
 
 def test_confluence_uses_d1_macro():
